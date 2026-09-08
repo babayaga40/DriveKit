@@ -1,0 +1,1095 @@
+{
+  "version": 1,
+  "description": "Pioneer BD drive firmware compatibility database",
+  "source": "Analyzed from firmware files by DriveKit",
+  "count": 62,
+  "firmware": [
+    {
+      "filename": "S8600000.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "GENERAL",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "9CFD5123",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600001.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "GENERAL",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1900800,
+      "checksum": "4F905ABF",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600130.154",
+      "model": "PIONEER BD-RW BDR-209MIO",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID13",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "0B708944",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600131.154",
+      "model": "PIONEER BD-RW BDR-209MIO",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID13",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1901824,
+      "checksum": "4081EBB1",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600430.154",
+      "model": "PIONEER BD-RW   BDR-S09",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID43",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "77E09891",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600431.154",
+      "model": "PIONEER BD-RW   BDR-S09",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID43",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1910528,
+      "checksum": "3C846B0F",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600440.E01",
+      "model": "ASUS    BW-12D1S-U",
+      "version": "E401",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID44",
+      "file_type": "Kernel",
+      "date": "13/09/10",
+      "filesize": 70144,
+      "checksum": "57C57BED",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600441.E02",
+      "model": "ASUS    BW-12D1S-U",
+      "version": "E402",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID44",
+      "file_type": "Normal",
+      "date": "18/01/15",
+      "filesize": 1898240,
+      "checksum": "D743A096",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600580.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID58",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "73BAD965",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600581.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID58",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1903616,
+      "checksum": "6A4EECAE",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600600 (1).154",
+      "model": "PIONEER BD-RW BDR-X09",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID60",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "AF1F8BC7",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600600.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID60",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "4CCFE8BF",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600601.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID60",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1902848,
+      "checksum": "09E510FD",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600610.151",
+      "model": "PIONEER BD-RW   BDR-209D",
+      "version": "1.51",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID61",
+      "file_type": "Kernel",
+      "date": "18/05/08",
+      "filesize": 70144,
+      "checksum": "25C2F75F",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600611.151",
+      "model": "PIONEER BD-RW   BDR-209D",
+      "version": "1.51",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID61",
+      "file_type": "Normal",
+      "date": "18/05/08",
+      "filesize": 1896960,
+      "checksum": "9733E2F8",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600720.154",
+      "model": "PIONEER BD-RW  BDR-S09JX",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID72",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "AD551A52",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600721.154",
+      "model": "PIONEER BD-RW  BDR-S09JX",
+      "version": "1.54",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID72",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1914880,
+      "checksum": "7DBA049E",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600760.E02",
+      "model": "ASUS    BW-16D1X-U",
+      "version": "E102",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID76",
+      "file_type": "Kernel",
+      "date": "18/01/15",
+      "filesize": 70144,
+      "checksum": "F9593B7A",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600761.E02",
+      "model": "ASUS    BW-16D1X-U",
+      "version": "E102",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID76",
+      "file_type": "Normal",
+      "date": "18/01/15",
+      "filesize": 1898240,
+      "checksum": "CE266912",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600810.151",
+      "model": "PIONEER BD-RW   BDR-209",
+      "version": "1.51",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID81",
+      "file_type": "Kernel",
+      "date": "18/05/08",
+      "filesize": 70144,
+      "checksum": "5A8567A3",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8600811.151",
+      "model": "PIONEER BD-RW   BDR-209",
+      "version": "1.51",
+      "platform": "SAT 8600",
+      "platform_id": "0x8600",
+      "platform_name": "BDR-209",
+      "kernel": "ID81",
+      "file_type": "Normal",
+      "date": "18/05/08",
+      "filesize": 1899008,
+      "checksum": "BC7AA9EB",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8601000.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "GENERAL",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "CB4FC578",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601001.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "GENERAL",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1861120,
+      "checksum": "F18AD50F",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601130.154",
+      "model": "PIONEER BD-RW BDR-209MIO",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID13",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "4CEF742B",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601131.154",
+      "model": "PIONEER BD-RW BDR-209MIO",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID13",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1862144,
+      "checksum": "1BEC8C8B",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601430.154",
+      "model": "PIONEER BD-RW   BDR-S09",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID43",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "B872E4BD",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601431.154",
+      "model": "PIONEER BD-RW   BDR-S09",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID43",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1872128,
+      "checksum": "5B92F033",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601600.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID60",
+      "file_type": "Kernel",
+      "date": "20/07/21",
+      "filesize": 70144,
+      "checksum": "9834264D",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601601.154",
+      "model": "PIONEER BD-RW   BDR-209M",
+      "version": "1.54",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID60",
+      "file_type": "Normal",
+      "date": "20/07/21",
+      "filesize": 1862400,
+      "checksum": "2683E940",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601610.151",
+      "model": "PIONEER BD-RW   BDR-209D",
+      "version": "1.51",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID61",
+      "file_type": "Kernel",
+      "date": "18/05/08",
+      "filesize": 70144,
+      "checksum": "B39692ED",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601611.151",
+      "model": "PIONEER BD-RW   BDR-209D",
+      "version": "1.51",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID61",
+      "file_type": "Normal",
+      "date": "18/05/08",
+      "filesize": 1853952,
+      "checksum": "E05E66D9",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601810.151",
+      "model": "PIONEER BD-RW   BDR-209",
+      "version": "1.51",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID81",
+      "file_type": "Kernel",
+      "date": "18/05/08",
+      "filesize": 70144,
+      "checksum": "8D73BD7D",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8601811.151",
+      "model": "PIONEER BD-RW   BDR-209",
+      "version": "1.51",
+      "platform": "SAT 8601",
+      "platform_id": "0x8601",
+      "platform_name": "BDR-209",
+      "kernel": "ID81",
+      "file_type": "Normal",
+      "date": "18/05/08",
+      "filesize": 1856768,
+      "checksum": "91BDE9B0",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8800000.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "GENERAL",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "F57EF064",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800001.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "GENERAL",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1923328,
+      "checksum": "EFFC1A45",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800430.153",
+      "model": "PIONEER BD-RW   BDR-S11",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID43",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "63D2224D",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800431.153",
+      "model": "PIONEER BD-RW   BDR-S11",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID43",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1934336,
+      "checksum": "383A144E",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800580.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID58",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "3031156C",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800581.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID58",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1926400,
+      "checksum": "D731D53F",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800600.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID60",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "DD2DB88B",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800601.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID60",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1924864,
+      "checksum": "52E590C3",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800720.153",
+      "model": "PIONEER BD-RW  BDR-S11JX",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID72",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "60E96107",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8800721.153",
+      "model": "PIONEER BD-RW  BDR-S11JX",
+      "version": "1.53",
+      "platform": "SAT 8800",
+      "platform_id": "0x8800",
+      "platform_name": "BDR-211",
+      "kernel": "ID72",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1938944,
+      "checksum": "DF3C39A3",
+      "crossflash_compatible": [
+        "0x8301",
+        "0x8600",
+        "0x8800"
+      ]
+    },
+    {
+      "filename": "S8801000.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "GENERAL",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "282544FF",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801001.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "GENERAL",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1938432,
+      "checksum": "49A2C8B2",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801430.153",
+      "model": "PIONEER BD-RW   BDR-S11",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID43",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "8D2C370A",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801431.153",
+      "model": "PIONEER BD-RW   BDR-S11",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID43",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1949440,
+      "checksum": "0387E03E",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801580.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID58",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "B60FC4EA",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801581.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID58",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1941504,
+      "checksum": "3F8497C1",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801600.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID60",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "E54BC5CB",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801601 (1).153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID60",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1939968,
+      "checksum": "9C9B02C0",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801601.153",
+      "model": "PIONEER BD-RW   BDR-211M",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID60",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1939968,
+      "checksum": "9C9B02C0",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801720.153",
+      "model": "PIONEER BD-RW  BDR-S11JX",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID72",
+      "file_type": "Kernel",
+      "date": "20/08/03",
+      "filesize": 70144,
+      "checksum": "D3CF9859",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8801721.153",
+      "model": "PIONEER BD-RW  BDR-S11JX",
+      "version": "1.53",
+      "platform": "SAT 8801",
+      "platform_id": "0x8801",
+      "platform_name": "BDR-211",
+      "kernel": "ID72",
+      "file_type": "Normal",
+      "date": "20/08/03",
+      "filesize": 1954048,
+      "checksum": "17B4EBEB",
+      "crossflash_compatible": [
+        "0x8601",
+        "0x8801"
+      ]
+    },
+    {
+      "filename": "S8B30690.111",
+      "model": "PIONEER BD-RW  BDR-XD06U",
+      "version": "1.11",
+      "platform": "SAT 8B30",
+      "platform_id": "0x8b30",
+      "platform_name": "BDR-XD06U",
+      "kernel": "ID69",
+      "file_type": "Kernel",
+      "date": "17/06/22",
+      "filesize": 70144,
+      "checksum": "F9C4A128",
+      "crossflash_compatible": [
+        "0x8231",
+        "0x8232",
+        "0x8b30"
+      ]
+    },
+    {
+      "filename": "S8B30691.111",
+      "model": "PIONEER BD-RW  BDR-XD06U",
+      "version": "1.11",
+      "platform": "SAT 8B30",
+      "platform_id": "0x8b30",
+      "platform_name": "BDR-XD06U",
+      "kernel": "ID69",
+      "file_type": "Normal",
+      "date": "17/06/22",
+      "filesize": 1922560,
+      "checksum": "643DAC9A",
+      "crossflash_compatible": [
+        "0x8231",
+        "0x8232",
+        "0x8b30"
+      ]
+    },
+    {
+      "filename": "S8F01430.100",
+      "model": "PIONEER BD-RW   BDR-S12U",
+      "version": "1.00",
+      "platform": "SAT 8F01",
+      "platform_id": "0x8f01",
+      "platform_name": "BDR-212",
+      "kernel": "ID43",
+      "file_type": "Kernel",
+      "date": "19/01/10",
+      "filesize": 70144,
+      "checksum": "71E66037",
+      "crossflash_compatible": [
+        "0x8f00",
+        "0x8f01"
+      ]
+    },
+    {
+      "filename": "S8F01431.102",
+      "model": "PIONEER BD-RW   BDR-S12U",
+      "version": "1.02",
+      "platform": "SAT 8F01",
+      "platform_id": "0x8f01",
+      "platform_name": "BDR-212",
+      "kernel": "ID43",
+      "file_type": "Normal",
+      "date": "22/03/07",
+      "filesize": 1949440,
+      "checksum": "9AFDF42B",
+      "crossflash_compatible": [
+        "0x8f00",
+        "0x8f01"
+      ]
+    },
+    {
+      "filename": "S8D31050.104",
+      "model": "PIONEER BD-RW  BDR-XD07U",
+      "version": "1.04",
+      "platform": "SAT 8D31",
+      "platform_id": "0x8d31",
+      "platform_name": "BDR-XD07U",
+      "kernel": "ID05",
+      "file_type": "Kernel",
+      "date": "22/05/31",
+      "filesize": 70144,
+      "checksum": "FA865DC7",
+      "crossflash_compatible": [
+        "0x8d30",
+        "0x8d31"
+      ]
+    },
+    {
+      "filename": "S8D31051.104",
+      "model": "PIONEER BD-RW  BDR-XD07U",
+      "version": "1.04",
+      "platform": "SAT 8D31",
+      "platform_id": "0x8d31",
+      "platform_name": "BDR-XD07U",
+      "kernel": "ID05",
+      "file_type": "Normal",
+      "date": "22/05/31",
+      "filesize": 1926400,
+      "checksum": "B92BFC6F",
+      "crossflash_compatible": [
+        "0x8d30",
+        "0x8d31"
+      ]
+    },
+    {
+      "filename": "S9331050.100",
+      "model": "PIONEER BD-RW  BDR-XD08U",
+      "version": "1.00",
+      "platform": "SAT 9331",
+      "platform_id": "0x9331",
+      "platform_name": "BDR-XD08U",
+      "kernel": "ID05",
+      "file_type": "Kernel",
+      "date": "22/04/03",
+      "filesize": 70144,
+      "checksum": "4D829FD5",
+      "crossflash_compatible": [
+        "0x9330",
+        "0x9331"
+      ]
+    },
+    {
+      "filename": "S9331051.101",
+      "model": "PIONEER BD-RW  BDR-XD08U",
+      "version": "1.01",
+      "platform": "SAT 9331",
+      "platform_id": "0x9331",
+      "platform_name": "BDR-XD08U",
+      "kernel": "ID05",
+      "file_type": "Normal",
+      "date": "22/10/11",
+      "filesize": 1926656,
+      "checksum": "6BC2EC7B",
+      "crossflash_compatible": [
+        "0x9330",
+        "0x9331"
+      ]
+    }
+  ]
+}

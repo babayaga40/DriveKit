@@ -278,7 +278,7 @@ Returns `0xFF` unless kernel mode active. Contains running firmware image. Writt
 ## Credits
 
 - **blackened2687** — BDRFlash / AutoFlasher author, Pioneer flash protocol pioneer
-- **Coppervid** — Outstanding support and testing
+- **Coppervid** — For giving tips about correct firmwares, and supporting us with it!
 - **MakeMKV community** — Drive testing and research
 - **rpc1dev** — DVRFlash open source reference
 

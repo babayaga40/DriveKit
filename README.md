@@ -4,7 +4,7 @@
 
 Combined optical drive & storage research toolkit for Windows and Linux, targeting Pioneer BD-R/BD-RE optical drives. All functionality is bundled into a single binary, with the operation selected via a command-line subcommand.
 
-Reverse engineering of the flash protocol was done by capturing USB traffic between Pioneer's own official flasher and the freeware `BDRFlash` tool and a drive (Wireshark/USBPcap), then analyzing the resulting binary with IDA Pro and x64dbg — **reading x86 assembly only, no decompilation to C or other high-level languages was performed at any point**. This project documents the vendor's WRITE BUFFER unlock sequence, the model/key payload format, the READ BUFFER 0xB0 kernel-mode trigger, drive-family compatibility groups, and the internal model string table required for newer drive families.
+Reverse engineering of the flash protocol was done by capturing USB traffic between the third-party `BDRFlash` tool and a drive (Wireshark/USBPcap), then analyzing the resulting binary with IDA Pro and x64dbg — **reading x86 assembly only, no decompilation to C or other high-level languages was performed at any point**. This project documents the vendor's WRITE BUFFER unlock sequence, the model/key payload format, the READ BUFFER 0xB0 kernel-mode trigger, drive-family compatibility groups, and the internal model string table required for newer drive families.
 
 ---
 
@@ -16,7 +16,7 @@ This tool talks to your optical drive at the raw SCSI/ATAPI command level and in
 - Don't use `--force` unless you understand what compatibility check you're bypassing.
 - Firmware flashing commands write a backup of the existing firmware — keep it.
 - Run as Administrator on Windows; run with `sudo` on Linux.
-- After flashing, wait **at least 2 minutes** before unplugging the drive — the NAND write continues internally after the USB transfer completes.
+- After the execution trigger the drive writes to NAND internally — **do not unplug** until the tool reports completion.
 
 ---
 
@@ -24,14 +24,11 @@ This tool talks to your optical drive at the raw SCSI/ATAPI command level and in
 
 Pioneer BD drives use the **Renesas H8S/2000** processor — a big-endian 16/32-bit RISC CPU. Confirmed by decoding the 0xB0 READ BUFFER dump and disassembling as H8S/2000 assembly.
 
-**Note:** Earlier community analysis suggested ARM Thumb-2 (ARMv6). H8S/2000 is now confirmed correct via direct assembly analysis.
-
 **Memory map confirmed from H8S/2000 assembly (SAT 8801 family):**
 - `0x00100000` = bootloader start
 - `0x00400000` = main firmware start
 - `0x00410000` = model string storage (`PIONEER  BDR-211`)
 - `0xFF414000` = physical address mapped via 0xB0 handler
-- `0x5E0000-0x5FFFFF` = hardcoded hole in 0xB0 handler
 
 **TWO unlock keys confirmed from WRITE BUFFER handler assembly (0x0044BC10):**
 ```asm
@@ -39,15 +36,68 @@ cmp.l   #h'9a782361, er0    ; 0x9A782361 BE = 0x6123789A LE (primary)
 cmp.l   #h'94e0f25c, er0    ; 0x94E0F25C BE = 0x5CF2E094 LE (secondary)
 ```
 
-The unlock handler compares the first 16 bytes of the payload against the **internal firmware model string** — NOT the INQUIRY product string. These differ on newer drive families:
+---
+
+## Flash Protocol — Confirmed from Wireshark Capture
+
+Full reverse engineering of the BDRFlash protocol confirmed via USB capture. The complete working sequence:
+
+### 1. Session Token (pre-cutoff drives)
+```
+READ BUFFER 0xA0 mode=2 offset=0x90 len=0x10  → get session token
+```
+Returns 16-byte dynamic token that changes each power-on. Pre-cutoff drives return the model string here instead (token not used).
+
+### 2. Unlock
+```
+WRITE BUFFER mode=4 bufID=0xFF len=0x100  → send token as payload
+```
+For pre-cutoff drives: payload = internal model string (e.g. `PIONEER BDR-BDS7`) + 4-byte key at offset 0x10.
+For post-cutoff drives: payload = 0xA0 session token (dynamic, read from drive).
+
+### 3. Kernel firmware transfer
+```
+WRITE BUFFER mode=7 bufID=0xFE offset=0x0000 len=0x8000  → chunk 1
+WRITE BUFFER mode=7 bufID=0xFE offset=0x8000 len=0x8000  → chunk 2
+...  (0x8000 byte chunks)
+```
+**Critical: must use 0x8000 byte chunks — larger transfers prevent NAND commit!**
+
+### 4. Normal firmware transfer
+```
+WRITE BUFFER mode=7 bufID=0xF0 offset=0x0000 len=0x8000  → chunk 1
+WRITE BUFFER mode=7 bufID=0xF0 offset=0x8000 len=0x8000  → chunk 2
+...  (0x8000 byte chunks)
+```
+
+### 5. Execution trigger
+```
+WRITE BUFFER mode=5 bufID=0xFF len=0x100  → same payload as unlock
+```
+
+### 6. Wait for NAND write + reboot
+```
+GET EVENT STATUS × 160   → poll while drive processes
+TEST UNIT READY          → check if drive ready
+REQUEST SENSE            → after every TUR (sense key 0x0C = NAND writing)
+```
+Drive reboots itself into normal mode when NAND write completes. **No power cycle needed.**
+
+---
+
+## Internal Model Strings
+
+The WRITE BUFFER unlock handler compares the payload against the **internal firmware model string** — NOT the INQUIRY product string. These differ on newer drive families:
 
 | Drive family | INQUIRY string | Internal model string |
 |---|---|---|
 | BDR-211M (SAT 8801) | `BD-RW   BDR-211M` | `PIONEER BDR-BDS5` |
+| BDR-XD05 (SAT 8231) | `BD-RW   BDR-XD05` | `PIONEER BDR-XD05` |
+| BDR-XD06U (SAT 8B30) | `BD-RW  BDR-XD06U` | `PIONEER BDR-XD06` |
 | BDR-XD07/AD07 (SAT 8D30) | `BD-RW   BDR-AD07` | `PIONEER BDR-BDS7` |
 | BDR-XD08 (SAT 9330) | `BD-RW   BDR-XD08` | `PIONEER BDR-BDS8` |
 
-**This is a significant finding** — BDRFlash uses the wrong model string for newer BDS7/BDS8 family drives, causing unlock failures that appear as drive incompatibility. DriveKit implements a correct internal model string lookup table (`mdl_map`) for all known drive families.
+**BDRFlash bug confirmed:** Uses wrong model strings for BDS7/BDS8 families causing unlock failures. DriveKit implements correct internal model string lookup (`g_mdl_map` table).
 
 ---
 
@@ -57,19 +107,30 @@ Pioneer introduced firmware version protection around 2022-2023. Post-cutoff fir
 
 1. **Accepts the unlock command** with correct model string and key
 2. **Accepts kernel/firmware data** transferred via WRITE BUFFER
-3. **Silently refuses to commit** the data to NAND — execution trigger returns GOOD but nothing happens
+3. **Execution trigger returns GOOD** — but NAND write never starts
 4. **Cannot be downgraded** — same-version reflash also blocked
 
 **Confirmed post-cutoff versions:**
 - BDR-AD07 / BDR-XD07 — firmware **1.04** and later
 - BDR-XD08 — firmware **1.04** and later
-- BDR-209M — firmware **1.55** and later
+- BDR-XD05 — firmware **1.22 / 2.11 / 3.11** and later
 
-**Last safe versions:**
-- BDR-AD07 / BDR-XD07 — **1.03** (confirmed, checksum `0A48BD40` kernel, `3AEA3453` normal)
-- BDR-XD08 — **1.01** or **1.02** (to be confirmed)
+**Last safe (pre-cutoff) versions:**
+- BDR-AD07 / BDR-XD07 — **1.03** (CRC kernel: `0A48BD40`, normal: `3AEA3453`)
+- BDR-XD05 — **3.01** / **2.10** / **1.21**
+- BDR-XD06U — **1.11** (confirmed UHD capable)
 
-**Open research:** The post-cutoff protection mechanism in the NAND write handler has not yet been reversed. The execution trigger `WRITE BUFFER mode=5 bufID=0xFF` returns GOOD but does not commit. Dumping the trigger handler from H8S/2000 assembly is the next research target.
+**Post-cutoff recovery:** Drives in normal mode can be recovered using the `0xA0` session token unlock (reads token at offset `0x90`, sends it back as unlock payload). Drives stuck in kernel mode with empty NAND partition cannot currently be recovered — open research.
+
+---
+
+## Confirmed Crossflashes
+
+| From | To | Firmware | UHD | Notes |
+|------|-----|---------|-----|-------|
+| BDR-XD05 (8231) | BDR-XD06U (8B30) | 1.11 | ✅ | Confirmed working, rips UHD |
+| BDR-AD07 (8D30) | BDR-XD07U (8D31) | 1.04 | ✅ | Confirmed working, UHD identified by Windows |
+| BDR-AD07 (8D30) | BDR-AD07 (8D30) | 1.03 | ❓ | Downgrade confirmed, UHD TBD |
 
 ---
 
@@ -79,13 +140,11 @@ DriveKit supports **365+ Pioneer BD drive firmware entries** across all major fa
 
 | Model | Platform | Drive ID | Notes |
 |-------|----------|----------|-------|
-| BDR-XD05 (JP) | SAT 8231 | ID35 | Crossflash to XD06U confirmed |
-| BDR-XD06U | SAT 8B30 | ID69 | Unlock key 0x6123789A confirmed |
-| BDR-AD07 | SAT 8D30 | ID32 | Internal model `PIONEER BDR-BDS7`. Post-cutoff at 1.04 |
-| BDR-XD08 | SAT 9330 | ID36 | Internal model `PIONEER BDR-BDS8`. Post-cutoff at 1.04 |
-| BDR-209M | SAT 8601 | ID58 | Post-cutoff at 1.55 |
-| BDR-211M | SAT 8801 | ID60 | ASUS OEM rebadge. H8S/2000 assembly analyzed |
-| BDR-S12U | SAT 8F01 | ID43 | Firmware 1.02 documented |
+| BDR-XD05 | SAT 8231 | ID35 | Crossflash to XD06U confirmed |
+| BDR-XD06U | SAT 8B30 | ID69 | UHD ripping confirmed |
+| BDR-AD07 | SAT 8D30 | ID32 | Downgrade to 1.03 confirmed |
+| BDR-XD08 | SAT 9330 | ID36 | Post-cutoff research ongoing |
+| BDR-211M | SAT 8801 | ID60 | H8S/2000 assembly analyzed |
 
 ---
 
@@ -102,8 +161,6 @@ gcc drivekit.c -o drivekit -w
 sudo ./drivekit inquiry /dev/sg1
 ```
 
-Single source file — no separate headers needed.
-
 ---
 
 ## Usage
@@ -112,69 +169,45 @@ Single source file — no separate headers needed.
 drivekit <command> <drive_letter> [options]
 ```
 
-If the drive letter is omitted, DriveKit scans all optical drive letters and prompts you to pick one.
-
 ### Options
 
 | Option | Description |
 |---|---|
-| `--bufid 0xF4` | Buffer ID for `rawdump` (default `0xF4`) |
-| `--file name` | Output/input filename override |
-| `--file2 name` | Secondary filename override |
-| `--force` | Skip compatibility/ready checks |
-| `--nounlock` | Skip the unlock step in flash commands |
-| `--key 0x5CF2E094` | Override unlock key (default: derived from drive ID) |
+| `--bufid 0xF4` | Buffer ID for `rawdump` |
+| `--file name` | Kernel firmware file |
+| `--file2 name` | Normal firmware file |
+| `--force` | Skip compatibility checks |
+| `--nounlock` | Skip unlock step |
+| `--key 0x5CF2E094` | Override unlock key |
 
 ---
 
 ## Commands
 
-**Identification / probing**
-
 | Command | Description |
 |---|---|
-| `inquiry` | Read drive vendor/model/firmware identity |
-| `info` | Full drive information including serial decode |
-| `driveinfo` | Full MMC feature probe and supported profile list |
-| `discinfo` | Read and parse BD/DVD disc information |
-| `modelcheck` | Look up Pioneer model against known drive-family table |
-| `probevendor` | Probe vendor commands 0xC0-0xFF and report responses |
-| `probeb0` | Probe READ BUFFER 0xB0 capability data |
-| `rawdump` | Raw READ BUFFER dump (`--bufid`) |
-| `checkcompat` | Check drive against compatibility.json for safe crossflash |
-
-**Buffer / firmware dumping**
-
-| Command | Description |
-|---|---|
-| `rawdump --bufid 0xB0` | Capability/calibration data |
-| `rawdump --bufid 0x92` | Drive config and factory calibration |
-| `rawdump --bufid 0xF1` | Drive identity (serial, platform, kernel ID) |
-| `rawdump --bufid 0xF4` | NAND flash contents (requires kernel mode) |
-| `rawdump --bufid 0xFE` | Kernel area in RAM (requires kernel mode) |
-| `triggerkernel` | Trigger kernel mode via READ BUFFER 0xB0 exploit (disc required, patched on newer firmware) |
-
-**Service mode / flashing**
-
-| Command | Description |
-|---|---|
-| `unlock` | Send WRITE BUFFER 0xFF service mode unlock |
+| `info` | Full drive information with serial decode |
+| `inquiry` | Drive vendor/model/firmware |
+| `unlock` | Service mode unlock (auto-detects token or model string method) |
 | `flashfw` | Flash kernel + firmware (`--file`, `--file2`, `--nounlock`) |
-| `autoflash` | Auto-detect and flash from `firmware\` folder |
-| `brutekey` | Try all known Pioneer unlock keys |
-| `keycheck` | Show which unlock key would be used for connected drive |
+| `probevendor` | Probe vendor commands 0xC0-0xFF |
+| `rawdump` | Raw READ BUFFER dump (`--bufid`) |
+| `checkcompat` | Check crossflash compatibility |
+| `sendcdb` | Send raw SCSI CDB |
 | `resetnormal` | Attempt to exit kernel/service mode |
-| `sendcdb` | Send raw SCSI CDB to drive (advanced) |
+| `triggerkernel` | Trigger kernel mode via 0xB0 exploit |
 
-> **Flash sequence:** `unlock G` → `flashfw G --file kernel.bin --file2 normal.bin --nounlock`
->
-> **NAND dump sequence:** `triggerkernel G` (with disc) → `rawdump G --bufid 0xF4`
+> **Flash sequence:**
+> ```
+> drivekit unlock G
+> drivekit flashfw G --file kernel.bin --file2 normal.bin --nounlock
+> ```
 
 ---
 
 ## DriveBrowser
 
-DriveKit includes `drivebrowser` — a graphical database browser for `drives.json` and `compatibility.json`.
+Graphical database browser for `drives.json` and `compatibility.json` with Supabase cloud sync.
 
 **Windows:**
 ```
@@ -189,100 +222,35 @@ gcc drivebrowser_linux.c -o drivebrowser \
     $(pkg-config --cflags --libs gtk+-3.0) -lcurl -lm
 ```
 
-Features: Supabase cloud sync, sortable columns, search/filter, edit/add/delete entries, crossflash compatibility view.
-
 ---
 
 ## Serial Number Decode
 
-Pioneer serial format (e.g. `NIDL001216JP`):
+Pioneer serial format: `NKDL005825JP`
 
 ```
-N  I  D  L  0  0  1  2  1  6  J  P
+N  K  D  L  0  0  5  8  2  5  J  P
 |  |  |-----|  |-----|  |--|  |--|
 |  |  country  sequence  year  market
-|  month (UNICODE mapping A=Jan...L=Dec)
+|  month (A=Jan ... L=Dec)
 plant code
 ```
 
-### Month Encoding
-
-DriveKit uses the UNICODE version mapping (straight A=Jan through L=Dec):
-
-| Letter | Month | Letter | Month |
-|--------|-------|--------|-------|
-| A | January | G | July |
-| B | February | H | August |
-| C | March | I | September |
-| D | April | J | October |
-| E | May | K | November |
-| F | June | L | December |
-
-### Country Encoding
-
-Positions 2-3 form a little-endian 16-bit word. Key finding: the BDRFlash ANSI version **hardcodes "China"** for all drives. Only the UNICODE version has the full lookup table. DriveKit implements the full table.
-
-### Year Encoding
-
-The year formula remains an **open research question**. Known data points:
-- `NIDL001216JP` → September 2014
-- `SEDL056253WL` → May 2005
+Month encoding (UNICODE version — straight A=Jan through L=Dec).
 
 ---
 
-## Buffer Research (READ BUFFER IDs)
+## Buffer Research
 
-### READ BUFFER 0xB0 — Capability/Calibration Data
-
-Available on BDR-211M (SAT 8801) at firmware 1.53. Returns drive calibration data. Handler accepts offsets up to `0x880300` with a hardcoded hole at `0x5E0000-0x5FFFFF`. The repeating `00 55 1F 1A` pattern contains the bus encryption flags (`0x55`) checked by MakeMKV/LibreDrive for UHD capability.
-
-### READ BUFFER 0x92 — Drive Config / Calibration Blocks
-
-Available without unlock. Three regions confirmed on BDR-211M and BDR-XD08:
-
-| Block | Content |
-|-------|---------|
-| `0x000000` | Drive capability header |
-| `0x001000` | Factory calibration — laser power (`F4 8C`), servo params, dates |
-| `0x002000` | Uninitialized (`0xCC` fill) |
-
-XD08 capacity: `0x00103700`. BDR-211M capacity: `0x00100300`.
-
-### READ BUFFER 0xF1 — Drive Identity
-
-Returns serial, platform string and kernel ID. Available on all drives. Layout:
-- Offset `0x00`: Serial number (12 bytes)
-- Offset `0x10`: Platform string e.g. `SAT 9330ID36`
-- Offset `0x20`: Firmware version (`0000` = kernel mode active)
-
-### READ BUFFER 0xF4 — NAND Flash Contents
-
-Requires kernel mode trigger + disc inserted. Returns encrypted NAND (~16MB). Trigger exploit patched in post-cutoff firmware. On XD08 in half-flash state reports 0 bytes (normal firmware partition empty).
-
-### READ BUFFER 0xFE — Kernel Area (RAM)
-
-Returns `0xFF` unless kernel mode active. Contains running firmware image. Written during flash via WRITE BUFFER 0xFE.
-
----
-
-## Notes
-
-- All SCSI pass-through calls have a 35s timeout.
-- `drives.json` (365+ entries) and `compatibility.json` (60+ firmware files) are the database files.
-- `autoflash` matches firmware files by content (Pioneer header), not filename.
-- After flashing wait 2+ minutes before unplugging — NAND write continues internally.
-- Linux port in progress — USB→SATA adapter required for internal SATA drives.
-
----
-
-## Credits
-
-- **blackened2687** — BDRFlash / AutoFlasher author, Pioneer flash protocol pioneer
-- **Coppervid** — For giving tips about correct firmwares, and supporting us with it!
-- **MakeMKV community** — Drive testing and research
-- **rpc1dev** — DVRFlash open source reference
-
-**Tools:** Wireshark + USBPcap, IDA Pro + hrtng plugin, x64dbg, Visual Studio 2022, WSL, GCC
+| Buffer ID | Name | Notes |
+|-----------|------|-------|
+| `0x92` | Drive config | Capacity header + factory calibration |
+| `0xA0` | Session token | Pre-flash challenge token (offset 0x90) |
+| `0xB0` | Capability data | Bus encryption flags, laser calibration |
+| `0xF1` | Drive identity | Serial, platform, kernel ID, firmware version |
+| `0xF4` | NAND flash | Requires kernel mode trigger + disc |
+| `0xFE` | Kernel RAM | Active kernel image |
+| `0xF0` | Normal RAM | Active normal firmware image |
 
 ---
 
@@ -290,23 +258,26 @@ Returns `0xFF` unless kernel mode active. Contains running firmware image. Writt
 
 | Term | Description |
 |------|-------------|
-| **SCSI** | Command protocol used to communicate with optical drives, even over USB or SATA |
-| **CDB** | Command Descriptor Block — raw bytes sent to the drive |
-| **READ BUFFER** | SCSI opcode `0x3C` — reads internal drive memory regions |
-| **WRITE BUFFER** | SCSI opcode `0x3B` — writes to internal drive memory; used for unlock and flash |
-| **Kernel** | First firmware component (buffer 0xFE) — low-level drive control |
-| **Normal** | Second firmware component (buffer 0xF0) — drive behaviour and features |
-| **NAND** | Flash memory inside the drive storing firmware and config (buffer 0xF4) |
-| **Platform ID** | Drive family identifier e.g. `SAT 9330` |
-| **Internal model string** | Firmware's own model name, used in unlock payload — differs from INQUIRY string on newer drives |
-| **Unlock** | WRITE BUFFER 0xFF command that enters service mode before flashing |
-| **Kernel mode** | Drive state triggered via READ BUFFER 0xB0 exploit — enables NAND dump |
-| **Crossflash** | Flashing firmware from a compatible but different drive model |
-| **Post-cutoff** | Firmware versions with NAND write protection preventing downgrade/crossflash |
-| **ASC/ASCQ** | Additional Sense Code / Qualifier — SCSI error codes in sense data |
+| **Session token** | Dynamic 16-byte value from READ BUFFER 0xA0 offset=0x90, used as unlock payload on post-cutoff drives |
+| **Internal model string** | Firmware's own model name used in unlock payload — differs from INQUIRY string on newer drives |
+| **Post-cutoff** | Firmware with NAND write protection — accepts data but silently refuses to commit |
+| **Kernel mode** | Drive state after unlock — firmware shows `0000`, NAND write enabled |
+| **Crossflash** | Flashing firmware from compatible different drive model |
+| **0x8000 chunks** | Required transfer size for WRITE BUFFER — larger chunks prevent NAND commit |
+| **key=0C** | Sense key during TUR polling indicating active NAND write in progress |
 
 ---
 
-Research and educational purposes only. Always back up firmware before flashing. Authors take no responsibility for bricked drives. Use at your own risk.
+## Credits
+
+- **blackened2687** — BDRFlash / AutoFlasher original author
+- **Coppervid** — Outstanding support and testing
+- **MakeMKV community** — Drive testing and research
+
+**Tools:** Wireshark + USBPcap, IDA Pro, x64dbg, Visual Studio 2022, WSL, GCC
+
+---
+
+Research and educational purposes only. Always back up firmware before flashing. Authors take no responsibility for bricked drives.
 
 *DriveKit v1.0 — cPix / Razor 1911 (c) 2026*

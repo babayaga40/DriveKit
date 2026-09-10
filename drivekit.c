@@ -12,14 +12,9 @@
  * Commands:
  *   inquiry          Read drive firmware version and identity
  *   libredrive       Probe LibreDrive capability
- *   bdread           Query MMC feature 0x010C (BD Read)
- *   modepage         Dump mode page 0x2A (drive capabilities)
  *   probef0          Probe READ BUFFER IDs 0xF0-0xFF
  *   rawdump          Raw READ BUFFER dump (use --bufid 0xF4 etc)
- *   combinedump      Dump both 0xF4 and 0xFE into one file
- *   findsigs         Scan a file for firmware signatures
  *   unlock           Pioneer RS8801 service mode unlock
- *   resetdrive       Reset an unresponsive SATA drive
  *   probevendor      Probe vendor-specific opcodes 0xC0-0xFF
  *
  * Options:
@@ -32,8 +27,6 @@
  *   drivekit rawdump E --bufid 0xFE
  *   drivekit probef0 E
  *   drivekit unlock E
- *   drivekit resetdrive D
- *   drivekit findsigs firmware.bin
  */
 
 #include <windows.h>
@@ -50,7 +43,7 @@
    CONSTANTS
    ========================================================= */
 #define SENSE_SIZE       32
-#define CHUNK_SIZE       0xA400
+#define CHUNK_SIZE       0xA4
 #define MAX_DUMP_SIZE    0x02000000
 #define PAYLOAD_SIZE     256
 #define VERSION          "1.0"
@@ -68,13 +61,18 @@ static HANDLE  g_hDrive    = INVALID_HANDLE_VALUE;
 static char    g_drivePath[16];
 static char    g_outFile[256];
 static char    g_outFile2[256];
+static char    g_outFile3[256]; /* second normal firmware pass (post-cutoff) */
+static UCHAR   g_unlock_mode  = 0x04;
+static UCHAR   g_unlock_bufid = 0xFF;
 static int     g_force = 0;
 static DWORD   g_key_override = 0; /* 0 = use derived key */
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static int     g_nounlock = 0;    /* skip unlock step (older drives) */
 static UCHAR   g_bufID     = 0xF4;
 static UCHAR   g_a0token[0x100] = {0}; /* session token from 0xA0 - reused for trigger */
+static UCHAR   g_f1token[0x30]  = {0}; /* 0xF1 token captured before unlock */
 static int     g_has_token = 0;         /* 1 if valid token was retrieved */
+static int     g_has_f1token = 0;       /* 1 if 0xF1 token was captured */
 
 /* Forward typedef so PIONEER_DRIVE can be used in early functions */
 typedef struct PIONEER_DRIVE_S {
@@ -98,32 +96,21 @@ static int   cmd_inquiry(void);
 static int   cmd_probef0(void);
 static int   cmd_flashfw(void);
 static int   cmd_autoflash(void);
-static int   cmd_sendfirmware(void);
-static int   cmd_probemodes(void);
-static int   cmd_resetnormal(void);
-static int   cmd_fwversion(void);
-static int   cmd_checkfw(void);
-static int   cmd_checkcompat(void);
-static int   cmd_triggerkernel(void);
-static int   cmd_getresource(const char *filename);
-static int   rb_descriptor(UCHAR bufID, DWORD *cap);
-static int   rb_data(UCHAR bufID, DWORD offset,
-                     UCHAR *buf, DWORD len, UCHAR *senseOut);
 
 /* =========================================================
    UTILITY: memmem for Windows
    ========================================================= */
-static void *memmem_win(const void *hay, size_t hLen,
-                         const void *ndl, size_t nLen)
+static void *memmem_win(const void *hay, size_t hlen,
+                        const void *needle, size_t nlen)
 {
-    const UCHAR *h = (const UCHAR *)hay;
-    const UCHAR *n = (const UCHAR *)ndl;
+    const UCHAR *h = (const UCHAR*)hay;
+    const UCHAR *n = (const UCHAR*)needle;
     size_t i;
-    if (nLen == 0) return (void *)hay;
-    if (hLen < nLen) return NULL;
-    for (i = 0; i <= hLen - nLen; i++)
-        if (memcmp(&h[i], n, nLen) == 0)
-            return (void *)&h[i];
+    if (nlen == 0) return (void*)hay;
+    if (hlen < nlen) return NULL;
+    for (i = 0; i <= hlen - nlen; i++)
+        if (memcmp(h + i, n, nlen) == 0)
+            return (void*)(h + i);
     return NULL;
 }
 
@@ -741,99 +728,6 @@ static int cmd_driveinfo2(void)
 }
 
 /* =========================================================
-   COMMAND: bdread (feature 0x010C)
-   ========================================================= */
-static int cmd_bdread(void)
-{
-    UCHAR buf[512];
-    UCHAR cdb[10] = {0x46,0x02,0x01,0x0C,0,0,0,0x02,0x00,0};
-    int   scsiStatus;
-
-    printf("=== BD READ FEATURE 0x010C ===\n\n");
-    memset(buf, 0, sizeof(buf));
-
-    if (send_scsi(g_hDrive, cdb, 10, buf, 512,
-                  SCSI_IOCTL_DATA_IN, NULL, &scsiStatus)
-        || scsiStatus) {
-        printf("  GET CONFIGURATION failed.\n");
-        return 1;
-    }
-
-    WORD code = ((WORD)buf[8]<<8)|buf[9];
-    if (code != 0x010C) {
-        printf("  Feature 0x010C NOT present.\n");
-        return 0;
-    }
-
-    UCHAR *feat = &buf[8];
-    printf("  Feature 0x010C present.\n");
-    printf("  Version   : %u\n",  (feat[2]>>2)&0x3F);
-    printf("  Persistent: %s\n",  (feat[2]>>1)&1 ? "Yes":"No");
-    printf("  Current   : %s\n",  feat[2]&1 ? "Yes":"No");
-
-    if (feat[3] >= 12) {
-        UCHAR *d = &feat[4];
-        printf("\n  BD-RE  Class0: 0x%02X  Class1: 0x%02X\n",
-               d[0], d[1]);
-        printf("  BD-R   Class0: 0x%02X  Class1: 0x%02X\n",
-               d[4], d[5]);
-        printf("  BD-ROM Class0: 0x%02X  Class1: 0x%02X\n",
-               d[8], d[9]);
-    }
-    return 0;
-}
-
-/* =========================================================
-   COMMAND: modepage 0x2A
-   ========================================================= */
-static int cmd_modepage(void)
-{
-    UCHAR buf[512];
-    UCHAR cdb[10] = {0x5A,0,0x2A,0,0,0,0,0x02,0x00,0};
-    UCHAR sense[SENSE_SIZE];
-    int   scsiStatus;
-
-    printf("=== MODE PAGE 0x2A ===\n\n");
-    memset(buf, 0, sizeof(buf));
-
-    if (send_scsi(g_hDrive, cdb, 10, buf, 512,
-                  SCSI_IOCTL_DATA_IN, sense, &scsiStatus)
-        || scsiStatus) {
-        fprintf(stderr, "MODE SENSE failed: key=%02X ASC=%02X\n",
-                sense[2]&0x0F, sense[12]);
-        return 1;
-    }
-
-    WORD bdLen = ((WORD)buf[6]<<8)|buf[7];
-    const UCHAR *page = buf + 8 + bdLen;
-
-    printf("  Page code : 0x%02X\n", page[0]&0x3F);
-    printf("  Page len  : %u bytes\n\n", page[1]);
-
-    if (page[1] < 2) { printf("  Too short.\n"); return 0; }
-
-    printf("  Read  caps: CD-R=%s CD-RW=%s DVD-ROM=%s DVD-R=%s\n",
-           (page[2]&0x01)?"Y":"N", (page[2]&0x02)?"Y":"N",
-           (page[2]&0x08)?"Y":"N", (page[2]&0x10)?"Y":"N");
-    printf("  Write caps: CD-R=%s CD-RW=%s DVD-R=%s\n",
-           (page[3]&0x01)?"Y":"N", (page[3]&0x02)?"Y":"N",
-           (page[3]&0x10)?"Y":"N");
-    printf("  Mechanism : %s\n",
-           ((page[6]>>4)&7)==1 ? "Tray" :
-           ((page[6]>>4)&7)==0 ? "Caddy" : "Other");
-    printf("  Eject     : %s\n", (page[6]&0x08)?"Yes":"No");
-
-    if (page[1] >= 14) {
-        WORD maxRd = ((WORD)page[8]<<8)|page[9];
-        WORD bufKB = ((WORD)page[12]<<8)|page[13];
-        printf("  Max read  : %u KB/s (~%ux CD)\n",
-               maxRd, maxRd/150);
-        printf("  Buffer    : %u KB\n", bufKB);
-    }
-    return 0;
-}
-
-/* =========================================================
    COMMAND: probef0
    ========================================================= */
 static int cmd_probef0(void)
@@ -1014,154 +908,6 @@ static int cmd_rawdump(void)
 
 
 /* =========================================================
-   COMMAND: combinedump
-   ========================================================= */
-static int cmd_combinedump(void)
-{
-    const UCHAR IDS[2]     = { 0xF4, 0xFE };
-    const char *NAMES[2]   = { "F4", "FE" };
-    const DWORD TARGET     = 0x01000000;
-    char   fname[256];
-    FILE  *fp;
-    UCHAR *chunk;
-    UCHAR *padBuf;
-    UCHAR  sense[SENSE_SIZE];
-    UCHAR  id;
-    DWORD  cap;
-    DWORD  offset;
-    DWORD  written;
-    DWORD  total;
-    DWORD  thisChunk;
-    DWORD  pad;
-    DWORD  pi;
-    int    r;
-
-    if (g_outFile[0])
-        strncpy(fname, g_outFile, sizeof(fname));
-    else
-        strcpy(fname, "rs8801_combined.bin");
-
-    printf("=== COMBINED DUMP (0xF4 + 0xFE) ===\n\n");
-    printf("  Output: %s\n\n", fname);
-
-    fp = fopen(fname, "wb");
-    if (!fp) { fprintf(stderr, "Cannot create output.\n"); return 1; }
-
-    chunk = (UCHAR*)malloc(CHUNK_SIZE);
-    if (!chunk) { fclose(fp); return 1; }
-
-    for (r = 0; r < 2; r++) {
-        id      = IDS[r];
-        cap     = 0;
-        offset  = 0;
-        written = 0;
-
-        printf("  Buffer 0x%s -> ", NAMES[r]);
-
-        if (rb_descriptor(id, &cap) || cap == 0) {
-            printf("not available - padding with 0xFF\n");
-            memset(chunk, 0xFF, CHUNK_SIZE);
-            for (pi = 0; pi < TARGET; pi += CHUNK_SIZE)
-                fwrite(chunk, 1, CHUNK_SIZE, fp);
-            continue;
-        }
-
-        total = (cap>MAX_DUMP_SIZE)?MAX_DUMP_SIZE:cap;
-        printf("0x%08lX bytes\n  Dumping", total);
-
-        while (offset < total) {
-            thisChunk = CHUNK_SIZE;
-            if (offset+thisChunk > total) thisChunk = total-offset;
-            memset(chunk, 0xFF, thisChunk);
-            rb_data(id, offset, chunk, thisChunk, sense);
-            fwrite(chunk, 1, thisChunk, fp);
-            written += thisChunk;
-            offset  += thisChunk;
-            if ((offset%0x100000)==0) { printf("."); fflush(stdout); }
-        }
-
-        if (written < TARGET) {
-            pad = TARGET - written;
-            padBuf = (UCHAR*)malloc(pad);
-            if (padBuf) {
-                memset(padBuf, 0xFF, pad);
-                fwrite(padBuf, 1, pad, fp);
-                free(padBuf);
-            }
-        }
-        printf("\n  Written: %lu bytes\n\n", written);
-    }
-
-    fclose(fp);
-    free(chunk);
-    printf("  Done. Load in IDA: mipsl, base 0x80000000\n");
-    return 0;
-}
-
-/* =========================================================
-   COMMAND: findsigs (scan file for firmware signatures)
-   ========================================================= */
-static int cmd_findsigs(const char *filename)
-{
-    FILE  *fp;
-    UCHAR *buf;
-    long   len;
-
-    const char *sigs[] = {
-        "SAT 8800","SAT 8801","SAT8800","SAT8801",
-        "RS8801","PIONEER","ASUSTek","ASUS",
-        "BDR-","BW-","ID60","SEDL","Copyright",
-        NULL
-    };
-
-    printf("=== SIGNATURE SCAN: %s ===\n\n", filename);
-
-    fp = fopen(filename, "rb");
-    if (!fp) { fprintf(stderr, "Cannot open %s\n", filename); return 1; }
-    fseek(fp, 0, SEEK_END);
-    len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    buf = (UCHAR*)malloc(len);
-    fread(buf, 1, len, fp);
-    fclose(fp);
-
-    printf("  File size: %ld bytes\n\n", len);
-
-    int s;
-    for (s = 0;  sigs[s]; s++) {
-        UCHAR *found = (UCHAR*)memmem_win(buf, len,
-                                          sigs[s], strlen(sigs[s]));
-        if (found) {
-            DWORD off = (DWORD)(found - buf);
-            printf("  \"%s\" at offset 0x%08lX\n", sigs[s], off);
-            DWORD start = (off>=16)?off-16:0;
-            printf("  Context:");
-            hex_dump(&buf[start], 48, 48);
-            printf("\n");
-        }
-    }
-
-    /* Flash region boundaries */
-    printf("  Flash region boundaries (0xFF->data):\n");
-    int inFF = 1;
-    int count = 0;
-    for (long i = 1; i < len && count < 20; i++) {
-        if (inFF && buf[i] != 0xFF) {
-            printf("    Start at 0x%08lX\n", (DWORD)i);
-            inFF = 0; count++;
-        } else if (!inFF && i+3 < len &&
-                   buf[i]==0xFF && buf[i+1]==0xFF &&
-                   buf[i+2]==0xFF && buf[i+3]==0xFF) {
-            printf("    End   at 0x%08lX\n", (DWORD)i);
-            inFF = 1;
-        }
-    }
-
-    free(buf);
-    return 0;
-}
-
-/* =========================================================
    COMMAND: unlock (Pioneer RS8801 service mode)
    ========================================================= */
 /* Internal model string lookup table */
@@ -1182,7 +928,7 @@ static const struct { WORD did; const char *str; } g_mdl_map[] = {
     { 0x8800, "PIONEER BDR-211  " },
     { 0x8801, "PIONEER BDR-BDS5 " },
     { 0x8A10, "PIONEER BDR-UD04 " },
-    { 0x8B30, "PIONEER BDR-XD06U" },
+    { 0x8B30, "XD05BK2/XV5     " }, /* post-cutoff internal model string */
     { 0x8D30, "PIONEER BDR-BDS7 " },
     { 0x8D31, "PIONEER BDR-BDS7 " },
     { 0x8E20, "PIONEER BDR-BDS7 " },
@@ -1199,165 +945,158 @@ static int cmd_unlock(void)
 {
     UCHAR cdb[12];
     UCHAR buf[256];
-    UCHAR sense[SENSE_SIZE];
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR sense2[SENSE_SIZE] = {0};
     UCHAR icdb[6] = {0x12,0,0,0,96,0};
-    UCHAR inq[96];
-    UCHAR rb[64];
-    UCHAR sense2[SENSE_SIZE];
-    UCHAR wcdb[10] = {0x3B,0x04,0xFF,0,0,0,0,0x01,0,0};
-    UCHAR payload[PAYLOAD_SIZE];
-    UCHAR es[8];
+    UCHAR inq[96] = {0};
+    UCHAR rb[64] = {0};
+    UCHAR payload[PAYLOAD_SIZE] = {0};
+    UCHAR es[8] = {0};
     UCHAR escdb[10] = {0x4A,0x01,0,0,0x5A,0,0,0,0x08,0};
-    UCHAR a0[16];
+    UCHAR a0[16] = {0};
     UCHAR a0cdb[10] = {0x3C,0x02,0xA0,0,0,0x90,0,0,0x10,0};
-    UCHAR preview[64];
-    UCHAR psense[SENSE_SIZE];
+    UCHAR preview[64] = {0};
+    UCHAR psense[SENSE_SIZE] = {0};
     char  vendor[9]    = {0};
     char  model[17]    = {0};
     char  platform[12] = {0};
     char  serial[16]   = {0};
-    char  shortmodel[9]= {0};
-    const char *p;
-    const char *p2;
-    WORD  driveID   = 0;
-    DWORD unlockKey = 0;
-    DWORD cap       = 0;
-    int   scsiStatus;
-    int   j;
-    int   k;
-    int   i;
+    int   j, i, k, scsiStatus = 0, st = 0;
+    DWORD cap = 0;
+    WORD  driveID = 0;
+    DWORD unlockKey = 0x6123789A;
+    char *p, *p2;
 
     printf("=== PIONEER RS8801 SERVICE MODE UNLOCK ===\n\n");
 
     /* Step 1: INQUIRY */
     printf("[1/6] INQUIRY...\n");
-    memset(inq, 0, sizeof(inq));
-    send_scsi(g_hDrive, icdb, 6, inq, 96,
-              SCSI_IOCTL_DATA_IN, sense, &scsiStatus);
-    if (scsiStatus != 0) { fprintf(stderr, "  INQUIRY failed\n"); return 1; }
-    memcpy(vendor, &inq[8],  8); vendor[8]  = '\0';
-    memcpy(model,  &inq[16],16); model[16]  = '\0';
-    for (j=7;  j>=0 && vendor[j]==' '; j--) vendor[j] = '\0';
-    for (j=15; j>=0 && model[j]==' ';  j--) model[j]  = '\0';
-    printf("  Vendor  : %s\n", vendor);
-    printf("  Model   : %s\n\n", model);
-    if (strncmp(vendor, "PIONEER", 7) != 0) {
-        fprintf(stderr, "  ERROR: Not a Pioneer drive (\"%s\")\n", vendor);
-        return 1;
-    }
-
-    /* Step 2: READ BUFFER 0xF1 */
-    printf("[2/6] READ BUFFER 0xF1...\n");
-    memset(rb, 0, sizeof(rb));
-    rb_data(0xF1, 0, rb, 48, sense2);
-    for (j=0; j<12 && rb[j]  >=0x20&&rb[j]  <0x7F; j++) serial[j]   = rb[j];
-    for (j=0; j<8  && rb[16+j]>=0x20&&rb[16+j]<0x7F; j++) platform[j] = rb[16+j];
     {
-        char month[16]={0}, year[8]={0}, country[32]={0};
-        pioneer_serial_decode(serial, month, year, country);
-        printf("  Serial  : %s\n", serial);
-        printf("  Mfg Date: %s %s\n", month, year);
-        printf("  Country : %s\n", country);
-    }
-    printf("  Platform: %s\n\n", platform);
-    if (!strstr(platform, "8801") && !strstr(platform, "8511") &&
-        !strstr(platform, "8232") && !strstr(platform, "8D30"))
-        printf("  WARNING: Platform \"%s\" may not support this unlock.\n\n", platform);
-    p = platform;
-    while (*p && (*p < '0' || *p > '9')) p++;
-    if (*p) driveID = (WORD)strtol(p, NULL, 16);
-    printf("  Drive ID: 0x%04X\n\n", driveID);
-
-    unlockKey = pioneer_key(driveID, 0);
-    if (g_key_override) {
-        unlockKey = g_key_override;
-        printf("  Using override key: 0x%08lX\n\n", unlockKey);
-    } else {
-        printf("  Using derived key: 0x%08lX\n\n", unlockKey);
-    }
-
-    /* Step 2b: Try READ BUFFER 0xA0 session token method (BDRFlash method)
-       BDRFlash reads 0xA0 at offset 0x90 (144) and sends it back as the unlock payload.
-       This is a challenge-response token that changes each power-on.
-       If available, this method works on ALL drives including post-cutoff! */
-    memset(payload, 0, PAYLOAD_SIZE);
-    memset(a0, 0, sizeof(a0));
-    {
-        int a0st = 0;
-        UCHAR a0sense[SENSE_SIZE];
-        send_scsi(g_hDrive, a0cdb, 10, a0, 16, SCSI_IOCTL_DATA_IN, a0sense, &a0st);
-        /* Check if we got a valid session token vs model string
-           Token starts with 00 00 5C 00 (non-ASCII)
-           Model string starts with ASCII chars like 'B' (0x42) */
-        if (a0st == 0 && a0[0]==0x00 && a0[1]==0x00 && a0[2]!=0x00) {
-            /* Got valid token - use BDRFlash method */
-            memcpy(payload, a0, 16);
-            memcpy(g_a0token, a0, 16); /* save for execution trigger */
-            g_has_token = 1;
-            printf("  Using 0xA0 session token (BDRFlash method):\n  Token: ");
-            for (j=0;j<16;j++) printf("%02X ",a0[j]);
-            printf("\n\n");
-        } else {
-            /* 0xA0 not available - use model string + key method */
-            const char *internal_model = NULL;
-            int mi;
-            printf("  0xA0 token not available - using model string + key method\n\n");
-            for (mi = 0; g_mdl_map[mi].did; mi++) {
-                if (g_mdl_map[mi].did == driveID) {
-                    internal_model = g_mdl_map[mi].str;
-                    break;
-                }
-            }
-            memset(payload, 0, PAYLOAD_SIZE);
-            if (internal_model) {
-                for (j = 0; j < 16 && internal_model[j]; j++)
-                    payload[j] = (UCHAR)internal_model[j];
-                printf("  Using internal model string: \"%s\"\n", internal_model);
-            } else {
-                payload[0]='P'; payload[1]='I'; payload[2]='O';
-                payload[3]='N'; payload[4]='E'; payload[5]='E';
-                payload[6]='R'; payload[7]=' '; payload[8]=' ';
-                p2 = strstr(model, "BDR-");
-                if (!p2) p2 = strstr(model, "DVR-");
-                if (p2) {
-                    for (k = 0; k < 7 && p2[k] && p2[k] != ' '; k++)
-                        payload[9+k] = (UCHAR)p2[k];
-                }
-                printf("  WARNING: No internal model known for 0x%04X, using INQUIRY string\n", driveID);
-            }
-            payload[0x10] = (UCHAR)(unlockKey >>  0);
-            payload[0x11] = (UCHAR)(unlockKey >>  8);
-            payload[0x12] = (UCHAR)(unlockKey >> 16);
-            payload[0x13] = (UCHAR)(unlockKey >> 24);
-            printf("  Payload: ");
-            for (j = 0; j < 20; j++) printf("%02X ", payload[j]);
-            printf("\n  String : \"");
-            for (j = 0; j < 16; j++)
-                printf("%c", payload[j]>=0x20&&payload[j]<0x7F?payload[j]:'.');
-            printf("\"\n\n");
+        memset(inq, 0, sizeof(inq));
+        send_scsi(g_hDrive, icdb, 6, inq, 96, SCSI_IOCTL_DATA_IN, sense, &st);
+        if (st != 0) { fprintf(stderr, "  INQUIRY failed\n"); return 1; }
+        memcpy(vendor, &inq[8],  8);
+        memcpy(model,  &inq[16], 16);
+        for (j=7;  j>=0 && vendor[j]==' '; j--) vendor[j] = '\0';
+        for (j=15; j>=0 && model[j]==' ';  j--) model[j]  = '\0';
+        printf("  Vendor  : %s\n", vendor);
+        printf("  Model   : %s\n\n", model);
+        if (strncmp(vendor, "PIONEER", 7) != 0) {
+            fprintf(stderr, "  ERROR: Not a Pioneer drive\n"); return 1;
         }
     }
 
-    /* Step 3: WRITE BUFFER 0xFF unlock */
-    printf("[3/6] WRITE BUFFER 0xFF unlock...\n");
-    send_scsi(g_hDrive, wcdb, 10, payload, PAYLOAD_SIZE,
-              SCSI_IOCTL_DATA_OUT, sense, &scsiStatus);
-    printf("  Status: %s\n\n", scsiStatus==0 ? "GOOD" : "CHECK CONDITION");
-    if (scsiStatus != 0) {
-        printf("  Sense: key=%02X ASC=%02X ASCQ=%02X\n",
-               sense[2]&0x0F, sense[12], sense[13]);
-        return 1;
+    /* ================================================================
+       CRITICAL ZERO-DELAY SECTION
+       All SCSI ops must happen back-to-back before any printfs!
+       Post-cutoff drives enter kernel mode on 0xF1 read — unlock
+       must follow immediately after.
+       ================================================================ */
+
+    /* 2a: Read 0xA0 to get model string BEFORE 0xF1 triggers kernel mode */
+    {
+        UCHAR a0pre[0x100] = {0};
+        UCHAR a0presense[SENSE_SIZE] = {0};
+        UCHAR a0precdb[10] = {0x3C,0x02,0xA0,0,0,0x90,0,0,0x10,0};
+        int a0prest = 0;
+        send_scsi(g_hDrive, a0precdb, 10, a0pre, 0x100,
+                  SCSI_IOCTL_DATA_IN, a0presense, &a0prest);
+        if (a0prest == 0 && a0pre[0] >= 0x20) {
+            memcpy(g_a0token, a0pre, 0x10);
+            g_has_token = 2;
+        }
     }
 
+    /* 2b: Read 0xF1 — may trigger kernel mode on post-cutoff drives */
+    rb_data(0xF1, 0, rb, 0x30, sense2);
+
+    /* Parse 0xF1 for serial/platform */
+    for (j=0; j<12 && rb[j]>=0x20&&rb[j]<0x7F; j++) serial[j]   = rb[j];
+    for (j=0; j<8  && rb[16+j]>=0x20&&rb[16+j]<0x7F; j++) platform[j] = rb[16+j];
+    p = platform;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (*p) driveID = (WORD)strtol(p, NULL, 16);
+    unlockKey = pioneer_key(driveID, 0);
+    if (!unlockKey) unlockKey = 0x6123789A;
+    if (g_key_override) unlockKey = g_key_override;
+
+    /* 2c: Build payload */
+    memset(payload, 0, PAYLOAD_SIZE);
+    if (g_has_token == 2 && g_a0token[0] >= 0x20) {
+        /* Use model string from 0xA0 pre-read */
+        memcpy(payload, g_a0token, 0x10);
+    } else {
+        /* Use g_mdl_map */
+        int mi;
+        for (mi = 0; g_mdl_map[mi].did; mi++) {
+            if (g_mdl_map[mi].did == driveID) {
+                memcpy(payload, g_mdl_map[mi].str, 16);
+                break;
+            }
+        }
+        if (!payload[0]) {
+            /* Fallback: PIONEER + model from INQUIRY */
+            memcpy(payload, "PIONEER BDR-    ", 16);
+            p2 = strstr(model, "BDR-");
+            if (p2) { for (k=0; k<7&&p2[k]&&p2[k]!=' '; k++) payload[9+k]=(UCHAR)p2[k]; }
+        }
+    }
+    payload[0x10]=(UCHAR)(unlockKey>> 0);
+    payload[0x11]=(UCHAR)(unlockKey>> 8);
+    payload[0x12]=(UCHAR)(unlockKey>>16);
+    payload[0x13]=(UCHAR)(unlockKey>>24);
+
+    /* Step 3: WRITE BUFFER unlock sweep — try all modes immediately! */
+    {
+        UCHAR modes[]  = {0x04, 0x01, 0x00, 0x0A, 0x0B, 0x0C, 0x0D};
+        UCHAR bufids[] = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        int found = 0;
+        for (i = 0; i < 7; i++) {
+            UCHAR ucdb[10] = {0x3B,modes[i],bufids[i],0,0,0,0,0x00,0x20,0};
+            UCHAR usense[SENSE_SIZE] = {0};
+            int ust = 0;
+            send_scsi(g_hDrive, ucdb, 10, payload, 0x20,
+                      SCSI_IOCTL_DATA_OUT, usense, &ust);
+            if (ust == 0 || (usense[2]&0x0F) == 0x00) {
+                g_unlock_mode  = modes[i];
+                g_unlock_bufid = bufids[i];
+                found = 1;
+                memcpy(sense, usense, SENSE_SIZE);
+                break;
+            }
+            memcpy(sense, usense, SENSE_SIZE);
+        }
+
+        /* ===== NOW safe to print ===== */
+        printf("[2/6] READ BUFFER 0xF1...\n");
+        {
+            char month[16]={0}, year[32]={0}, country[32]={0};
+            pioneer_serial_decode(serial, month, year, country);
+            printf("  Serial  : %s\n", serial);
+            printf("  Mfg Date: %s %s\n", month, year);
+            printf("  Country : %s\n", country);
+            printf("  Platform: %s\n", platform);
+            printf("  Drive ID: 0x%04X\n\n", driveID);
+        }
+
+        printf("[3/6] WRITE BUFFER unlock...\n");
+        printf("  Payload : %.16s + 0x%08lX\n", (char*)payload, unlockKey);
+        if (found) {
+            printf("  Status  : GOOD (mode=0x%02X bufID=0x%02X)\n\n",
+                   g_unlock_mode, g_unlock_bufid);
+        } else {
+            printf("  Status  : FAIL (key=%02X ASC=%02X)\n",
+                   sense[2]&0x0F, sense[12]);
+            printf("  ERROR: All unlock modes rejected.\n");
+            return 1;
+        }
+    }
     Sleep(500);
 
     /* Step 4: GET EVENT STATUS */
     printf("[4/6] GET EVENT STATUS...\n");
-    memset(es, 0, sizeof(es));
-    send_scsi(g_hDrive, escdb, 10, es, 8,
-              SCSI_IOCTL_DATA_IN, sense, &scsiStatus);
+    send_scsi(g_hDrive, escdb, 10, es, 8, SCSI_IOCTL_DATA_IN, sense, &scsiStatus);
     printf("  Event: %02X %02X %02X %02X\n\n", es[0],es[1],es[2],es[3]);
-
     Sleep(100);
 
     /* Step 5: INQUIRY again */
@@ -1366,20 +1105,16 @@ static int cmd_unlock(void)
 
     /* Step 6: READ BUFFER 0xA0 */
     printf("[6/6] READ BUFFER 0xA0...\n");
-    memset(a0, 0, sizeof(a0));
-    send_scsi(g_hDrive, a0cdb, 10, a0, 16,
-              SCSI_IOCTL_DATA_IN, sense, &scsiStatus);
+    send_scsi(g_hDrive, a0cdb, 10, a0, 16, SCSI_IOCTL_DATA_IN, sense, &scsiStatus);
     printf("  Response: ");
     for (i = 0; i < 16; i++) printf("%02X ", a0[i]);
     printf("\n\n");
-
     Sleep(100);
 
-    /* Verify 0xF4 */
+    /* Verify 0xF4 accessibility */
     printf("Verifying 0xF4 accessibility...\n");
     if (!rb_descriptor(0xF4, &cap) && cap > 0) {
         printf("  0xF4 accessible! Capacity: 0x%08lX bytes\n", cap);
-        memset(preview, 0, sizeof(preview));
         if (rb_data(0xF4, 0, preview, 64, psense) == 0) {
             printf("  Preview:");
             hex_dump(preview, 64, 64);
@@ -1388,106 +1123,12 @@ static int cmd_unlock(void)
         printf("  Run: drivekit rawdump %c\n", g_drivePath[4]);
     } else {
         printf("  0xF4 not accessible after unlock.\n");
-        printf("  Key may be incorrect - run: drivekit keycheck %c\n",
-               g_drivePath[4]);
+        printf("  Key may be incorrect - try: drivekit brutekey %c\n", g_drivePath[4]);
     }
 
     return 0;
 }
 
-/* =========================================================
-   COMMAND: resetdrive
-   ========================================================= */
-static int cmd_resetdrive(void)
-{
-    DWORD bytesReturned;
-    int   anySuccess = 0;
-    UCHAR sense[SENSE_SIZE];
-
-    printf("=== DRIVE RESET ===\n\n");
-
-    /* Method 1: device reset */
-    printf("Method 1: IOCTL_STORAGE_RESET_DEVICE...\n");
-    if (DeviceIoControl(g_hDrive, IOCTL_STORAGE_RESET_DEVICE,
-                        NULL,0,NULL,0,&bytesReturned,NULL)) {
-        printf("  [OK]\n"); anySuccess = 1;
-    } else {
-        printf("  [--] error %lu\n", GetLastError());
-    }
-
-    Sleep(500);
-
-    /* Method 2: request sense */
-    printf("Method 2: REQUEST SENSE...\n");
-    {
-        UCHAR sb[18];
-        UCHAR cdb[6]={0x03,0,0,0,0x12,0};
-        int   status;
-        memset(sb, 0, sizeof(sb));
-        if (!send_scsi(g_hDrive, cdb, 6, sb, 18,
-                       SCSI_IOCTL_DATA_IN, sense, &status)
-            && status == 0) {
-            printf("  [OK] sense key=0x%02X ASC=0x%02X\n",
-                   sb[2]&0x0F, sb[12]);
-            anySuccess = 1;
-        } else {
-            printf("  [--] error %lu\n", GetLastError());
-        }
-    }
-
-    Sleep(500);
-
-    /* Method 3: bus reset */
-    printf("Method 3: IOCTL_STORAGE_RESET_BUS...\n");
-    {
-        STORAGE_BUS_RESET_REQUEST req;
-        memset(&req, 0, sizeof(req));
-        if (DeviceIoControl(g_hDrive, IOCTL_STORAGE_RESET_BUS,
-                            &req,sizeof(req),NULL,0,
-                            &bytesReturned,NULL)) {
-            printf("  [OK]\n"); anySuccess = 1;
-        } else {
-            printf("  [--] error %lu\n", GetLastError());
-        }
-    }
-
-    Sleep(1000);
-
-    /* Method 4: poll ready */
-    printf("Method 4: TEST UNIT READY...\n");
-    int i;
-    for (i = 0;  i < 10; i++) {
-        UCHAR cdb[6]={0,0,0,0,0,0};
-        SPTD_EX sx;
-        DWORD br;
-        memset(&sx,0,sizeof(sx));
-        sx.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT);
-        sx.sptd.CdbLength=6;
-        sx.sptd.SenseInfoLength=SENSE_SIZE;
-        sx.sptd.DataIn=SCSI_IOCTL_DATA_UNSPECIFIED;
-        sx.sptd.TimeOutValue=5;
-        sx.sptd.SenseInfoOffset=offsetof(SPTD_EX,sense);
-        memcpy(sx.sptd.Cdb,cdb,6);
-        DeviceIoControl(g_hDrive,IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                        &sx,sizeof(sx),&sx,sizeof(sx),&br,NULL);
-        if (sx.sptd.ScsiStatus==0) {
-            printf("  [OK] Ready (attempt %d)\n", i+1);
-            anySuccess=1; break;
-        }
-        printf("  Attempt %d: status=0x%02X\n",
-               i+1, sx.sptd.ScsiStatus);
-        Sleep(1000);
-    }
-
-    printf("\n%s\n", anySuccess ?
-           "Reset complete. Try accessing the drive now." :
-           "All methods failed. Drive needs full power cycle.");
-    return 0;
-}
-
-/* =========================================================
-   COMMAND: probevendor
-   ========================================================= */
 static int cmd_probevendor(void)
 {
     UCHAR buf[256], sense[SENSE_SIZE], cdb[12];
@@ -1560,192 +1201,6 @@ static int cmd_probevendor(void)
    probes the HIT vendor command 0xE7, dumps READ BUFFER
    regions and checks ARM reset vector for IDA analysis.
    ========================================================= */
-static int cmd_mt1959(void)
-{
-    UCHAR buf[256], sense[SENSE_SIZE], cdb[12];
-    int   st = 0;
-    int   i;
-
-    printf("=== MT1959 PROBE (HLDS/LG) ===\n\n");
-
-    /* ---- Step 1: INQUIRY - confirm HLDS vendor ---- */
-    printf("[1] INQUIRY\n");
-    {
-        UCHAR icdb[6] = {0x12,0,0,0,96,0};
-        UCHAR inq[96];
-        char  vendor[9]={0}, model[17]={0}, rev[5]={0};
-        int   j;
-
-        memset(inq, 0, sizeof(inq));
-        send_scsi(g_hDrive, icdb, 6, inq, 96,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        if (st == 0) {
-            memcpy(vendor, &inq[8],  8); vendor[8]  = '\0';
-            memcpy(model,  &inq[16],16); model[16]  = '\0';
-            memcpy(rev,    &inq[32], 4); rev[4]     = '\0';
-            for (j=7;  j>=0 && vendor[j]==' '; j--) vendor[j]='\0';
-            for (j=15; j>=0 && model[j]==' ';  j--) model[j] ='\0';
-            for (j=3;  j>=0 && rev[j]==' ';    j--) rev[j]   ='\0';
-            printf("  Vendor  : %s\n", vendor);
-            printf("  Model   : %s\n", model);
-            printf("  Firmware: %s\n", rev);
-
-            /* Confirm HLDS */
-            if (memmem_win(vendor, 8, "HL-DT-ST", 8) ||
-                memmem_win(vendor, 8, "HLDS",     4))
-                printf("  *** HLDS (Hitachi-LG) confirmed ***\n");
-            else
-                printf("  NOTE: Vendor is not HLDS - may not be MT1959\n");
-        } else {
-            printf("  INQUIRY failed\n");
-        }
-    }
-    printf("\n");
-
-    /* ---- Step 2: Feature 0x0113 - LibreDrive status ---- */
-    printf("[2] GET CONFIGURATION - Feature 0x0113\n");
-    {
-        UCHAR gcdb[10] = {0x46,0x02,0x01,0x13,0,0,0,0x02,0,0};
-        UCHAR feat[512];
-        BOOL  has0113 = FALSE;
-        WORD  code;
-        UCHAR cur;
-
-        memset(feat, 0, sizeof(feat));
-        send_scsi(g_hDrive, gcdb, 10, feat, 512,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        if (st == 0) {
-            code = ((WORD)feat[8]<<8)|feat[9];
-            cur  = feat[10] & 0x01;
-            if (code == 0x0113) {
-                has0113 = TRUE;
-                printf("  Feature 0x0113 : PRESENT\n");
-                printf("  Current        : %s\n", cur?"Yes (active)":"No");
-                printf("  *** LibreDrive firmware CONFIRMED ***\n");
-            } else {
-                printf("  Feature 0x0113 : Not present\n");
-                printf("  Status         : Original firmware (not patched)\n");
-            }
-        } else {
-            printf("  GET CONFIGURATION failed: key=%02X ASC=%02X\n",
-                   sense[2]&0x0F, sense[12]);
-        }
-        (void)has0113;
-    }
-    printf("\n");
-
-    /* ---- Step 3: 0xE7 HIT vendor command ---- */
-    printf("[3] Vendor command 0xE7 (HIT identifier)\n");
-    {
-        UCHAR vcdb[12] = {0xE7,0x48,0x49,0x54,0,0,0,0,0x20,0,0,0};
-        char  str[32]  = {0};
-        int   slen     = 0;
-
-        memset(buf, 0, sizeof(buf));
-        send_scsi(g_hDrive, vcdb, 12, buf, 32,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        if (st == 0) {
-            printf("  Response:");
-            for (i = 0; i < 32; i++) {
-                if (i%16==0) printf("\n    ");
-                printf("%02X ", buf[i]);
-            }
-            printf("\n");
-            for (i = 0; i < 32 && slen < 20; i++) {
-                if (buf[i] >= 0x20 && buf[i] < 0x7F)
-                    str[slen++] = buf[i];
-                else if (slen > 2) break;
-            }
-            if (slen > 0) printf("  String   : %s\n", str);
-            printf("  *** 0xE7 HIT responded - MT1959 confirmed ***\n");
-        } else {
-            printf("  0xE7 HIT: sense key=%02X ASC=%02X\n",
-                   sense[2]&0x0F, sense[12]);
-            printf("  NOTE: Drive may not support 0xE7 HIT\n");
-        }
-    }
-    printf("\n");
-
-    /* ---- Step 4: READ BUFFER descriptor scan ---- */
-    printf("[4] READ BUFFER scan\n");
-    {
-        UCHAR ids[] = {0x00,0x01,0x02,0x03,0x04,
-                       0x10,0x20,0x80,0x81,0x82,
-                       0xF0,0xF1,0xF4,0xFE,0xFF};
-        UCHAR preview[16];
-        DWORD cap;
-        int   n = sizeof(ids)/sizeof(ids[0]);
-        int   j;
-
-        for (i = 0; i < n; i++) {
-            UCHAR id = ids[i];
-            if (rb_descriptor(id, &cap) || cap == 0) continue;
-            printf("  Buffer 0x%02X : 0x%08lX bytes (%lu KB)\n",
-                   id, cap, cap/1024);
-
-            memset(preview, 0, sizeof(preview));
-            if (rb_data(id, 0, preview, 16, sense) == 0) {
-                printf("    Preview:");
-                for (j = 0; j < 16; j++)
-                    printf(" %02X", preview[j]);
-                printf("\n");
-
-                if (preview[3] == 0xEA)
-                    printf("    *** ARM branch at offset 0 "
-                           "- possible firmware entry ***\n");
-                if (preview[0]==0x00 && preview[1]==0x00 &&
-                    preview[2]==0xA0 && preview[3]==0xE3)
-                    printf("    *** ARM MOV r0,r0 - "
-                           "possible ARM code (little-endian) ***\n");
-                if (preview[0]=='M' && preview[1]=='T')
-                    printf("    *** MT header signature ***\n");
-            }
-        }
-    }
-    printf("\n");
-
-    /* ---- Step 5: 0xE1 LibreDrive active check ---- */
-    printf("[5] 0xE1 LDRE signature check\n");
-    {
-        memset(cdb, 0, sizeof(cdb));
-        memset(buf, 0, sizeof(buf));
-        cdb[0] = 0xE1; cdb[8] = 0xFF;
-        send_scsi(g_hDrive, cdb, 12, buf, 32,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        if (st == 0) {
-            printf("  Response:");
-            for (i = 0; i < 16; i++) printf(" %02X", buf[i]);
-            printf("\n");
-            if (buf[0]=='L'&&buf[1]=='D'&&buf[2]=='R'&&buf[3]=='E')
-                printf("  *** LDRE signature - LibreDrive ACTIVE ***\n");
-            else
-                printf("  No LDRE signature\n");
-        } else {
-            printf("  0xE1 not supported: key=%02X ASC=%02X\n",
-                   sense[2]&0x0F, sense[12]);
-        }
-    }
-    printf("\n");
-
-    /* ---- Step 6: IDA guidance ---- */
-    printf("[6] IDA Pro guidance for MT1959\n");
-    printf("  Architecture : ARM little-endian\n");
-    printf("  Processor    : ARM926EJ-S (ARMv5TEJ)\n");
-    printf("  Endian       : Little\n");
-    printf("  IDA setting  : ARM Little-endian [ARM]\n");
-    printf("  Base arch    : ARMv5TEJ\n");
-    printf("  ROM base     : 0x00000000\n");
-    printf("  Reset vector : offset 0x00000000\n");
-    printf("  Look for     : EA xx xx xx (ARM branch at reset)\n");
-    printf("  Note         : firmware may be encrypted on flash\n");
-    printf("                 extract executable before loading\n\n");
-
-    printf("  Dump command : drivekit rawdump G --bufid 0x01\n");
-    printf("                 (buffer 0x01 most likely ARM executable)\n");
-
-    return 0;
-}
-
 /* =========================================================
    COMMAND: discstruct
    READ DISC STRUCTURE (opcode 0xAD)
@@ -1974,171 +1429,6 @@ static int cmd_discinfo(void)
 
     #undef READ_DS
     printf("\n");
-    return 0;
-}
-
-static int cmd_discstruct(void)
-{
-    UCHAR   buf[4096];
-    UCHAR   sense[SENSE_SIZE];
-    UCHAR   cdb[12];
-    int     st = 0;
-    DWORD   structLen = 0;
-    WORD    code      = (WORD)strtol(g_outFile[0] ? "0" : "0", NULL, 16);
-    WORD    length    = (WORD)sizeof(buf);
-    FILE   *fp        = NULL;
-    char    fname[256];
-    int     i;
-
-    /* g_bufID is reused to carry the structure code when
-       user passes --bufid 0x0001 etc                     */
-    code = ((WORD)g_bufID << 8) | 0x00;
-
-    /* Actually use a dedicated global would be cleaner -
-       for now accept --bufid lo-byte as code low byte
-       and treat the full 16-bit value from strtol        */
-    code = g_bufID;   /* user passes --bufid 0x0000..0x00FF */
-
-    printf("=== READ DISC STRUCTURE (0xAD) ===\n\n");
-    printf("  Structure code : 0x%04X\n", code);
-    printf("  Buffer size    : %u bytes\n\n", length);
-
-    /* Build CDB - matches QueryDiscStructure exactly */
-    memset(cdb, 0, sizeof(cdb));
-    cdb[0]  = 0xAD;
-    cdb[1]  = (UCHAR)(code >> 8);   /* format / code high byte */
-    cdb[7]  = (UCHAR)(code);        /* code low byte           */
-    cdb[8]  = (UCHAR)(length >> 8); /* allocation length high  */
-    cdb[9]  = (UCHAR)(length);      /* allocation length low   */
-
-    memset(buf, 0xEE, sizeof(buf)); /* sentinel like MakeMKV   */
-
-    if (send_scsi(g_hDrive, cdb, 12, buf, length,
-                  SCSI_IOCTL_DATA_IN, sense, &st)) {
-        fprintf(stderr, "  IOCTL failed\n");
-        return 1;
-    }
-
-    if (st != 0) {
-        printf("  SCSI status    : CHECK CONDITION\n");
-        printf("  Sense key      : 0x%02X\n", sense[2]&0x0F);
-        printf("  ASC            : 0x%02X\n", sense[12]);
-        printf("  ASCQ           : 0x%02X\n", sense[13]);
-        printf("  No disc structure available for code 0x%04X\n", code);
-        return 1;
-    }
-
-    /* Parse structure length from response header
-       Matches MakeMKV: rd16be(Buffer) + 2
-       and checks rd16be(Buffer+2) == 0               */
-    {
-        WORD dataLen  = ((WORD)buf[0]<<8) | buf[1];
-        WORD reserved = ((WORD)buf[2]<<8) | buf[3];
-
-        if (reserved != 0x0000) {
-            printf("  Reserved field non-zero (0x%04X) "
-                   "- no valid structure\n", reserved);
-            structLen = 0;
-        } else {
-            structLen = (DWORD)dataLen + 2;
-        }
-    }
-
-    if (structLen == 0) {
-        printf("  Structure length : 0 - no data returned\n");
-        return 0;
-    }
-
-    if (structLen > sizeof(buf)) structLen = sizeof(buf);
-
-    printf("  Structure length : %lu bytes\n\n", structLen);
-
-    /* Hex dump the structure */
-    printf("  Data:\n");
-    for (i = 0; i < (int)structLen; i++) {
-        if (i % 16 == 0) printf("    %04X  ", i);
-        printf("%02X ", buf[i]);
-        if (i % 16 == 15 || i == (int)structLen-1) {
-            int pad = 15 - (i % 16);
-            int j, lineStart = i - (i%16);
-            for (j=0; j<pad*3; j++) printf(" ");
-            printf("  ");
-            for (j = lineStart; j <= i; j++)
-                printf("%c", (buf[j]>=0x20&&buf[j]<0x7F)?buf[j]:'.');
-            printf("\n");
-        }
-    }
-
-    /* Decode common structures */
-    printf("\n  Decoded:\n");
-    switch (code) {
-    case 0x0000:
-    case 0x0001:
-        /* Physical format information */
-        if (structLen >= 8) {
-            UCHAR *d = buf + 4;
-            printf("  Book type      : 0x%X (%s)\n",
-                   (d[0]>>4)&0xF,
-                   ((d[0]>>4)&0xF)==0?"DVD-ROM":
-                   ((d[0]>>4)&0xF)==1?"DVD-RAM":
-                   ((d[0]>>4)&0xF)==2?"DVD-R":
-                   ((d[0]>>4)&0xF)==3?"DVD-RW":
-                   ((d[0]>>4)&0xF)==9?"DVD+RW":
-                   ((d[0]>>4)&0xF)==0xA?"DVD+R":"Other");
-            printf("  Part version   : %u\n",   d[0]&0xF);
-            printf("  Disc size      : %s\n",   (d[1]>>4)&0xF ? "80mm":"120mm");
-            printf("  Max rate       : %s\n",
-                   (d[1]&0xF)==0?"2.52 Mbps":
-                   (d[1]&0xF)==1?"5.04 Mbps":
-                   (d[1]&0xF)==2?"10.08 Mbps":"Other");
-            printf("  Num layers     : %u\n",   (d[2]>>5)&0x3);
-            printf("  Track path     : %s\n",   (d[2]>>4)&1?"Opposite":"Parallel");
-            printf("  Layer type     : 0x%X\n", d[2]&0xF);
-            printf("  Linear density : 0x%X\n", (d[3]>>4)&0xF);
-            printf("  Track density  : 0x%X\n", d[3]&0xF);
-            if (structLen >= 16) {
-                DWORD startPSN = ((DWORD)d[5]<<16)|((DWORD)d[6]<<8)|d[7];
-                DWORD endPSN   = ((DWORD)d[9]<<16)|((DWORD)d[10]<<8)|d[11];
-                printf("  Start PSN      : 0x%06lX\n", startPSN);
-                printf("  End PSN        : 0x%06lX\n", endPSN);
-            }
-        }
-        break;
-
-    case 0x000C:
-        /* BCA */
-        printf("  BCA data length: %lu bytes\n", structLen - 4);
-        break;
-
-    case 0x0100:
-        /* BD disc info */
-        if (structLen >= 8) {
-            printf("  BD disc info   : %lu bytes of data\n",
-                   structLen - 4);
-            /* First 4 bytes after header often contain disc type */
-            printf("  Disc type byte : 0x%02X\n", buf[4]);
-        }
-        break;
-
-    default:
-        printf("  (no decoder for code 0x%04X - raw dump above)\n",
-               code);
-        break;
-    }
-
-    /* Save to file if requested */
-    if (g_outFile[0]) {
-        strncpy(fname, g_outFile, sizeof(fname)-1);
-        fp = fopen(fname, "wb");
-        if (fp) {
-            fwrite(buf, 1, structLen, fp);
-            fclose(fp);
-            printf("\n  Saved %lu bytes to %s\n", structLen, fname);
-        } else {
-            fprintf(stderr, "\n  Cannot create %s\n", fname);
-        }
-    }
-
     return 0;
 }
 
@@ -2843,6 +2133,38 @@ static void build_pioneer_payload_auto(UCHAR *payload)
     int   ti;
     const char *p;
 
+    /* Try 0xA0 FIRST before 0xF1 — post-cutoff drives return model+key from 0xA0
+       but 0xF1 may trigger kernel mode on post-cutoff drives! */
+    {
+        UCHAR a0buf[0x100] = {0};
+        UCHAR a0sense[SENSE_SIZE];
+        UCHAR a0cdb[10] = {0x3C,0x02,0xA0,0,0,0x90,0,0,0x10,0};
+        int a0st = 0;
+        /* Request 0x10 bytes but provide 0x100 buffer — drive returns key at 0x10-0x13 */
+        send_scsi(g_hDrive, a0cdb, 10, a0buf, 0x100,
+                  SCSI_IOCTL_DATA_IN, a0sense, &a0st);
+        if (a0st == 0 && a0buf[0] >= 0x20) {
+            /* A0 returned a model string — use it directly as payload!
+               Key is at offset 0x10-0x13 of the response */
+            memcpy(payload, a0buf, 0x14);
+            printf("  [DBG] Using 0xA0: %.16s key=%02X%02X%02X%02X\n",
+                   (char*)payload,
+                   payload[0x10],payload[0x11],payload[0x12],payload[0x13]);
+            /* If key is zero, use derived key from driveID */
+            if (payload[0x10]==0 && payload[0x11]==0 && 
+                payload[0x12]==0 && payload[0x13]==0) {
+                DWORD k = pioneer_key(0x8B30, 0); /* use platform-specific key */
+                if (!k) k = 0x6123789A;
+                payload[0x10]=(UCHAR)(k>> 0);
+                payload[0x11]=(UCHAR)(k>> 8);
+                payload[0x12]=(UCHAR)(k>>16);
+                payload[0x13]=(UCHAR)(k>>24);
+                printf("  [DBG] Key was zero, using derived 0x%08lX\n", k);
+            }
+            return;
+        }
+    }
+
     memset(rb, 0, sizeof(rb));
     if (rb_data(0xF1, 0, rb, 0x30, sense) == 0) {
         /* Copy platform string properly with null termination */
@@ -2937,7 +2259,7 @@ static int cmd_modelcheck(void)
         }
         printf("  Serial  : %s\n", serial);
         {
-            char month[16]={0}, year[8]={0}, country[32]={0};
+            char month[16]={0}, year[32]={0}, country[32]={0};
             pioneer_serial_decode(serial, month, year, country);
             printf("  Mfg Date: %s %s\n", month, year);
             printf("  Country : %s\n", country);
@@ -3107,9 +2429,11 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     case 0x8000: return 0xC2DAB750;
     /* BDR-TD05 */
     case 0x8211: return 0xC2DAB751;
-    /* BDR-XD05 */
+    /* BDR-XD05 pre-cutoff */
     case 0x8221:
-    case 0x8231: return 0x6123789A; /* uses default ASUS key */
+    case 0x8231: return 0x6123789A; /* uses default key */
+    /* BDR-XD05 post-cutoff (2232 variant) - key found in BDR-XD05BKXL2 updater.exe */
+    case 0x8232: return 0xBE4B8754;
     /* BDR-US02 */
     case 0x8410:
     case 0x8420:
@@ -3123,10 +2447,12 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     case 0x8600:
     case 0x8601:
     case 0x8680: return 0xC2DAB755;
-    /* BDR-XS06 */
+    /* BDR-XD06U pre-cutoff */
     case 0x8721:
     case 0x8722:
-    case 0x8B30: return 0x6123789A; /* uses default ASUS key */
+    case 0x8B30: return 0x08A98AF2; /* XD06U — post-cutoff key from updater.exe */
+    /* BDR-XD06U post-cutoff — key from BDR-XD06J-UHD updater.exe */
+    case 0x8B31: return 0x08A98AF2;
     /* BDR-211M  <- your drive (rebranded, uses ASUS key) */
     case 0x8800: return 0xC2DAB750;
     case 0x8801: return 0x6123789A;  /* rebranded ASUS variant - also accepts 0x5CF2E094 (confirmed H8S/2000 asm) */
@@ -3295,158 +2621,6 @@ static int cmd_keycheck(void)
    Usage:
      drivekit probewb G
    ========================================================= */
-static int cmd_probewb(void)
-{
-    UCHAR  sense[SENSE_SIZE];
-    UCHAR  inq[96];
-    UCHAR  rb[64];
-    UCHAR  payload[256];
-    char   vendor[9]   = {0};
-    char   model[17]   = {0};
-    char   platform[12]= {0};
-    char   shortmodel[8]={0};
-    WORD   driveID     = 0;
-    DWORD  key         = 0;
-    int    j, m, l;
-    int    st          = 0;
-
-    printf("=== WRITE BUFFER 0xFF PROBE ===\n\n");
-
-    /* INQUIRY */
-    {
-        UCHAR cdb[6] = {0x12,0,0,0,96,0};
-        memset(inq, 0, sizeof(inq));
-        send_scsi(g_hDrive, cdb, 6, inq, 96,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        if (st != 0) { fprintf(stderr, "INQUIRY failed\n"); return 1; }
-        memcpy(vendor, &inq[8],  8); vendor[8]  = '\0';
-        memcpy(model,  &inq[16],16); model[16]  = '\0';
-        for (j=7;  j>=0 && vendor[j]==' '; j--) vendor[j] = '\0';
-        for (j=15; j>=0 && model[j]==' ';  j--) model[j]  = '\0';
-        printf("  Vendor  : %s\n", vendor);
-        printf("  Model   : %s\n", model);
-    }
-
-
-    printf("  Key     : 0x%08lX\n\n", key);
-
-    /* Extract short model for payload */
-    {
-        const char *p = strstr(model, "BDR-");
-        if (!p) p = strstr(model, "DVR-");
-        if (p) {
-            for (j=0; j<7 && p[j] && p[j]!=' '; j++)
-                shortmodel[j] = p[j];
-        }
-    }
-
-    /* Build base payload - "PIONEER  BDR-211" + key */
-    memset(payload, 0, sizeof(payload));
-    payload[0]='P'; payload[1]='I'; payload[2]='O';
-    payload[3]='N'; payload[4]='E'; payload[5]='E';
-    payload[6]='R'; payload[7]=' '; payload[8]=' ';
-    for (j=0; j<7 && shortmodel[j]; j++)
-        payload[9+j] = shortmodel[j];
-    payload[0x10] = (UCHAR)(key);
-    payload[0x11] = (UCHAR)(key>>8);
-    payload[0x12] = (UCHAR)(key>>16);
-    payload[0x13] = (UCHAR)(key>>24);
-
-    printf("  Base payload:\n  ");
-    for (j=0; j<20; j++) printf("%02X ", payload[j]);
-    printf("\n  \"");
-    for (j=0; j<16; j++)
-        printf("%c", payload[j]>=0x20&&payload[j]<0x7F?payload[j]:'.');
-    printf("\"\n\n");
-
-    /* Modes and lengths to try - mode 7 + bufFE is from Wireshark capture */
-    static const UCHAR modes[]   = {0x07, 0x04, 0x05, 0x06, 0x01};
-    static const UCHAR bufids[]  = {0xFE, 0xFF};
-    static const DWORD lengths[] = {0x8000, 0x100, 0x14, 0x10,
-                                    0x18, 0x1C, 0x20, 0x40};
-    int nmodes   = sizeof(modes)/sizeof(modes[0]);
-    int nbufids  = sizeof(bufids)/sizeof(bufids[0]);
-    int nlengths = sizeof(lengths)/sizeof(lengths[0]);
-
-    printf("  Probing %d modes x %d bufIDs x %d lengths...\n\n",
-           nmodes, nbufids, nlengths);
-    printf("  %-6s  %-6s  %-8s  %-16s  %s\n",
-           "Mode", "BufID", "Length", "Status", "Sense");
-    printf("  %-6s  %-6s  %-8s  %-16s  %s\n",
-           "------","------","--------","----------------","-----");
-
-    for (m = 0; m < nmodes; m++) {
-        int b;
-        for (b = 0; b < nbufids; b++) {
-        for (l = 0; l < nlengths; l++) {
-            UCHAR cdb[10];
-            DWORD len = lengths[l];
-            UCHAR bufid = bufids[b];
-
-            memset(cdb, 0, sizeof(cdb));
-            cdb[0] = 0x3B;
-            cdb[1] = modes[m];
-            cdb[2] = bufid;
-            cdb[6] = (UCHAR)(len>>16);
-            cdb[7] = (UCHAR)(len>>8);
-            cdb[8] = (UCHAR)(len);
-
-            memset(sense, 0, SENSE_SIZE);
-            send_scsi(g_hDrive, cdb, 10, payload,
-                      (len > PAYLOAD_SIZE) ? PAYLOAD_SIZE : len,
-                      SCSI_IOCTL_DATA_OUT, sense, &st);
-
-            UCHAR skey  = sense[2] & 0x0F;
-            UCHAR asc   = sense[12];
-            UCHAR ascq  = sense[13];
-
-            printf("  0x%02X    0x%02X   0x%04lX   ",
-                   modes[m], bufid, len);
-
-            if (st == 0) {
-                printf("*** GOOD ***      ");
-                printf("no error\n");
-
-                /* Immediately verify 0xF4 */
-                DWORD cap = 0;
-                if (!rb_descriptor(0xF4, &cap) && cap > 0) {
-                    printf("\n  *** 0xF4 ACCESSIBLE - SERVICE MODE ACTIVE ***\n");
-                    printf("  Mode=0x%02X BufID=0x%02X Length=0x%04lX\n",
-                           modes[m], bufid, len);
-                    printf("  Run: drivekit rawdump %c\n",
-                           g_drivePath[4]);
-                    return 0;
-                } else {
-                    printf("  (0xF4 not accessible yet)\n");
-                }
-            } else {
-                if (skey==0x05 && asc==0x20)
-                    printf("ILLEGAL CMD       ");
-                else if (skey==0x05 && asc==0x26)
-                    printf("INVALID PARAM     ");
-                else if (skey==0x05 && asc==0x24)
-                    printf("INVALID FIELD CDB ");
-                else if (skey==0x05 && asc==0x25)
-                    printf("LUN NOT SUPPORTED ");
-                else
-                    printf("CHECK CONDITION   ");
-                printf("key=%02X ASC=%02X ASCQ=%02X\n",
-                       skey, asc, ascq);
-            }
-
-            Sleep(100);
-        }
-        }
-    }
-
-    printf("\n  Probe complete.\n");
-    printf("  If all return INVALID PARAM (ASC=26) the payload\n");
-    printf("  content may need adjustment - capture BDRFlash USB\n");
-    printf("  traffic with Wireshark to get the exact bytes.\n");
-
-    return 0;
-}
-
 /* =========================================================
    COMMAND: brutekey
    Tries all known Pioneer keys with the correct CDB
@@ -3642,21 +2816,54 @@ static void pioneer_serial_decode(const char *serial,
             strcpy(month_out, "Unknown");
     }
 
-    /* Year: exact formula unknown - show raw sequence digits */
+    /* Year: position 0 = year letter
+       Old format (pre-2021): A=2001, B=2002, ... N=2014, ... Z=2026
+       New format (post-2021 reset): A=2021/2022, B=2022, C=2023, D=2024, E=2025, F=2026
+       O=2020 seen in new format too
+       Source: cxplay (MakeMKV forum) - confirmed against known drive production dates */
     if (year_out) {
-        char seq[5] = {0};
-        int i, valid = 1;
-        for (i = 0; i < 4; i++) {
-            if (serial[4+i] < '0' || serial[4+i] > '9') { valid = 0; break; }
-            seq[i] = serial[4+i];
+        char year_letter = serial[0];
+        int year = -1;
+
+        /* New format detection - if sequence number starts high (>026000 approx)
+           and letter is A-F, likely new format. Heuristic: use new format if
+           letter A-F and sequence > 020000 */
+        int seq_num = 0;
+        { int i, valid=1;
+          for(i=0;i<4;i++){
+              if(serial[4+i]<'0'||serial[4+i]>'9'){valid=0;break;}
+              seq_num=seq_num*10+(serial[4+i]-'0');
+          }
+          if(!valid) seq_num=0;
         }
-        if (valid) strcpy(year_out, seq);
-        else       strcpy(year_out, "?");
+
+        /* Try new format first for A-F if sequence > 20000 */
+        if (seq_num > 20000 && year_letter >= 'A' && year_letter <= 'F') {
+            int new_years[] = {2021, 2022, 2023, 2024, 2025, 2026};
+            year = new_years[year_letter - 'A'];
+        } else if (year_letter == 'O' && seq_num > 40000) {
+            year = 2020; /* O=2020 in new format */
+        } else {
+            /* Old format: A=2001 ... Z=2026 */
+            if (year_letter >= 'A' && year_letter <= 'Z')
+                year = 2001 + (year_letter - 'A');
+        }
+
+        if (year > 0) {
+            char seq[5]={0}; int i;
+            for(i=0;i<4;i++) seq[i]=serial[4+i];
+            snprintf(year_out, 32, "%d (seq:%s)", year, seq);
+        } else {
+            char seq[5]={0}; int i;
+            for(i=0;i<4;i++) seq[i]=serial[4+i];
+            snprintf(year_out, 32, "? (seq:%s)", seq);
+        }
     }
 
     /* Country code: positions 2-3 loaded as little-endian 16-bit word
        i.e. cc = (serial[3]<<8) | serial[2]
-       Matches BDRFlash x86: mov bx,[esi+2] then CMP BX, XXXX */
+       Factory codes confirmed by cxplay:
+       DL = Pioneer High Technology (Dongguan) Co., Ltd., Guangdong China */
     if (country_out) {
         cc = ((unsigned short)(unsigned char)serial[3] << 8) |
               (unsigned short)(unsigned char)serial[2];
@@ -3776,10 +2983,10 @@ static void print_drive_info(HANDLE hDrive, const char *path)
             for (j=0;j<12&&rb[0x10+j]>=0x20&&rb[0x10+j]<0x7F;j++) platform[j] = rb[0x10+j];
             for (j=0;j<6 &&rb[0x18+j]>=0x20&&rb[0x18+j]<0x7F;j++) kernel[j]   = rb[0x18+j];
             if (serial[0])   {
-                char month[16]={0}, year[8]={0}, country[32]={0};
+                char month[16]={0}, year[32]={0}, country[32]={0};
                 char mfgdate[32]={0};
                 pioneer_serial_decode(serial, month, year, country);
-                snprintf(mfgdate, sizeof(mfgdate), "%s (seq:%s)", month, year);
+                snprintf(mfgdate, sizeof(mfgdate), "%s %s", month, year);
                 printf("  Serial    : %-28s|\n", serial);
                 printf("  Mfg Date  : %-28s|\n", mfgdate);
                 printf("  Country   : %-28s|\n", country);
@@ -3950,134 +3157,59 @@ static void print_drive_info(HANDLE hDrive, const char *path)
 }
 
 /* =========================================================
-   COMMAND: extract
-   Extracts a raw binary region from a file by offset+length.
-   Usage: drivekit extract <file> --offset 0xB353 --length 0x6712
+   COMMAND: resetnormal
+   Attempt to exit kernel/service mode and return to normal mode.
    ========================================================= */
-static int cmd_extract(const char *filename)
+static int cmd_resetnormal(void)
 {
-    typedef struct { DWORD start; DWORD end; } Region;
-    FILE  *fp, *out;
-    UCHAR *buf;
-    long   len;
-    DWORD  offset = 0, extract_len = 0;
-    DWORD  rstart = 0;
-    DWORD  sz;
-    DWORD  sa, sb;
-    DWORD  j;
-    char   outname[300];
-    char  *offsetStr = NULL, *lenStr = NULL;
-    Region regions[64];
-    Region tmp;
-    int    nreg  = 0;
-    int    inFF  = 1;
-    int    top;
-    int    mx;
-    int    i, k, b;
+    UCHAR sense[SENSE_SIZE];
+    UCHAR cdb[10] = {0x3B,0x00,0xFF,0,0,0,0,0,0,0};
+    UCHAR payload[0x100] = {0};
+    int   st = 0, attempt;
 
-    if (g_outFile[0]) {
-        offsetStr = g_outFile;
-        lenStr = strchr(g_outFile, ',');
-        if (lenStr) { *lenStr = '\0'; lenStr++; }
+    printf("=== RESET TO NORMAL MODE ===\n\n");
+    printf("Attempting to exit kernel/service mode...\n\n");
+
+    send_scsi(g_hDrive, cdb, 10, payload, 0x100,
+              SCSI_IOCTL_DATA_OUT, sense, &st);
+    printf("  WRITE BUFFER mode=0: %s\n", st==0?"GOOD":"FAIL");
+
+    for (attempt = 0; attempt < 30; attempt++) {
+        UCHAR tcdb[6] = {0,0,0,0,0,0};
+        Sleep(1000);
+        send_scsi(g_hDrive, tcdb, 6, NULL, 0,
+                  SCSI_IOCTL_DATA_UNSPECIFIED, sense, &st);
+        if (st == 0) {
+            printf("  Drive ready after %d seconds\n", attempt+1);
+            break;
+        }
+        printf("\r  Waiting %d/30...", attempt+1);
+        fflush(stdout);
     }
-    if (offsetStr) offset      = (DWORD)strtol(offsetStr, NULL, 16);
-    if (lenStr)    extract_len = (DWORD)strtol(lenStr,    NULL, 16);
-
-    fp = fopen(filename, "rb");
-    if (!fp) { fprintf(stderr, "Cannot open %s\n", filename); return 1; }
-    fseek(fp, 0, SEEK_END);
-    len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    buf = (UCHAR*)malloc(len);
-    if (!buf) { fclose(fp); return 1; }
-    fread(buf, 1, len, fp);
-    fclose(fp);
-
-    if (extract_len == 0 || offset + extract_len > (DWORD)len) {
-        printf("=== AUTO EXTRACT: finding firmware blobs ===\n\n");
-        printf("  File: %s (%ld bytes)\n\n", filename, len);
-
-        for (j = 0; j < (DWORD)len && nreg < 64; j++) {
-            if (inFF && buf[j] != 0xFF) {
-                rstart = j; inFF = 0;
-            } else if (!inFF && j+3 < (DWORD)len &&
-                       buf[j]==0xFF && buf[j+1]==0xFF &&
-                       buf[j+2]==0xFF && buf[j+3]==0xFF) {
-                regions[nreg].start = rstart;
-                regions[nreg].end   = j;
-                nreg++;
-                inFF = 1;
-            }
-        }
-
-        /* Sort by size descending, take top 3 */
-        for (i = 0; i < nreg-1; i++) {
-            mx = i;
-            for (k = i+1; k < nreg; k++) {
-                sa = regions[k].end  - regions[k].start;
-                sb = regions[mx].end - regions[mx].start;
-                if (sa > sb) mx = k;
-            }
-            if (mx != i) {
-                tmp         = regions[i];
-                regions[i]  = regions[mx];
-                regions[mx] = tmp;
-            }
-        }
-
-        top = (nreg < 3) ? nreg : 3;
-        for (i = 0; i < top; i++) {
-            sz = regions[i].end - regions[i].start;
-            snprintf(outname, sizeof(outname),
-                     "extracted_%d_0x%05lX.bin", i, regions[i].start);
-            out = fopen(outname, "wb");
-            if (!out) continue;
-            fwrite(&buf[regions[i].start], 1, sz, out);
-            fclose(out);
-            printf("  Region %d: 0x%05lX - 0x%05lX  size=0x%05lX  -> %s\n",
-                   i, regions[i].start, regions[i].end, sz, outname);
-
-            printf("    First bytes:");
-            for (b = 0; b < 16 && b < (int)sz; b++)
-                printf(" %02X", buf[regions[i].start + b]);
-            printf("\n");
-        }
-        printf("\n  Upload the .bin files and check for H8S/RS8801 signatures.\n");
-    } else {
-        snprintf(outname, sizeof(outname), "extracted_0x%05lX.bin", offset);
-        out = fopen(outname, "wb");
-        if (!out) { free(buf); return 1; }
-        fwrite(&buf[offset], 1, extract_len, out);
-        fclose(out);
-        printf("Extracted 0x%lX bytes from offset 0x%lX to %s\n",
-               extract_len, offset, outname);
-    }
-
-    free(buf);
+    printf("\n\nRun: drivekit inquiry to check firmware version\n");
     return 0;
 }
 
 /* =========================================================
    COMMAND: triggerkernel
-   Sends single READ BUFFER 0xB0 offset=0x04 length=0xA400
-   which triggers the drive to enter kernel mode and reboot.
+   Sends single READ BUFFER 0xB0 offset=0x04 length=0xA4 (164 bytes)
    From Wireshark capture of autoflasher: 3c 02 b0 00 00 04 00 00 a4 00
-   After this, wait ~30s for drive to reboot, then rawdump B0.
+   Note: length field is 0x00A4 = 164 bytes, NOT 0xA400!
    ========================================================= */
 static int cmd_triggerkernel(void)
 {
     UCHAR sense[SENSE_SIZE];
-    UCHAR buf[0xA400];
+    UCHAR buf[0xA4];
     int   st = 0, b;
 
     printf("=== KERNEL MODE TRIGGER ===\n\n");
-    printf("  Sending READ BUFFER 0xB0 offset=0x04 len=0xA400...\n");
+    printf("  Sending READ BUFFER 0xB0 offset=0x04 len=0xA4 (164 bytes)...\n");
     printf("  (This triggers drive to enter kernel mode and reboot)\n\n");
 
     {
         UCHAR cdb[10] = {0x3C,0x02,0xB0,0x00,0x00,0x04,0x00,0x00,0xA4,0x00};
         memset(buf, 0, sizeof(buf));
-        send_scsi(g_hDrive, cdb, 10, buf, 0xA400,
+        send_scsi(g_hDrive, cdb, 10, buf, 0xA4,
                   SCSI_IOCTL_DATA_IN, sense, &st);
         printf("  Status: %s", st==0?"GOOD":"FAIL");
         if (st != 0)
@@ -4130,7 +3262,7 @@ static int cmd_triggerkernel(void)
                 send_scsi(g_hDrive, f1cdb, 10, rb, 0x30,
                           SCSI_IOCTL_DATA_IN, sense2, &st2);
                 if (st2 == 0) {
-                    int is_kernel = (memcmp(rb+0x14,"        ",8)!=0);
+                    int is_kernel = (memcmp(rb+0x20,"        ",8)==0);
                     printf("  Drive mode: %s\n\n",
                            is_kernel?"*** KERNEL MODE ***":"normal mode");
                     if (is_kernel)
@@ -4669,200 +3801,6 @@ static int cmd_checkcompat(void)
     printf("        compatibility group. Wrong firmware = brick!\n\n");
     return 0;
 }
-static int cmd_fwversion(void)
-{
-    UCHAR rb[0x500];
-    UCHAR cdb[10] = {0x3C,0x02,0xF1,0,0,0,0,0x05,0x00,0};
-    UCHAR sense[SENSE_SIZE];
-    int   st = 0;
-    WORD  driveID;
-    char  platform[5] = {0};
-    char  hwtype[3]   = {0};
-    char  version[5]  = {0};
-    char  revision[5] = {0};
-    char  result[16]  = {0};
-    char  platcode;
-    int   i;
-
-    printf("=== FIRMWARE VERSION STRING ===\n\n");
-
-    memset(rb, 0, sizeof(rb));
-    send_scsi(g_hDrive, cdb, 10, rb, 0x500,
-              SCSI_IOCTL_DATA_IN, sense, &st);
-    if (st != 0) {
-        printf("  Failed to read 0xF1\n");
-        return 1;
-    }
-
-    /* Drive ID at +0x10 as hex string e.g. "SAT 8801" */
-    /* Parse drive ID from platform string - copy with proper null termination */
-    {
-        char platform_safe[16] = {0};
-        {
-            int k;
-            for (k=0; k<12 && rb[0x10+k]>=0x20 && rb[0x10+k]<0x7F; k++)
-                platform_safe[k] = rb[0x10+k];
-            platform_safe[k] = 0;
-        }
-        
-        const char *p = platform_safe;
-        memcpy(platform, p, 4);
-        while (*p && (*p<'0'||*p>'9') && (*p<'A'||*p>'F') &&
-               (*p<'a'||*p>'f')) p++;
-        driveID = (WORD)strtol(p, NULL, 16);
-    }
-
-    /* Hardware type code from drive ID — port of sub_414C1F jump table */
-    {
-        WORD ax = driveID;
-        /* Mask same as BDRFlash: and ax, 0F0FFh at some points
-           but here we use full ID for the jump table            */
-        if      (ax == 0x01)              strcpy(hwtype, "R3");
-        else if (ax == 0x03)              strcpy(hwtype, "R4");
-        else if (ax == 0x04)              strcpy(hwtype, "R5");
-        else if (ax == 0x06)              strcpy(hwtype, "R6");
-        else if (ax == 0x08)             strcpy(hwtype, "R8");
-        else if (ax <  0x08)              strcpy(hwtype, "R7");
-        else if (ax == 0x09)              strcpy(hwtype, "R9");
-        else if (ax == 0x10)              strcpy(hwtype, "RA");
-        else if (ax == 0x11)              strcpy(hwtype, "RB");
-        else if (ax >= 0x50 && ax < 0x56) strcpy(hwtype, "S1");
-        else if (ax >= 0x56 && ax < 0x58) strcpy(hwtype, "T4");
-        else if (ax >= 0x59 && ax < 0x61) strcpy(hwtype, "S4");
-        else if (ax >= 0x61 && ax < 0x64) strcpy(hwtype, "S4");
-        else if (ax >= 0x64 && ax < 0x66) strcpy(hwtype, "S5");
-        else if (ax >= 0x68 && ax < 0x6A) strcpy(hwtype, "S6");
-        else if (ax >= 0x6A && ax < 0x6F) strcpy(hwtype, "T5");
-        else if (ax >= 0x70 && ax < 0x72) strcpy(hwtype, "T6");
-        else if (ax == 0x1000)            strcpy(hwtype, "B1");
-        else if (ax >= 0x52 && ax < 0x54) strcpy(hwtype, "S2");
-        else if (ax == 0x53)              strcpy(hwtype, "S3");
-        else                              strcpy(hwtype, "RC"); /* BDR-211M etc */
-    }
-
-    /* Platform code */
-    if      (strncmp(platform, "ATA ", 4) == 0) platcode = '1';
-    else if (strncmp(platform, "SAT ", 4) == 0) platcode = '2';
-    else if (strncmp(platform, "STE ", 4) == 0) platcode = '2';
-    else if (strncmp(platform, "SCSI", 4) == 0) platcode = '3';
-    else                                          platcode = 'X';
-
-    /* Version from revision level at +0x28 in 0xF1 buffer
-       e.g. "1.53" — take major digit and 2 decimal digits */
-    {
-        const char *rev = (const char*)(rb+0x28);
-        /* Find first digit */
-        for (i = 0; i < 8 && rev[i]; i++) {
-            if (rev[i] >= '0' && rev[i] <= '9') {
-                /* Copy e.g. "153" from "1.53" */
-                int j = 0;
-                int k = i;
-                while (j < 4 && rev[k]) {
-                    if (rev[k] != '.') revision[j++] = rev[k];
-                    k++;
-                }
-                /* Version string after dot for display */
-                snprintf(version, sizeof(version), "%c.%c%c",
-                         rev[i],
-                         rev[k-2] ? rev[k-2] : '0',
-                         rev[k-1] ? rev[k-1] : '0');
-                break;
-            }
-        }
-    }
-
-    /* Build result: hwtype + platcode + '0' + '.' + revision */
-    snprintf(result, sizeof(result), "%s%c0.%s",
-             hwtype, platcode, revision[0] ? revision : "???");
-
-    printf("  Drive ID   : 0x%04X\n", driveID);
-    printf("  Platform   : %.4s\n", platform);
-    printf("  HW type    : %s\n", hwtype);
-    printf("  Plat code  : %c\n", platcode);
-    printf("  Revision   : %s\n", version[0] ? version : "unknown");
-    printf("\n");
-    printf("  Version string: %s\n\n", result);
-
-    return 0;
-}
-
-static int cmd_resetnormal(void)
-{
-    UCHAR sense[SENSE_SIZE];
-    int   st = 0;
-
-    printf("=== RETURN TO NORMAL MODE ===\n\n");
-
-    /* Method 1: WRITE BUFFER mode=2 bufID=0x41 offset=0xAAAA
-       from sub_412814 — used by BDRFlash for certain drives   */
-    printf("[1/3] WRITE BUFFER mode=2 bufID=0x41 offset=0xAAAA...\n");
-    {
-        UCHAR cdb[10] = {0x3B,0x02,0x41,0,0xAA,0xAA,0,0,0,0};
-        UCHAR buf[2]  = {0x00, 0x00};
-        send_scsi(g_hDrive, cdb, 10, buf, 2,
-                  SCSI_IOCTL_DATA_OUT, sense, &st);
-        printf("  Status: %s", st==0?"GOOD":"FAIL");
-        if (st != 0)
-            printf(" (key=%02X ASC=%02X)", sense[2]&0x0F, sense[12]);
-        printf("\n\n");
-    }
-    Sleep(500);
-
-    /* Method 2: WRITE BUFFER mode=5 bufID=0xFF with key
-       sub_41252B sends this after firmware to trigger reboot  */
-    printf("[2/3] WRITE BUFFER mode=5 bufID=0xFF (reboot trigger)...\n");
-    {
-        UCHAR payload[0x100];
-        UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
-        build_pioneer_payload_auto(payload);
-        send_scsi(g_hDrive, cdb, 10, payload, 0x100,
-                  SCSI_IOCTL_DATA_OUT, sense, &st);
-        printf("  Status: %s", st==0?"GOOD":"FAIL");
-        if (st != 0)
-            printf(" (key=%02X ASC=%02X)", sense[2]&0x0F, sense[12]);
-        printf("\n\n");
-    }
-    Sleep(1000);
-
-    /* Method 3: READ BUFFER 0xF3 mode=1 — end-of-kernel signal
-       seen in sub_412857                                       */
-    printf("[3/3] READ BUFFER 0xF3 mode=1 (end-of-kernel signal)...\n");
-    {
-        UCHAR cdb[10] = {0x3C,0x01,0xF3,0,0,0,0,0,0x04,0};
-        UCHAR buf[4]  = {0};
-        send_scsi(g_hDrive, cdb, 10, buf, 4,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        printf("  Status: %s", st==0?"GOOD":"FAIL");
-        if (st != 0)
-            printf(" (key=%02X ASC=%02X)", sense[2]&0x0F, sense[12]);
-        printf("\n\n");
-    }
-    Sleep(500);
-
-    /* Check drive mode */
-    printf("Checking drive mode...\n");
-    {
-        UCHAR cdb[10] = {0x3C,0x02,0xF1,0,0,0,0,0,0x30,0};
-        UCHAR rb[0x30];
-        int   b;
-        memset(rb, 0, sizeof(rb));
-        send_scsi(g_hDrive, cdb, 10, rb, 0x30,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
-        if (st == 0) {
-            int is_kernel = (memcmp(rb+0x14, "        ", 8) != 0);
-            printf("  Kernel Version2: [");
-            for (b = 0; b < 8; b++) printf("%02X ", rb[0x14+b]);
-            printf("]\n");
-            printf("  Drive mode: %s\n",
-                   is_kernel ? "still in kernel mode" : "NORMAL MODE");
-        } else {
-            printf("  Could not read 0xF1 (drive may be rebooting)\n");
-            printf("  Power cycle if drive does not recover.\n");
-        }
-    }
-    return 0;
-}
-
 /* =========================================================
    Tries READ BUFFER modes 0,1,2,3,6 on vendor buffer IDs
    to find any accessible combination after unlock.
@@ -4909,166 +3847,46 @@ static int cmd_probemodes(void)
 
 static void print_help(void)
 {
-    printf("DriveKit - Optical Drive Research Toolkit\n");
-    printf("==========================================\n\n");
+    printf("DriveKit v1.0 - Optical Drive Research Toolkit\n");
+    printf("by cPix / Razor 1911 (c) 2026\n");
+    printf("================================================\n\n");
     printf("Usage:\n");
     printf("  drivekit <command> <drive_letter> [options]\n\n");
-    printf("Commands:\n");
-    printf("  inquiry       Read drive identity\n");
-    printf("  driveinfo     Full drive feature probe and profile list\n");
-    printf("  bdread        Query MMC feature 0x010C (BD Read)\n");
-    printf("  modepage      Dump mode page 0x2A (drive capabilities)\n");
-    printf("  probef0       Probe READ BUFFER IDs 0xF0-0xFF\n");
-    printf("  rawdump       Raw READ BUFFER dump\n");
-    printf("  combinedump   Dump 0xF4+0xFE into one combined file\n");
-    printf("  findsigs      Scan a file for firmware signatures\n");
-    printf("  unlock        Pioneer RS8801 service mode unlock\n");
-    printf("  resetdrive    Reset an unresponsive SATA drive\n");
-    printf("  probevendor   Probe vendor opcodes 0xC0-0xFF\n");
-    printf("  mt1959        HLDS/LG MT1959 probe\n");
+    printf("Identification:\n");
+    printf("  info          Full drive information with serial decode\n");
+    printf("  inquiry       Read drive vendor/model/firmware (alias: info)\n");
     printf("  discinfo      Read and parse BD/DVD disc information\n");
-    printf("  discstruct    READ DISC STRUCTURE (0xAD)\n");
+    printf("  modelcheck    Pioneer model lookup and internal model string\n");
+    printf("  keycheck      Show unlock key for connected drive\n");
+    printf("  checkcompat   Check drive against compatibility.json\n");
+    printf("  probevendor   Probe vendor opcodes 0xC0-0xFF\n");
     printf("  probeb0       Read/decode RS8801 buffer 0xB0\n");
-    printf("  modelcheck    Pioneer model lookup\n");
-    printf("  keycheck      Vendor unlock key lookup\n");
-    printf("  probewb       Probe WRITE BUFFER modes/lengths for unlock\n");
-    printf("  brutekey      Try all known Pioneer keys to find correct one\n");
-    printf("  extract       Extract firmware blobs from BDRFlash.exe\n");
-    printf("  getresource   Extract kernel resources 131/132 from BDRFlash.exe\n");
-    printf("  autoflash     Auto-detect and flash firmware from firmware\\ folder\n");
-    printf("                (detects Pioneer firmware by content, any filename)\n");
-    printf("  flashfw       Flash kernel+firmware to drive (NO disc!)\n");
-    printf("  sendfirmware  Send main firmware image (bufID=0xF0)\n");
-    printf("  triggerkernel Single READ 0xB0 trigger to enter kernel mode\n");
-    printf("  dumpfw        Trigger kernel mode and dump firmware (disc required)\n");
-    printf("  checkcompat   Check drive against compatibility.json (safe crossflash)\n");
-    printf("  fwversion     Build BDRFlash-style firmware version string\n");
-    printf("  resetnormal   Return drive from kernel mode to normal mode\n");
+    printf("  rawdump       Raw READ BUFFER dump (--bufid 0xxx)\n\n");
+    printf("Flashing:\n");
+    printf("  unlock        Pioneer service mode unlock (auto session token)\n");
+    printf("  flashfw       Flash kernel+firmware (--file kernel --file2 normal)\n");
+    printf("  autoflash     Auto-detect and flash from firmware\\ folder\n");
+    printf("  resetnormal   Attempt to exit kernel/service mode\n");
+    printf("  triggerkernel Trigger kernel mode via READ BUFFER 0xB0\n");
+    printf("  brutekey      Try all known Pioneer unlock keys\n");
+    printf("  sendcdb       Send raw SCSI CDB to drive\n\n");
+    printf("Other:\n");
     printf("  about         About DriveKit and credits\n\n");
     printf("Options:\n");
-    printf("  --bufid 0xF4  Buffer ID for rawdump (default 0xF4)\n");
-    printf("  --file  name  Output filename override\n\n");
+    printf("  --file  name        Kernel firmware file\n");
+    printf("  --file2 name        Normal firmware file\n");
+    printf("  --file3 name        Second normal firmware pass (post-cutoff drives)\n");
+    printf("  --bufid 0xF4        Buffer ID for rawdump (default 0xF4)\n");
+    printf("  --force             Skip compatibility checks\n");
+    printf("  --nounlock          Skip unlock step\n");
+    printf("  --key 0x5CF2E094    Override unlock key\n\n");
     printf("Examples:\n");
-    printf("  drivekit inquiry G\n");
+    printf("  drivekit info G\n");
     printf("  drivekit unlock G\n");
-    printf("  drivekit brutekey G\n");
-    printf("  drivekit rawdump G --bufid 0xF4\n");
-    printf("  drivekit probef0 G\n");
-    printf("  drivekit findsigs firmware.bin\n\n");
-    printf("Note: Run as Administrator for drive access.\n");
-}
-
-/* =========================================================
-   COMMAND: getresource
-   Enumerates and extracts all resources from BDRFlash.exe.
-   Usage: drivekit getresource BDRFlash.exe
-   ========================================================= */
-
-typedef struct {
-    int count;
-    HMODULE hMod;
-} EnumCtx;
-
-static BOOL CALLBACK EnumResType(HMODULE hMod, LPTSTR lpType,
-                                  LONG_PTR lParam)
-{
-    EnumCtx *ctx = (EnumCtx*)lParam;
-    if (IS_INTRESOURCE(lpType))
-        printf("  Type: #%lu\n", (DWORD)(ULONG_PTR)lpType);
-    else
-        printf("  Type: %s\n", (char*)lpType);
-    ctx->count++;
-    return TRUE;
-}
-
-static BOOL CALLBACK EnumResName(HMODULE hMod, LPCTSTR lpType,
-                                  LPTSTR lpName, LONG_PTR lParam)
-{
-    HRSRC   hRsrc;
-    HGLOBAL hGlobal;
-    void   *pData;
-    DWORD   dwSize;
-    char    outname[128];
-    FILE   *fp;
-    int    *count = (int*)lParam;
-
-    hRsrc = FindResourceA(hMod, lpName, lpType);
-    if (!hRsrc) return TRUE;
-
-    dwSize  = SizeofResource(hMod, hRsrc);
-    hGlobal = LoadResource(hMod, hRsrc);
-    pData   = LockResource(hGlobal);
-    if (!pData || dwSize < 16) return TRUE;
-
-    if (IS_INTRESOURCE(lpName))
-        snprintf(outname, sizeof(outname), "rsrc_%lu.bin",
-                 (DWORD)(ULONG_PTR)lpName);
-    else
-        snprintf(outname, sizeof(outname), "rsrc_%s.bin", (char*)lpName);
-
-    printf("    Name #%lu: %lu bytes", (DWORD)(ULONG_PTR)lpName, dwSize);
-
-    /* Show first 16 bytes */
-    {
-        UCHAR *p = (UCHAR*)pData;
-        DWORD  b;
-        printf("  [");
-        for (b = 0; b < 16 && b < dwSize; b++)
-            printf("%02X ", p[b]);
-        printf("]");
-    }
-
-    /* Check for Pioneer .153 header at +0x1F0 */
-    if (dwSize > 0x1FD) {
-        UCHAR *p = (UCHAR*)pData;
-        if (p[0x1F0] == 'S' || p[0x1F0] == 'K') {
-            printf("  <- Pioneer kernel: %.13s", p + 0x1F0);
-            fp = fopen(outname, "wb");
-            if (fp) { fwrite(pData, 1, dwSize, fp); fclose(fp); }
-            printf(" -> %s", outname);
-        }
-    }
-    printf("\n");
-    (*count)++;
-    return TRUE;
-}
-
-static BOOL CALLBACK EnumResTypeForNames(HMODULE hMod, LPTSTR lpType,
-                                          LONG_PTR lParam)
-{
-    if (IS_INTRESOURCE(lpType))
-        printf("  Type #%lu:\n", (DWORD)(ULONG_PTR)lpType);
-    else
-        printf("  Type %s:\n", (char*)lpType);
-    EnumResourceNamesA(hMod, lpType, EnumResName, lParam);
-    return TRUE;
-}
-
-static int cmd_getresource(const char *filename)
-{
-    HMODULE hMod;
-    int     count = 0;
-
-    printf("=== ENUMERATE RESOURCES: %s ===\n\n", filename);
-
-    hMod = LoadLibraryExA(filename, NULL,
-                          LOAD_LIBRARY_AS_DATAFILE |
-                          LOAD_LIBRARY_AS_IMAGE_RESOURCE);
-    if (!hMod) {
-        fprintf(stderr, "LoadLibraryEx failed: error %lu\n", GetLastError());
-        return 1;
-    }
-
-    EnumResourceTypesA(hMod, EnumResTypeForNames, (LONG_PTR)&count);
-
-    printf("\nTotal resources enumerated: %d\n", count);
-    if (count == 0)
-        printf("No resources found - kernel may be stored differently.\n");
-    else
-        printf("Pioneer kernel files saved as rsrc_NNN.bin\n");
-
-    FreeLibrary(hMod);
-    return 0;
+    printf("  drivekit flashfw G --file S9330360.102 --file2 S9330361.101 --nounlock\n");
+    printf("  drivekit rawdump G --bufid 0xB0\n");
+    printf("  drivekit sendcdb G 3B 05 FF 00 00 00 00 01 00 00\n\n");
+    printf("Note: Always eject disc before unlock/flash. Run as Administrator.\n");
 }
 
 /* =========================================================
@@ -5700,6 +4518,36 @@ static int cmd_flashfw(void)
     build_pioneer_payload_auto(g_payload);
     printf("  Payload  : %.16s + key\n\n", (char*)g_payload);
 
+    /* Pre-read 0xF1 token BEFORE unlock — post-cutoff drives return
+       00 00 5C 00 token in normal mode that's needed for trigger later!
+       Must be done BEFORE 0xF1 triggers kernel mode! */
+    {
+        /* First send START STOP 0x20 — Pioneer updater does this to
+           generate the session token before unlock! Go straight to 0xF1! */
+        {
+            UCHAR sscdb[6] = {0x1B,0x00,0x00,0x00,0x20,0x00};
+            UCHAR sssense[SENSE_SIZE] = {0};
+            int ssst = 0;
+            send_scsi(g_hDrive, sscdb, 6, NULL, 0,
+                      SCSI_IOCTL_DATA_UNSPECIFIED, sssense, &ssst);
+            Sleep(100); /* Small delay then immediately read 0xF1! */
+        }
+
+        /* Read 0xF1 IMMEDIATELY after START STOP */
+
+        UCHAR f1sense[SENSE_SIZE] = {0};
+        memset(g_f1token, 0, sizeof(g_f1token));
+        rb_data(0xF1, 0, g_f1token, 0x30, f1sense);
+        if (g_f1token[0] == 0x00 && g_f1token[1] == 0x00 && g_f1token[2] != 0x00) {
+            g_has_f1token = 1;
+            printf("  [DBG] 0xF1 token captured: %02X %02X %02X %02X\n",
+                   g_f1token[0],g_f1token[1],g_f1token[2],g_f1token[3]);
+        } else {
+            printf("  [DBG] 0xF1 pre-read: %02X %02X %02X %02X (serial/normal)\n",
+                   g_f1token[0],g_f1token[1],g_f1token[2],g_f1token[3]);
+        }
+    }
+
     /* Wait for drive ready */
     if (!g_skip_checks) {
         int attempt;
@@ -5748,11 +4596,59 @@ static int cmd_flashfw(void)
             send_scsi(g_hDrive, wcdb, 10, g_payload, PAYLOAD_SIZE,
                       SCSI_IOCTL_DATA_OUT, sense, &st);
             if (st != 0) {
-                printf("  FAILED key=%02X ASC=%02X ASCQ=%02X\n",
-                       sense[2]&0x0F, sense[12], sense[13]);
-                free(data); return 1;
+                /* Try post-cutoff mode=0x01 bufID=0x00 sweep */
+                UCHAR alt_modes[]  = {0x01, 0x00, 0x0A, 0x0B, 0x0C, 0x0D};
+                UCHAR alt_bufids[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                int found = 0, mi;
+                printf("  Standard unlock failed - trying post-cutoff mode sweep...\n");
+                for (mi = 0; mi < 6; mi++) {
+                    UCHAR acdb[10] = {0x3B,alt_modes[mi],alt_bufids[mi],
+                                      0,0,0,0,0x00,0x20,0};
+                    UCHAR asense[SENSE_SIZE];
+                    int ast = 0;
+                    send_scsi(g_hDrive, acdb, 10, g_payload, 0x20,
+                              SCSI_IOCTL_DATA_OUT, asense, &ast);
+                    if (ast == 0 || (asense[2]&0x0F) == 0x00) {
+                        printf("  Post-cutoff unlock GOOD (mode=0x%02X bufID=0x%02X)\n",
+                               alt_modes[mi], alt_bufids[mi]);
+                        g_unlock_mode  = alt_modes[mi];
+                        g_unlock_bufid = alt_bufids[mi];
+                        st = 0;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    /* Try again with shorter payload (no key) */
+                    UCHAR short_payload[0x20] = {0};
+                    memcpy(short_payload, g_payload, 0x10); /* model string only */
+                    printf("  Retrying with short payload (model string only)...\n");
+                    for (mi = 0; mi < 6; mi++) {
+                        UCHAR acdb[10] = {0x3B,alt_modes[mi],alt_bufids[mi],
+                                          0,0,0,0,0x00,0x20,0};
+                        UCHAR asense[SENSE_SIZE];
+                        int ast = 0;
+                        send_scsi(g_hDrive, acdb, 10, short_payload, 0x20,
+                                  SCSI_IOCTL_DATA_OUT, asense, &ast);
+                        if (ast == 0 || (asense[2]&0x0F) == 0x00) {
+                            printf("  Post-cutoff unlock GOOD (mode=0x%02X short payload)\n",
+                                   alt_modes[mi]);
+                            g_unlock_mode  = alt_modes[mi];
+                            g_unlock_bufid = alt_bufids[mi];
+                            st = 0;
+                            found = 1;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    printf("  FAILED key=%02X ASC=%02X ASCQ=%02X\n",
+                           sense[2]&0x0F, sense[12], sense[13]);
+                    free(data); return 1;
+                }
+            } else {
+                printf("  GOOD\n\n");
             }
-            printf("  GOOD\n\n");
             Sleep(500);
             memset(es, 0, sizeof(es));
             send_scsi(g_hDrive, escdb, 10, es, 8,
@@ -5782,20 +4678,23 @@ static int cmd_flashfw(void)
         UCHAR  rbsense[SENSE_SIZE];
         int    rb_st = 0, a0_st = 0;
         
-        printf("  Pre-flash: reading 0xF1...\n");
-        rb_data(0xF1, 0, rb, 0x30, rbsense);
-        if (rbsense[2] != 0) {
-            printf("    WARNING: 0xF1 read returned sense key %02X ASC=%02X\n",
-                   rbsense[2]&0x0F, rbsense[12]);
+        if (g_unlock_mode == 0x01) {
+            printf("  Pre-flash: skipping reads (post-cutoff service mode)\n\n");
+        } else {
+            printf("  Pre-flash: reading 0xF1...\n");
+            rb_data(0xF1, 0, rb, 0x30, rbsense);
+            if (rbsense[2] != 0) {
+                printf("    WARNING: 0xF1 read returned sense key %02X ASC=%02X\n",
+                       rbsense[2]&0x0F, rbsense[12]);
+            }
+            printf("  Pre-flash: reading 0xA0...\n");
+            rb_data(0xA0, 0x90, a0, 0x10, rbsense);
+            if (rbsense[2] != 0) {
+                printf("    WARNING: 0xA0 read returned sense key %02X ASC=%02X\n",
+                       rbsense[2]&0x0F, rbsense[12]);
+            }
+            Sleep(200);
         }
-        
-        printf("  Pre-flash: reading 0xA0...\n");
-        rb_data(0xA0, 0x90, a0, 0x10, rbsense);
-        if (rbsense[2] != 0) {
-            printf("    WARNING: 0xA0 read returned sense key %02X ASC=%02X\n",
-                   rbsense[2]&0x0F, rbsense[12]);
-        }
-        Sleep(200);
     }
 
     printf("[2/3] Sending kernel (0x8000 chunks, %ld bytes)...\n", filesize);
@@ -5806,7 +4705,7 @@ static int cmd_flashfw(void)
             DWORD n = (DWORD)filesize - offset;
             if (n > 0x8000) n = 0x8000;
             memset(cdb, 0, sizeof(cdb));
-            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=(g_unlock_mode==0x01)?0x00:0xFE;
             cdb[3]=(UCHAR)(offset>>16);
             cdb[4]=(UCHAR)(offset>>8);
             cdb[5]=(UCHAR)(offset);
@@ -5820,7 +4719,7 @@ static int cmd_flashfw(void)
                 DWORD total = (DWORD)filesize;
                 printf("\n  Chunk failed at 0x%lX - trying single transfer...\n", offset);
                 memset(cdb,0,sizeof(cdb));
-                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=(g_unlock_mode==0x01)?0x00:0xFE;
                 cdb[6]=(UCHAR)(total>>16);
                 cdb[7]=(UCHAR)(total>>8);
                 cdb[8]=(UCHAR)(total);
@@ -5854,7 +4753,8 @@ static int cmd_flashfw(void)
         long   fwsize;
         DWORD  fwoffset = 0;
 
-        printf("[2c/3] Sending firmware (%s)...\n", g_outFile2);
+        printf("[2c/3] Sending firmware (%s)...\n  [DBG] g_unlock_mode=0x%02X bufID=0x%02X\n", 
+               g_outFile2, g_unlock_mode, g_unlock_mode==0x01?0x00:0xF0);
         fp2 = fopen(g_outFile2, "rb");
         if (!fp2) {
             fprintf(stderr, "Cannot open %s\n", g_outFile2);
@@ -5892,6 +4792,26 @@ static int cmd_flashfw(void)
                 send_scsi(g_hDrive, cdb, 10, fw + fwoffset, n,
                           SCSI_IOCTL_DATA_OUT, sense, &st);
                 if (st != 0) {
+                    if (fwoffset == 0 && g_unlock_mode == 0x01) {
+                        /* Post-cutoff: try single transfer of entire file */
+                        printf("\n  Chunk failed - trying single transfer of full image...\n");
+                        memset(cdb, 0, sizeof(cdb));
+                        cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0x00;
+                        cdb[6]=(UCHAR)(fwsize>>16);
+                        cdb[7]=(UCHAR)(fwsize>>8);
+                        cdb[8]=(UCHAR)(fwsize);
+                        send_scsi(g_hDrive, cdb, 10, fw, (DWORD)fwsize,
+                                  SCSI_IOCTL_DATA_OUT, sense, &st);
+                        if (st == 0) {
+                            printf("  %ld / %ld bytes - OK (single transfer)\n",
+                                   (long)fwsize, (long)fwsize);
+                            fwoffset = (DWORD)fwsize;
+                            break;
+                        }
+                        printf("\n  FAILED single transfer: key=%02X ASC=%02X\n",
+                               sense[2]&0x0F, sense[12]);
+                        free(fw); return 1;
+                    }
                     /* Drive busy - clear and retry */
                     HANDLE_BUSY();
                     send_scsi(g_hDrive, cdb, 10, fw + fwoffset, n,
@@ -5918,18 +4838,150 @@ static int cmd_flashfw(void)
         printf("  TIP: Use --file2 S8801601.153 to send firmware\n\n");
     }
 
-    /* Execution trigger — WRITE BUFFER mode=5 bufID=0xFF
-       BDRFlash uses same session token as unlock payload for trigger too! */
-    printf("[2d/3] Execution trigger (mode=5, bufID=0xFF)...\n");
+    /* Second normal firmware pass (post-cutoff drives require normal→kernel→normal) */
+    if (g_outFile3[0]) {
+        FILE  *fp3;
+        UCHAR *fw3;
+        long   fw3size;
+        DWORD  fw3offset = 0;
+
+        printf("[2e/3] Sending firmware pass 2 (%s)...\n", g_outFile3);
+        fp3 = fopen(g_outFile3, "rb");
+        if (!fp3) {
+            fprintf(stderr, "Cannot open %s\n", g_outFile3);
+            return 1;
+        }
+        fseek(fp3, 0, SEEK_END);
+        fw3size = ftell(fp3);
+        fseek(fp3, 0, SEEK_SET);
+        fw3 = (UCHAR*)malloc(fw3size);
+        if (!fw3) { fclose(fp3); return 1; }
+        fread(fw3, 1, fw3size, fp3);
+        fclose(fp3);
+
+        if (memmem_win(fw3, 0x200, "Normal", 6))
+            printf("  Type : Normal confirmed\n");
+
+        {
+            while (fw3offset < (DWORD)fw3size) {
+                UCHAR cdb[10];
+                DWORD n = (DWORD)fw3size - fw3offset;
+                if (n > 0x8000) n = 0x8000;
+                memset(cdb, 0, sizeof(cdb));
+                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
+                cdb[3]=(UCHAR)(fw3offset>>16);
+                cdb[4]=(UCHAR)(fw3offset>>8);
+                cdb[5]=(UCHAR)(fw3offset);
+                cdb[6]=(UCHAR)(n>>16);
+                cdb[7]=(UCHAR)(n>>8);
+                cdb[8]=(UCHAR)(n);
+                send_scsi(g_hDrive, cdb, 10, fw3 + fw3offset, n,
+                          SCSI_IOCTL_DATA_OUT, sense, &st);
+                if (st != 0) {
+                    HANDLE_BUSY();
+                    send_scsi(g_hDrive, cdb, 10, fw3 + fw3offset, n,
+                              SCSI_IOCTL_DATA_OUT, sense, &st);
+                    if (st != 0) {
+                        printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
+                               fw3offset, sense[2]&0x0F, sense[12]);
+                        free(fw3); return 1;
+                    }
+                }
+                fw3offset += n;
+                printf("\r  %lu / %lu bytes", fw3offset, (DWORD)fw3size);
+                fflush(stdout);
+                Sleep(50);
+            }
+            printf("\n  Done.\n\n");
+        }
+        HANDLE_BUSY();
+        free(fw3);
+    }
+
+    /* Execution trigger
+       Confirmed from Wireshark capture [564]: mode=5 bufID=0xFF len=0x100
+       with the 0xF1 session token as payload!
+       For post-cutoff: read 0xF1 AFTER firmware send (in service mode)
+       then use that token with standard trigger */
+    printf("[2d/3] Execution trigger...\n");
     {
-        UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
-        UCHAR sense2[SENSE_SIZE];
-        UCHAR *trig_payload = g_has_token ? g_a0token : g_payload;
+        UCHAR sense2[SENSE_SIZE] = {0};
+        UCHAR trig_payload[0x100] = {0};
         int   st2 = 0;
-        if (g_has_token)
-            printf("  Using 0xA0 session token for trigger\n");
-        send_scsi(g_hDrive, cdb, 10, trig_payload, 0x100,
-                  SCSI_IOCTL_DATA_OUT, sense2, &st2);
+
+        if (g_unlock_mode == 0x01) {
+            /* Post-cutoff trigger: use 0xF1 token captured before unlock
+               Confirmed from Wireshark [564]: mode=5 bufID=0xFF len=0x100 */
+            UCHAR f1buf[0x30] = {0};
+            UCHAR f1sense[SENSE_SIZE] = {0};
+
+            /* Try reading 0xF1 now (in service mode) */
+            rb_data(0xF1, 0, f1buf, 0x30, f1sense);
+            printf("  0xF1 after firmware send: %02X %02X %02X %02X\n",
+                   f1buf[0],f1buf[1],f1buf[2],f1buf[3]);
+
+            /* Choose best token: pre-captured 00 00 5C 00 > current 0xF1 > model string */
+            if (g_has_f1token) {
+                memcpy(trig_payload, g_f1token, 0x30);
+                printf("  Using pre-captured 0xF1 token: %02X %02X %02X %02X\n",
+                       g_f1token[0],g_f1token[1],g_f1token[2],g_f1token[3]);
+            } else if (f1buf[0] != 0x00 || f1buf[2] == 0x00) {
+                memcpy(trig_payload, f1buf, 0x30);
+                printf("  Using current 0xF1 as trigger payload\n");
+            } else {
+                memcpy(trig_payload, g_payload, 0x20);
+                printf("  Using model string as trigger payload\n");
+            }
+
+            /* Try triggers in order - most likely to work first */
+            {
+                /* Try mode=5 bufID=0xFF len=256 with model string — confirmed from Wireshark! */
+                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+                UCHAR tsense[SENSE_SIZE] = {0};
+                send_scsi(g_hDrive, tcdb, 10, trig_payload, 0x100,
+                          SCSI_IOCTL_DATA_OUT, tsense, &st2);
+                printf("  Trigger mode=5 bufID=0xFF len=256: %s",
+                       (st2==0||(tsense[2]&0xF)==0)?"GOOD":"FAIL");
+                if (st2 != 0 && (tsense[2]&0xF) != 0)
+                    printf(" (key=%02X ASC=%02X)", tsense[2]&0xF, tsense[12]);
+                printf("\n");
+                if (st2 == 0 || (tsense[2]&0xF) == 0) {
+                    memcpy(sense2, tsense, SENSE_SIZE);
+                    st2 = 0;
+                } else {
+                    /* Fallback: mode=5 bufID=0x00 len=32 */
+                    UCHAR tcdb2[10] = {0x3B,0x05,0x00,0,0,0,0,0x00,0x20,0};
+                    send_scsi(g_hDrive, tcdb2, 10, trig_payload, 0x20,
+                              SCSI_IOCTL_DATA_OUT, sense2, &st2);
+                    printf("  Trigger mode=5 bufID=0x00 len=32: %s",
+                           (st2==0||(sense2[2]&0xF)==0)?"GOOD":"FAIL");
+                    if (st2 != 0 && (sense2[2]&0xF) != 0)
+                        printf(" (key=%02X ASC=%02X)", sense2[2]&0xF, sense2[12]);
+                    printf("\n");
+                    if (st2 == 0 || (sense2[2]&0xF) == 0) st2 = 0;
+                    else {
+                        /* Last resort: mode=1 bufID=0x00 */
+                        UCHAR tcdb3[10] = {0x3B,0x01,0x00,0,0,0,0,0x00,0x20,0};
+                        send_scsi(g_hDrive, tcdb3, 10, trig_payload, 0x20,
+                                  SCSI_IOCTL_DATA_OUT, sense2, &st2);
+                        printf("  Trigger mode=1 bufID=0x00: %s",
+                               (st2==0||(sense2[2]&0xF)==0)?"GOOD":"FAIL");
+                        if (st2 != 0 && (sense2[2]&0xF) != 0)
+                            printf(" (key=%02X ASC=%02X)", sense2[2]&0xF, sense2[12]);
+                        printf("\n");
+                        if (st2 == 0 || (sense2[2]&0xF) == 0) st2 = 0;
+                    }
+                }
+            }
+        } else {
+            /* Pre-cutoff: standard trigger with bufID=0xFF and session token */
+            UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+            UCHAR *trig_payload = g_has_token ? g_a0token : g_payload;
+            if (g_has_token)
+                printf("  Using 0xA0 session token for trigger\n");
+            send_scsi(g_hDrive, cdb, 10, trig_payload, 0x100,
+                      SCSI_IOCTL_DATA_OUT, sense2, &st2);
+        }
         printf("  Status: %s", st2==0?"GOOD":"FAIL");
         if (st2 != 0)
             printf(" (key=%02X ASC=%02X)",
@@ -6092,86 +5144,6 @@ static int cmd_flashfw(void)
    Usage: drivekit sendfirmware G --file firmware.bin
    bufID = 0xF0, mode = 7
    ========================================================= */
-static int cmd_sendfirmware(void)
-{
-    UCHAR  sense[SENSE_SIZE];
-    int    st = 0;
-    FILE  *fp;
-    UCHAR *data;
-    long   filesize;
-    DWORD  offset;
-    char   fname[256];
-
-    if (!g_outFile[0]) {
-        fprintf(stderr, "Usage: drivekit sendfirmware G --file firmware.bin\n");
-        return 1;
-    }
-    strncpy(fname, g_outFile, sizeof(fname)-1);
-
-    printf("=== SEND FIRMWARE ===\n\n");
-    printf("  File : %s\n", fname);
-
-    fp = fopen(fname, "rb");
-    if (!fp) { fprintf(stderr, "Cannot open %s\n", fname); return 1; }
-    fseek(fp, 0, SEEK_END);
-    filesize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    data = (UCHAR*)malloc(filesize);
-    if (!data) { fclose(fp); return 1; }
-    fread(data, 1, filesize, fp);
-    fclose(fp);
-
-    printf("  Size : 0x%lX bytes (full file including header)\n\n", (DWORD)filesize);
-
-    /* Verify header */
-    if (memmem_win(data, 0x200, "SAT 8801", 8))
-        printf("  HW   : SAT 8801 confirmed\n");
-    else
-        printf("  WARN : SAT 8801 not found in header\n");
-    if (memmem_win(data, 0x200, "Normal", 6))
-        printf("  Type : Normal (firmware) confirmed\n");
-    else
-        printf("  WARN : File Type is not Normal\n");
-    printf("\n");
-
-    printf("  Sending (mode=7, bufID=0xF0)...\n");
-
-    offset = 0;
-    {
-        DWORD  fw_size = (DWORD)filesize - 0x200;
-        UCHAR *fw_data = data + 0x200;
-        while (offset < fw_size) {
-            UCHAR  cdb[10];
-            DWORD  n = fw_size - offset;
-            if (n > CHUNK_SIZE) n = CHUNK_SIZE;
-
-            memset(cdb, 0, sizeof(cdb));
-            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
-            cdb[3]=(UCHAR)(offset>>16);
-            cdb[4]=(UCHAR)(offset>>8);
-            cdb[5]=(UCHAR)(offset);
-            cdb[6]=(UCHAR)(n>>16);
-            cdb[7]=(UCHAR)(n>>8);
-            cdb[8]=(UCHAR)(n);
-
-            send_scsi(g_hDrive, cdb, 10, fw_data + offset, n,
-                      SCSI_IOCTL_DATA_OUT, sense, &st);
-            if (st != 0) {
-                printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X ASCQ=%02X\n",
-                       offset, sense[2]&0x0F, sense[12], sense[13]);
-                free(data); return 1;
-            }
-            offset += n;
-            printf("\r  %lu / %lu bytes", offset, fw_size);
-            fflush(stdout);
-            Sleep(50);
-        }
-    }
-    printf("\n  Done.\n");
-    free(data);
-    return 0;
-}
-
 /* =========================================================
    MAIN
    ========================================================= */
@@ -6188,6 +5160,7 @@ int main(int argc, char *argv[])
 
     memset(g_outFile,  0, sizeof(g_outFile));
     memset(g_outFile2, 0, sizeof(g_outFile2));
+    memset(g_outFile3, 0, sizeof(g_outFile3));
 
     if (argc < 2) { print_help(); return 0; }
 
@@ -6205,6 +5178,8 @@ int main(int argc, char *argv[])
             strncpy(g_outFile, argv[++i], sizeof(g_outFile)-1);
         } else if (strcmp(argv[i], "--file2") == 0 && i+1 < argc) {
             strncpy(g_outFile2, argv[++i], sizeof(g_outFile2)-1);
+        } else if (strcmp(argv[i], "--file3") == 0 && i+1 < argc) {
+            strncpy(g_outFile3, argv[++i], sizeof(g_outFile3)-1);
         } else if (strcmp(argv[i], "--force") == 0) {
             g_force = 1;
         } else if (strcmp(argv[i], "--key") == 0 && i+1 < argc) {
@@ -6244,81 +5219,72 @@ int main(int argc, char *argv[])
     printf("\n");
 
     if (strcmp(cmd, "about") == 0) {
-        printf("=== ABOUT DRIVEKIT ===\n\n");
-        printf("  DriveKit is an optical drive research toolkit focused on\n");
-        printf("  Pioneer BD optical drives. It allows firmware flashing,\n");
-        printf("  drive identification, SCSI command probing and firmware\n");
-        printf("  analysis of Pioneer BD-R/BD-RE drives.\n\n");
-        printf("  Research & Development\n");
-        printf("  ----------------------\n");
-        printf("  The flash protocol was reverse engineered by capturing\n");
-        printf("  USB traffic between BDRFlash and Pioneer drives using\n");
-        printf("  Wireshark/USBPcap. Key findings include:\n\n");
-        printf("  - WRITE BUFFER mode=4 bufID=0xFF unlock sequence\n");
-        printf("  - Model string + key payload format\n");
-        printf("  - READ BUFFER 0xB0 kernel mode trigger bug\n");
-        printf("  - Drive family compatibility groups\n");
-        printf("  - Serial number manufacture date/country decode\n");
-        printf("    (full country table vs BDRFlash hardcoded China)\n\n");
-        printf("  Tools Used\n");
-        printf("  ----------\n");
-        printf("  Wireshark + USBPcap  - USB traffic capture\n");
-        printf("  IDA Pro + Hex-Rays   - BDRFlash reverse engineering\n");
-        printf("  hrtng IDA plugin     - Decompilation assistance\n");
-        printf("  x64dbg               - Dynamic analysis and debugging\n");
-        printf("  MSVC (cl.exe)        - Compilation\n\n");
-        printf("  Credits\n");
-        printf("  -------\n");
-        printf("  blackened2687        - BDRFlash / AutoFlasher author\n");
-        printf("                         Pioneer flash protocol pioneer :)\n");
-        printf("  MakeMKV community    - Drive testing and research\n");
-        printf("  rpc1dev              - DVRFlash open source reference\n\n");
-        printf("  Hardware Research\n");
-        printf("  -----------------\n");
-        printf("  Pioneer BD drives (BDR-211M/SAT 8801 family) confirmed to use\n");
-        printf("  Renesas H8S/2000 processor (big-endian 16/32-bit RISC).\n");
-        printf("  Confirmed by decoding the 0xB0 READ BUFFER dump and\n");
-        printf("  disassembling the firmware as H8S/2000 assembly.\n\n");
-        printf("  Memory map (from H8S assembly):\n");
-        printf("    0x00100000 = bootloader start\n");
-        printf("    0x00400000 = main firmware start\n");
-        printf("    0x00410000 = model string storage\n");
-        printf("    0xFF414000 = physical address (via 0xB0 mapping)\n\n");
-        printf("  TWO unlock keys confirmed from WRITE BUFFER handler:\n");
-        printf("    0x6123789A = primary key (LE form of H8S 0x9A782361)\n");
-        printf("    0x5CF2E094 = secondary key (LE form of H8S 0x94E0F25C)\n\n");
-        printf("  Note: Earlier analysis suggested ARM Thumb-2 (ARMv6) based\n");
-        printf("  on a decompiled C file. H8S/2000 is now confirmed correct\n");
-        printf("  for the SAT 8801 family via direct assembly analysis.\n\n");
-        printf("  DriveKit v1.0 - cPix / Razor 1911 (c) 2026\n");
-        printf("  Optical drive research toolkit\n\n");
+        printf("\n");
+        printf("  DriveKit v1.0\n");
+        printf("  Optical Drive Research Toolkit\n");
+        printf("  by cPix / Razor 1911 (c) 2026\n");
+        printf("  ================================\n\n");
+        printf("  Pioneer BD optical drive research toolkit.\n");
+        printf("  Firmware flashing, drive identification, SCSI probing\n");
+        printf("  and firmware analysis for Pioneer BD-R/BD-RE drives.\n\n");
 
-        printf("\n");
-        printf("\n");
-        printf("\n");
-        printf("\n");
+        printf("  KEY DISCOVERIES\n");
+        printf("  ---------------\n");
+        printf("  - Session token (READ BUFFER 0xA0 offset=0x90)\n");
+        printf("    Dynamic 16-byte unlock token, changes each power-on\n");
+        printf("  - Internal model strings (PIONEER BDR-BDS7, BDS8 etc)\n");
+        printf("    Differ from INQUIRY strings on newer drive families\n");
+        printf("  - 0x8000 chunk size required for NAND commit\n");
+        printf("  - Firmware pair matching: kernel ID must match normal firmware\n");
+        printf("    Mismatched pair returns ASC=4C (self-test failed)\n");
+        printf("  - AES-encrypted firmware (MrPenguin, H8S/2000 analysis)\n");
+        printf("    Crypto engine at 0xFF3FF000 handles flash + key verification\n");
+        printf("  - XD08 kernel limbo recovery via native ID36 firmware pair\n");
+        printf("  - Serial number year encoding confirmed (cxplay)\n\n");
+
+        printf("  HARDWARE\n");
+        printf("  --------\n");
+        printf("  Pioneer BD drives use Renesas H8S/2000 (big-endian RISC)\n");
+        printf("  Memory map (SAT 8801):\n");
+        printf("    0x00100000 = bootloader\n");
+        printf("    0x00400000 = main firmware\n");
+        printf("    0x00410000 = model string\n");
+        printf("    0xFF3FF000 = crypto/DMA engine\n");
+        printf("  Unlock keys: 0x6123789A (primary) 0x5CF2E094 (secondary)\n\n");
+
+        printf("  CREDITS\n");
+        printf("  -------\n");
+        printf("  blackened2687   BDRFlash/AutoFlasher author\n");
+        printf("                  Pioneer flash protocol pioneer\n");
+        printf("  MrPenguin       H8S/2000 deep firmware analysis\n");
+        printf("                  AES/crypto engine reverse engineering\n");
+        printf("                  BDR-S12U pypcode/Ghidra SLA analysis\n");
+        printf("  cxplay          1.4GB+ firmware archive\n");
+        printf("                  S9330360/361 discovery\n");
+        printf("                  Serial number year formula\n");
+        printf("  Sayaka          Firmware hunting methodology\n");
+        printf("                  BDR-UD04 UHD confirmation\n");
+        printf("  Coppervid       Support, testing, community liaison\n");
+        printf("  MakeMKV comm.   Drive testing and firmware contributions\n\n");
+
+        printf("  BDRFlash special thanks:\n");
+        printf("  Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen,\n");
+        printf("  ala42, czary2mary, jadburner, cvs, alexx12345, seku,\n");
+        printf("  Leman39, wujooj, jurireal, alphaville0527, SnowFox,\n");
+        printf("  Kirby, haysey70, Majestic12, elflorek, floppydumper,\n");
+        printf("  redwine, cryptojoe3737, TeddyRaspin, BillyCar11,\n");
+        printf("  asmcom, payalnik23, aliter404\n\n");
+
+        printf("  Tools: Wireshark+USBPcap, IDA Pro, x64dbg, pypcode,\n");
+        printf("         Visual Studio 2022, WSL, GCC\n\n");
+        printf("  Research and educational purposes only.\n");
+        printf("  https://github.com/cpix/drivekit\n\n");
 
         printf("                        /\\                \n");
         printf("          Razor 1911   /__\\   Since 1985 \n");
         printf("                      /\\  /\\ \n");
         printf("                     /__\\/__\\ \n");
         return 0;
-    }
-
-    if (strcmp(cmd, "findsigs")   == 0 ||
-        strcmp(cmd, "extract")    == 0 ||
-        strcmp(cmd, "getresource")== 0 ||
-        strcmp(cmd, "getres")     == 0) {
-        /* filename may come as bare arg (drv) or via --file or
-           as a path argument that was routed to g_outFile       */
-        const char *fname = drv ? drv : (g_outFile[0] ? g_outFile : NULL);
-        if (!fname) {
-            fprintf(stderr, "Usage: drivekit %s <filename>\n", cmd);
-            return 1;
-        }
-        if (strcmp(cmd, "findsigs")    == 0) return cmd_findsigs(fname);
-        if (strcmp(cmd, "extract")     == 0) return cmd_extract(fname);
-        return cmd_getresource(fname);
     }
 
     /* All other commands need a drive letter. If one wasn't given
@@ -6379,70 +5345,59 @@ int main(int argc, char *argv[])
         print_drive_info(g_hDrive, g_drivePath);
 
     if      (strcmp(cmd, "inquiry")     == 0) ret = cmd_inquiry();
+    else if (strcmp(cmd, "info")        == 0) ret = cmd_inquiry();
     else if (strcmp(cmd, "driveinfo")  == 0) ret = cmd_driveinfo2();
-    else if (strcmp(cmd, "bdread")      == 0) ret = cmd_bdread();
-    else if (strcmp(cmd, "modepage")    == 0) ret = cmd_modepage();
     else if (strcmp(cmd, "probef0")     == 0) ret = cmd_probef0();
     else if (strcmp(cmd, "rawdump")     == 0) ret = cmd_rawdump();
-    else if (strcmp(cmd, "combinedump") == 0) ret = cmd_combinedump();
     else if (strcmp(cmd, "unlock")      == 0) ret = cmd_unlock();
-    else if (strcmp(cmd, "resetdrive")  == 0) ret = cmd_resetdrive();
     else if (strcmp(cmd, "probevendor") == 0) ret = cmd_probevendor();
-    else if (strcmp(cmd, "mt1959")      == 0) ret = cmd_mt1959();
     else if (strcmp(cmd, "discinfo")    == 0) ret = cmd_discinfo();
-    else if (strcmp(cmd, "discstruct")  == 0) ret = cmd_discstruct();
     else if (strcmp(cmd, "querydriveinfo") == 0) ret = cmd_querydriveinfo();
     else if (strcmp(cmd, "probeb0")     == 0) ret = cmd_probeb0();
     else if (strcmp(cmd, "modelcheck")  == 0) ret = cmd_modelcheck();
     else if (strcmp(cmd, "keycheck")    == 0) ret = cmd_keycheck();
-    else if (strcmp(cmd, "probewb")     == 0) ret = cmd_probewb();
     else if (strcmp(cmd, "brutekey")    == 0) ret = cmd_brutekey();
-    else if (strcmp(cmd, "extract")     == 0) {
-        if (!drv) {
-            fprintf(stderr, "Usage: drivekit extract <filename>\n");
-            ret = 1;
-        } else {
-            ret = cmd_extract(drv);
-        }
-    }
     else if (strcmp(cmd, "autoflash")  == 0) ret = cmd_autoflash();
     else if (strcmp(cmd, "flashfw")    == 0) ret = cmd_flashfw();
-    else if (strcmp(cmd, "sendfirmware") == 0) ret = cmd_sendfirmware();
     else if (strcmp(cmd, "probemodes")   == 0) ret = cmd_probemodes();
     else if (strcmp(cmd, "resetnormal")  == 0) ret = cmd_resetnormal();
     else if (strcmp(cmd, "sendcdb")      == 0) {
+        UCHAR cdb[16]={0}; UCHAR payload[0x100]={0};
+        UCHAR sense[SENSE_SIZE]; int st=0, nc=0, i;
         /* sendcdb 3B 05 FE 00 00 00 00 01 00 00
            Sends raw CDB to drive, direction OUT with zero payload
            Usage: drivekit sendcdb G 3B 05 FE 00 00 00 00 01 00 00 */
-        UCHAR cdb[16]={0}; UCHAR payload[0x100]={0};
-        UCHAR sense[SENSE_SIZE]; int st=0, nc=0, i;
         /* Parse hex bytes from remaining args */
         for(i=3; i<argc && nc<16; i++)
             cdb[nc++]=(UCHAR)strtol(argv[i],NULL,16);
         if(nc<6){printf("Usage: drivekit sendcdb G 3B 05 FE 00 00 00 00 01 00 00\n");}
         else {
+            int direction = SCSI_IOCTL_DATA_OUT;
+            /* Auto-detect direction: 0x3C = READ BUFFER → DATA_IN */
+            if (cdb[0] == 0x3C || cdb[0] == 0x12 || cdb[0] == 0x03 ||
+                cdb[0] == 0x4A || cdb[0] == 0x46 || cdb[0] == 0x51)
+                direction = SCSI_IOCTL_DATA_IN;
             build_pioneer_payload_auto(payload);
             printf("Sending CDB: ");
             for(i=0;i<nc;i++) printf("%02X ",cdb[i]); printf("\n");
-            send_scsi(g_hDrive,cdb,nc,payload,0x100,
-                      SCSI_IOCTL_DATA_OUT,sense,&st);
+            send_scsi(g_hDrive,cdb,nc,payload,0x100,direction,sense,&st);
             printf("Status: %s",st==0?"GOOD":"FAIL");
             if(st!=0) printf(" key=%02X ASC=%02X",sense[2]&0x0F,sense[12]);
             printf("\n");
+            if(st==0 && direction==SCSI_IOCTL_DATA_IN) {
+                printf("Response (first 32 bytes):\n");
+                for(i=0;i<32;i++) {
+                    if(i%16==0) printf("  %04X  ",i);
+                    printf("%02X ",payload[i]);
+                    if(i%16==15) printf("\n");
+                }
+            }
         }
         ret=0;
     }
     else if (strcmp(cmd, "checkfw")     == 0) ret = cmd_checkfw();
     else if (strcmp(cmd, "checkcompat") == 0) ret = cmd_checkcompat();
-    else if (strcmp(cmd, "fwversion")    == 0) ret = cmd_fwversion();
     else if (strcmp(cmd, "triggerkernel")== 0) ret = cmd_triggerkernel();
-    else if (strcmp(cmd, "dumpfw")       == 0) {
-        /* Combined: trigger kernel mode then dump 0xB0 firmware
-           Disc must be inserted. Same handle = kernel mode preserved */
-        g_bufID = 0xB0;
-        ret = cmd_triggerkernel();
-        if (ret == 0) ret = cmd_rawdump();
-    }
     else if (strcmp(cmd, "triggerflash") == 0) {
         /* Trigger kernel mode then immediately flash — same handle,
            kernel mode state preserved between the two operations  */

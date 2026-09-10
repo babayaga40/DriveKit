@@ -73,6 +73,8 @@ static DWORD   g_key_override = 0; /* 0 = use derived key */
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static int     g_nounlock = 0;    /* skip unlock step (older drives) */
 static UCHAR   g_bufID     = 0xF4;
+static UCHAR   g_a0token[0x100] = {0}; /* session token from 0xA0 - reused for trigger */
+static int     g_has_token = 0;         /* 1 if valid token was retrieved */
 
 /* Forward typedef so PIONEER_DRIVE can be used in early functions */
 typedef struct PIONEER_DRIVE_S {
@@ -1162,6 +1164,37 @@ static int cmd_findsigs(const char *filename)
 /* =========================================================
    COMMAND: unlock (Pioneer RS8801 service mode)
    ========================================================= */
+/* Internal model string lookup table */
+static const struct { WORD did; const char *str; } g_mdl_map[] = {
+    { 0x8000, "PIONEER BDR-S07J" },
+    { 0x8221, "PIONEER BDR-XS05" },
+    { 0x8231, "PIONEER BDR-XD05" },
+    { 0x8232, "PIONEER BDR-XD05" },
+    { 0x8301, "PIONEER BDR-208  " },
+    { 0x8410, "PIONEER BDR-UD02 " },
+    { 0x8490, "PIONEER BDC-UD02 " },
+    { 0x8510, "PIONEER BDR-UD03 " },
+    { 0x8511, "PIONEER BDR-UD03 " },
+    { 0x8600, "PIONEER BDR-209  " },
+    { 0x8601, "PIONEER BDR-209M " },
+    { 0x8721, "PIONEER BDR-XS06 " },
+    { 0x8722, "PIONEER BDR-XS06 " },
+    { 0x8800, "PIONEER BDR-211  " },
+    { 0x8801, "PIONEER BDR-BDS5 " },
+    { 0x8A10, "PIONEER BDR-UD04 " },
+    { 0x8B30, "PIONEER BDR-XD06U" },
+    { 0x8D30, "PIONEER BDR-BDS7 " },
+    { 0x8D31, "PIONEER BDR-BDS7 " },
+    { 0x8E20, "PIONEER BDR-BDS7 " },
+    { 0x8E21, "PIONEER BDR-BDS7 " },
+    { 0x8F00, "PIONEER BDR-212  " },
+    { 0x8F01, "PIONEER BDR-BDS6 " },
+    { 0x9330, "PIONEER BDR-BDS8 " },
+    { 0x9331, "PIONEER BDR-BDS8 " },
+    { 0x9400, "PIONEER BDR-X13  " },
+    { 0, NULL }
+};
+
 static int cmd_unlock(void)
 {
     UCHAR cdb[12];
@@ -1243,78 +1276,67 @@ static int cmd_unlock(void)
         printf("  Using derived key: 0x%08lX\n\n", unlockKey);
     }
 
-    /* Build payload - use internal firmware model string, NOT INQUIRY model
-       The unlock handler compares against the firmware's own model string
-       which differs from the INQUIRY product string on many drives */
+    /* Step 2b: Try READ BUFFER 0xA0 session token method (BDRFlash method)
+       BDRFlash reads 0xA0 at offset 0x90 (144) and sends it back as the unlock payload.
+       This is a challenge-response token that changes each power-on.
+       If available, this method works on ALL drives including post-cutoff! */
+    memset(payload, 0, PAYLOAD_SIZE);
+    memset(a0, 0, sizeof(a0));
     {
-        /* Internal model string lookup by platform ID */
-        static const struct { WORD did; const char *str; } mdl_map[] = {
-            { 0x8000, "PIONEER BDR-S07J" },
-            { 0x8221, "PIONEER BDR-XS05" },
-            { 0x8231, "PIONEER BDR-XD05" },
-            { 0x8232, "PIONEER BDR-XD05" },
-            { 0x8301, "PIONEER BDR-208  " },
-            { 0x8410, "PIONEER BDR-UD02 " },
-            { 0x8490, "PIONEER BDC-UD02 " },
-            { 0x8510, "PIONEER BDR-UD03 " },
-            { 0x8511, "PIONEER BDR-UD03 " },
-            { 0x8600, "PIONEER BDR-209  " },
-            { 0x8601, "PIONEER BDR-209M " },
-            { 0x8721, "PIONEER BDR-XS06 " },
-            { 0x8722, "PIONEER BDR-XS06 " },
-            { 0x8800, "PIONEER BDR-211  " },
-            { 0x8801, "PIONEER BDR-BDS5 " },
-            { 0x8A10, "PIONEER BDR-UD04 " },
-            { 0x8B30, "PIONEER BDR-XD06U" },
-            { 0x8D30, "PIONEER BDR-BDS7 " },
-            { 0x8D31, "PIONEER BDR-BDS7 " },
-            { 0x8E20, "PIONEER BDR-BDS7 " },
-            { 0x8E21, "PIONEER BDR-BDS7 " },
-            { 0x8F00, "PIONEER BDR-212  " },
-            { 0x8F01, "PIONEER BDR-BDS6 " },
-            { 0x9330, "PIONEER BDR-BDS8 " },
-            { 0x9331, "PIONEER BDR-BDS8 " },
-            { 0x9400, "PIONEER BDR-X13  " },
-            { 0, NULL }
-        };
-        const char *internal_model = NULL;
-        int mi;
-        for (mi = 0; mdl_map[mi].did; mi++) {
-            if (mdl_map[mi].did == driveID) {
-                internal_model = mdl_map[mi].str;
-                break;
-            }
-        }
-        memset(payload, 0, PAYLOAD_SIZE);
-        if (internal_model) {
-            /* Use known internal model string */
-            for (j = 0; j < 16 && internal_model[j]; j++)
-                payload[j] = (UCHAR)internal_model[j];
-            printf("  Using internal model string: \"%s\"\n", internal_model);
+        int a0st = 0;
+        UCHAR a0sense[SENSE_SIZE];
+        send_scsi(g_hDrive, a0cdb, 10, a0, 16, SCSI_IOCTL_DATA_IN, a0sense, &a0st);
+        /* Check if we got a valid session token vs model string
+           Token starts with 00 00 5C 00 (non-ASCII)
+           Model string starts with ASCII chars like 'B' (0x42) */
+        if (a0st == 0 && a0[0]==0x00 && a0[1]==0x00 && a0[2]!=0x00) {
+            /* Got valid token - use BDRFlash method */
+            memcpy(payload, a0, 16);
+            memcpy(g_a0token, a0, 16); /* save for execution trigger */
+            g_has_token = 1;
+            printf("  Using 0xA0 session token (BDRFlash method):\n  Token: ");
+            for (j=0;j<16;j++) printf("%02X ",a0[j]);
+            printf("\n\n");
         } else {
-            /* Fall back to INQUIRY-derived string */
-            payload[0]='P'; payload[1]='I'; payload[2]='O';
-            payload[3]='N'; payload[4]='E'; payload[5]='E';
-            payload[6]='R'; payload[7]=' '; payload[8]=' ';
-            p2 = strstr(model, "BDR-");
-            if (!p2) p2 = strstr(model, "DVR-");
-            if (p2) {
-                for (k = 0; k < 7 && p2[k] && p2[k] != ' '; k++)
-                    payload[9+k] = (UCHAR)p2[k];
+            /* 0xA0 not available - use model string + key method */
+            const char *internal_model = NULL;
+            int mi;
+            printf("  0xA0 token not available - using model string + key method\n\n");
+            for (mi = 0; g_mdl_map[mi].did; mi++) {
+                if (g_mdl_map[mi].did == driveID) {
+                    internal_model = g_mdl_map[mi].str;
+                    break;
+                }
             }
-            printf("  WARNING: No internal model known for 0x%04X, using INQUIRY string\n", driveID);
+            memset(payload, 0, PAYLOAD_SIZE);
+            if (internal_model) {
+                for (j = 0; j < 16 && internal_model[j]; j++)
+                    payload[j] = (UCHAR)internal_model[j];
+                printf("  Using internal model string: \"%s\"\n", internal_model);
+            } else {
+                payload[0]='P'; payload[1]='I'; payload[2]='O';
+                payload[3]='N'; payload[4]='E'; payload[5]='E';
+                payload[6]='R'; payload[7]=' '; payload[8]=' ';
+                p2 = strstr(model, "BDR-");
+                if (!p2) p2 = strstr(model, "DVR-");
+                if (p2) {
+                    for (k = 0; k < 7 && p2[k] && p2[k] != ' '; k++)
+                        payload[9+k] = (UCHAR)p2[k];
+                }
+                printf("  WARNING: No internal model known for 0x%04X, using INQUIRY string\n", driveID);
+            }
+            payload[0x10] = (UCHAR)(unlockKey >>  0);
+            payload[0x11] = (UCHAR)(unlockKey >>  8);
+            payload[0x12] = (UCHAR)(unlockKey >> 16);
+            payload[0x13] = (UCHAR)(unlockKey >> 24);
+            printf("  Payload: ");
+            for (j = 0; j < 20; j++) printf("%02X ", payload[j]);
+            printf("\n  String : \"");
+            for (j = 0; j < 16; j++)
+                printf("%c", payload[j]>=0x20&&payload[j]<0x7F?payload[j]:'.');
+            printf("\"\n\n");
         }
     }
-    payload[0x10] = (UCHAR)(unlockKey >>  0);
-    payload[0x11] = (UCHAR)(unlockKey >>  8);
-    payload[0x12] = (UCHAR)(unlockKey >> 16);
-    payload[0x13] = (UCHAR)(unlockKey >> 24);
-    printf("  Payload: ");
-    for (j = 0; j < 20; j++) printf("%02X ", payload[j]);
-    printf("\n  String : \"");
-    for (j = 0; j < 16; j++)
-        printf("%c", payload[j]>=0x20&&payload[j]<0x7F?payload[j]:'.');
-    printf("\"\n\n");
 
     /* Step 3: WRITE BUFFER 0xFF unlock */
     printf("[3/6] WRITE BUFFER 0xFF unlock...\n");
@@ -5358,8 +5380,9 @@ static int cmd_flashfw(void)
     DWORD  offset;
     char   fname[256];
 
-    if (!g_outFile[0]) {
-        fprintf(stderr, "Usage: drivekit flashfw G --file S8801600.153\n");
+    if (!g_outFile[0] && !g_outFile2[0]) {
+        fprintf(stderr, "Usage: drivekit flashfw G --file kernel.bin [--file2 normal.bin]\n");
+        fprintf(stderr, "       drivekit flashfw G --file2 normal.bin  (normal firmware only)\n");
         return 1;
     }
     strncpy(fname, g_outFile, sizeof(fname)-1);
@@ -5470,6 +5493,7 @@ static int cmd_flashfw(void)
         }
     }
 
+    if (g_outFile[0]) { /* kernel flash - skip if --file2 only */
     printf("  File : %s\n", fname);
 
     fp = fopen(fname, "rb");
@@ -5774,54 +5798,54 @@ static int cmd_flashfw(void)
         Sleep(200);
     }
 
-    printf("[2/3] Sending kernel (single transfer, %ld bytes)...\n", filesize);
+    printf("[2/3] Sending kernel (0x8000 chunks, %ld bytes)...\n", filesize);
     {
-        UCHAR  cdb[10];
-        DWORD  n = (DWORD)filesize;
-        memset(cdb, 0, sizeof(cdb));
-        cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
-        cdb[3]=0; cdb[4]=0; cdb[5]=0;
-        cdb[6]=(UCHAR)(n>>16);
-        cdb[7]=(UCHAR)(n>>8);
-        cdb[8]=(UCHAR)(n);
-        send_scsi(g_hDrive, cdb, 10, data, n,
-                  SCSI_IOCTL_DATA_OUT, sense, &st);
-        if (st != 0) {
-            printf("\n  Single transfer failed: key=%02X ASC=%02X - trying chunks\n",
-                   sense[2]&0x0F, sense[12]);
-            /* Fall back to chunked transfer */
-            offset = 0;
-            while (offset < (DWORD)filesize) {
-                UCHAR chunk[0x4000];
-                DWORD cn = (DWORD)filesize - offset;
-                if (cn > 0x4000) cn = 0x4000;
-                memset(chunk, 0, sizeof(chunk));
-                memcpy(chunk, data + offset, cn);
-                memset(cdb, 0, sizeof(cdb));
+        UCHAR cdb[10];
+        offset = 0;
+        while (offset < (DWORD)filesize) {
+            DWORD n = (DWORD)filesize - offset;
+            if (n > 0x8000) n = 0x8000;
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+            cdb[3]=(UCHAR)(offset>>16);
+            cdb[4]=(UCHAR)(offset>>8);
+            cdb[5]=(UCHAR)(offset);
+            cdb[6]=(UCHAR)(n>>16);
+            cdb[7]=(UCHAR)(n>>8);
+            cdb[8]=(UCHAR)(n);
+            send_scsi(g_hDrive, cdb, 10, data + offset, n,
+                      SCSI_IOCTL_DATA_OUT, sense, &st);
+            if (st != 0) {
+                /* Try single transfer as fallback (XD08 needs this) */
+                DWORD total = (DWORD)filesize;
+                printf("\n  Chunk failed at 0x%lX - trying single transfer...\n", offset);
+                memset(cdb,0,sizeof(cdb));
                 cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
-                cdb[3]=(UCHAR)(offset>>16);
-                cdb[4]=(UCHAR)(offset>>8);
-                cdb[5]=(UCHAR)(offset);
-                cdb[6]=0; cdb[7]=(UCHAR)(0x4000>>8); cdb[8]=0;
-                send_scsi(g_hDrive, cdb, 10, chunk, 0x4000,
+                cdb[6]=(UCHAR)(total>>16);
+                cdb[7]=(UCHAR)(total>>8);
+                cdb[8]=(UCHAR)(total);
+                send_scsi(g_hDrive, cdb, 10, data, total,
                           SCSI_IOCTL_DATA_OUT, sense, &st);
-                if (st != 0) {
-                    printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
-                           offset, sense[2]&0x0F, sense[12]);
-                    free(data); return 1;
+                if (st == 0) {
+                    printf("  %ld / %ld bytes - OK (single transfer)\n", total, total);
+                    offset = total;
+                    break;
                 }
-                offset += cn;
-                printf("\r  %lu / %lu bytes", offset, (DWORD)filesize);
-                fflush(stdout);
-                Sleep(200);
+                printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
+                       offset, sense[2]&0x0F, sense[12]);
+                free(data); return 1;
             }
-        } else {
-            printf("  %ld / %ld bytes - OK\n", filesize, filesize);
+            offset += n;
+            printf("\r  %lu / %lu bytes", offset, (DWORD)filesize);
+            fflush(stdout);
+            Sleep(50);
         }
+        printf("\n");
     }
-    offset = (DWORD)filesize;
-    printf("\n  Done.\n\n");
+    printf("  Done.\n\n");
     free(data);
+
+    } /* end kernel section - g_outFile */
 
     /* Immediately send firmware if --file2 provided */
     if (g_outFile2[0]) {
@@ -5895,14 +5919,16 @@ static int cmd_flashfw(void)
     }
 
     /* Execution trigger — WRITE BUFFER mode=5 bufID=0xFF
-       Wireshark confirmed: sent after last firmware chunk + busy clear
-       Payload: "PIONEER  BDR-211" + key 0x6123789A              */
+       BDRFlash uses same session token as unlock payload for trigger too! */
     printf("[2d/3] Execution trigger (mode=5, bufID=0xFF)...\n");
     {
         UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
         UCHAR sense2[SENSE_SIZE];
+        UCHAR *trig_payload = g_has_token ? g_a0token : g_payload;
         int   st2 = 0;
-        send_scsi(g_hDrive, cdb, 10, g_payload, 0x100,
+        if (g_has_token)
+            printf("  Using 0xA0 session token for trigger\n");
+        send_scsi(g_hDrive, cdb, 10, trig_payload, 0x100,
                   SCSI_IOCTL_DATA_OUT, sense2, &st2);
         printf("  Status: %s", st2==0?"GOOD":"FAIL");
         if (st2 != 0)
@@ -5918,8 +5944,8 @@ static int cmd_flashfw(void)
         int ready = 0;
         int attempt;
 
-        /* Phase 1: GET EVENT STATUS loop (frames 909-1082 in capture) */
-        for (attempt = 0; attempt < 80; attempt++) {
+        /* Phase 1: GET EVENT STATUS loop */
+        for (attempt = 0; attempt < 160; attempt++) {
             UCHAR escdb[10]={0x4A,0x01,0,0,0x5A,0,0,0,0x08,0};
             UCHAR es[8], sense2[SENSE_SIZE];
             int   st2 = 0;
@@ -5927,41 +5953,65 @@ static int cmd_flashfw(void)
             memset(es, 0, sizeof(es));
             send_scsi(g_hDrive, escdb, 10, es, 8,
                       SCSI_IOCTL_DATA_IN, sense2, &st2);
-            printf("\r  GET EVENT %2d/80  ", attempt+1);
+            printf("\r  GET EVENT %3d/160  ", attempt+1);
             fflush(stdout);
         }
         printf("\n");
 
-        /* Phase 2: TEST UNIT READY + REQUEST SENSE (frames 1083-1103) */
-        for (attempt = 0; attempt < 120; attempt++) {
-            UCHAR cdb[6]  = {0,0,0,0,0,0};
+        /* Phase 2: TEST UNIT READY + REQUEST SENSE after every TUR (BDRFlash method) */
+        for (attempt = 0; attempt < 300; attempt++) {  /* up to 5 minutes */
+            UCHAR cdb[6]   = {0,0,0,0,0,0};
+            UCHAR rscdb[6] = {0x03,0,0,0,0x12,0};
             UCHAR sense2[SENSE_SIZE];
-            int   st2 = 0;
+            UCHAR rsbuf[18];
+            int   st2=0, rst=0;
             UCHAR skey, asc;
-            Sleep(1000);
+            Sleep(500);  /* 500ms intervals like BDRFlash */
 
+            /* TUR */
             send_scsi(g_hDrive, cdb, 6, NULL, 0,
                       SCSI_IOCTL_DATA_UNSPECIFIED, sense2, &st2);
             skey = sense2[2] & 0x0F;
             asc  = sense2[12];
 
-            if (skey == 0x06) {
-                UCHAR rscdb[6]={0x03,0,0,0,0x12,0};
-                UCHAR rsbuf[18]; int rst=0;
-                send_scsi(g_hDrive,rscdb,6,rsbuf,18,
-                          SCSI_IOCTL_DATA_IN,sense2,&rst);
-                send_scsi(g_hDrive,cdb,6,NULL,0,
-                          SCSI_IOCTL_DATA_UNSPECIFIED,sense2,&st2);
-                skey = sense2[2] & 0x0F;
-                asc  = sense2[12];
+            /* REQUEST SENSE after every TUR - BDRFlash always does this */
+            memset(rsbuf, 0, sizeof(rsbuf));
+            send_scsi(g_hDrive, rscdb, 6, rsbuf, 18,
+                      SCSI_IOCTL_DATA_IN, sense2, &rst);
+
+            /* During NAND write sense key=0x0C is normal - drive is busy writing */
+            if (rsbuf[2] == 0x0C) {
+                printf("\r  TUR %3d/300: NAND writing (key=0C)...  ", attempt+1);
+                fflush(stdout);
+                continue;
             }
 
-            printf("\r  TUR %3d/120: skey=%02X ASC=%02X  ",
+            printf("\r  TUR %3d/300: skey=%02X ASC=%02X  ",
                    attempt+1, skey, asc);
             fflush(stdout);
 
             if (st2 == 0 || asc == 0x3A) {
-                printf("Flash complete - drive ready (no disc)\n\n");
+                /* Verify drive actually rebooted to normal mode */
+                UCHAR f1cdb[10]={0x3C,0x02,0xF1,0,0,0,0,0,0x30,0};
+                UCHAR f1buf[0x30]; int f1st=0;
+                memset(f1buf,0,sizeof(f1buf));
+                send_scsi(g_hDrive,f1cdb,10,f1buf,0x30,SCSI_IOCTL_DATA_IN,sense2,&f1st);
+                /* Check if drive exited kernel mode - look for non-"0000" firmware version
+                   Scan the F1 response for "0000" pattern indicating kernel mode */
+                { int still_kernel = 0;
+                  int bi;
+                  for(bi=0; bi<0x2C-3; bi++) {
+                      if(f1buf[bi]=='0'&&f1buf[bi+1]=='0'&&
+                         f1buf[bi+2]=='0'&&f1buf[bi+3]=='0') {
+                          still_kernel=1; break;
+                      }
+                  }
+                if(f1st==0 && still_kernel) {
+                    printf("\r  TUR %3d/300: drive ready but still kernel mode - waiting...  ", attempt+1);
+                    fflush(stdout);
+                    continue;
+                } }
+                printf("Flash complete - drive ready!\n\n");
                 ready = 1; break;
             }
             if (skey == 0x02 || (skey==0x04 && asc==0x4C)) continue;

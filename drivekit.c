@@ -1129,6 +1129,98 @@ static int cmd_unlock(void)
     return 0;
 }
 
+/* =========================================================
+   COMMAND: e5test
+   Tests the WRITE BUFFER 0xE5 "Engineering Mode" flag setter
+   discovered by MrPenguin in XD08U H8S/2000 disassembly.
+   
+   From MrPenguin's analysis:
+   - WRITE 0xE5 with payload 0x01 sets flag @0xA0CE7E = 1
+   - This enables the 0xFF "Engineering Mode" backdoor
+   - Which may bypass the version check!
+   - Length must be exactly 2 bytes
+   
+   Sequence:
+   1. WRITE 0xE5 len=2 payload=01  → enable engineering mode
+   2. Check 0xF4 accessibility
+   3. Try WRITE 0xFF with various payloads
+   4. Try flashing older firmware
+   ========================================================= */
+static int cmd_e5test(void)
+{
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR payload[0x100] = {0};
+    int st = 0, i;
+
+    printf("=== E5 ENGINEERING MODE TEST ===\n\n");
+    printf("Based on MrPenguin's H8S/2000 disassembly of XD08U.\n");
+    printf("Testing WRITE BUFFER 0xE5 flag setter...\n\n");
+
+    /* Try WRITE 0xE5 with length=2, payload=0x01 (enable) */
+    printf("[1] WRITE BUFFER 0xE5 len=2 payload=0x01 (ENABLE)...\n");
+    {
+        UCHAR cdb[10] = {0x3B,0x04,0xE5,0,0,0,0,0x00,0x02,0};
+        payload[0] = 0x01;
+        send_scsi(g_hDrive, cdb, 10, payload, 2, SCSI_IOCTL_DATA_OUT, sense, &st);
+        printf("  Status: %s", (st==0||(sense[2]&0xF)==0)?"GOOD":"FAIL");
+        if (st != 0) printf(" (key=%02X ASC=%02X)", sense[2]&0xF, sense[12]);
+        printf("\n\n");
+    }
+
+    /* Try different modes for 0xE5 */
+    printf("[2] Sweeping modes for WRITE 0xE5...\n");
+    UCHAR modes[] = {0x00,0x01,0x04,0x06,0x07};
+    for (i = 0; i < 5; i++) {
+        UCHAR cdb[10] = {0x3B,modes[i],0xE5,0,0,0,0,0x00,0x02,0};
+        memset(sense, 0, sizeof(sense));
+        payload[0] = 0x01; payload[1] = 0x00;
+        send_scsi(g_hDrive, cdb, 10, payload, 2, SCSI_IOCTL_DATA_OUT, sense, &st);
+        printf("  mode=0x%02X: %s", modes[i],
+               (st==0||(sense[2]&0xF)==0)?"GOOD":"FAIL");
+        if (st != 0) printf(" (key=%02X ASC=%02X)", sense[2]&0xF, sense[12]);
+        printf("\n");
+    }
+
+    /* Check if 0xF4 is accessible after E5 */
+    printf("\n[3] Checking 0xF4 accessibility after 0xE5...\n");
+    {
+        UCHAR cdb[10] = {0x3C,0x02,0xF4,0,0,0,0,0,0x40,0};
+        UCHAR rbuf[64] = {0};
+        send_scsi(g_hDrive, cdb, 10, rbuf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+        printf("  0xF4: %s\n", (st==0||(sense[2]&0xF)==0)?"ACCESSIBLE!":"not available");
+        if (st==0||(sense[2]&0xF)==0) {
+            printf("  First bytes: %02X %02X %02X %02X\n",
+                   rbuf[0],rbuf[1],rbuf[2],rbuf[3]);
+        }
+    }
+
+    /* Try WRITE 0xFF Engineering Mode with various payloads */
+    printf("\n[4] Testing 0xFF Engineering Mode...\n");
+    {
+        /* Try with model string + key */
+        UCHAR cdb[10] = {0x3B,0x04,0xFF,0,0,0,0,0x01,0x00,0};
+        memset(payload, 0, sizeof(payload));
+        memcpy(payload, "PIONEER BDR-XS06", 16);
+        payload[0x10]=0xF2; payload[0x11]=0x8A; payload[0x12]=0xA9; payload[0x13]=0x08;
+        send_scsi(g_hDrive, cdb, 10, payload, 0x100, SCSI_IOCTL_DATA_OUT, sense, &st);
+        printf("  0xFF XS06+key: %s", (st==0||(sense[2]&0xF)==0)?"GOOD":"FAIL");
+        if (st != 0) printf(" (key=%02X ASC=%02X)", sense[2]&0xF, sense[12]);
+        printf("\n");
+    }
+
+    /* Try WRITE 0xE5 disable */
+    printf("\n[5] WRITE BUFFER 0xE5 len=2 payload=0x00 (DISABLE)...\n");
+    {
+        UCHAR cdb[10] = {0x3B,0x04,0xE5,0,0,0,0,0x00,0x02,0};
+        memset(payload, 0, sizeof(payload));
+        send_scsi(g_hDrive, cdb, 10, payload, 2, SCSI_IOCTL_DATA_OUT, sense, &st);
+        printf("  Status: %s\n", (st==0||(sense[2]&0xF)==0)?"GOOD":"FAIL");
+    }
+
+    printf("\nDone! Check results above.\n");
+    return 0;
+}
+
 static int cmd_probevendor(void)
 {
     UCHAR buf[256], sense[SENSE_SIZE], cdb[12];
@@ -4522,18 +4614,18 @@ static int cmd_flashfw(void)
        00 00 5C 00 token in normal mode that's needed for trigger later!
        Must be done BEFORE 0xF1 triggers kernel mode! */
     {
-        /* First send START STOP 0x20 — Pioneer updater does this to
-           generate the session token before unlock! Go straight to 0xF1! */
+        /* START STOP 0x20 — enables chunked transfer and session token */
         {
             UCHAR sscdb[6] = {0x1B,0x00,0x00,0x00,0x20,0x00};
             UCHAR sssense[SENSE_SIZE] = {0};
             int ssst = 0;
             send_scsi(g_hDrive, sscdb, 6, NULL, 0,
                       SCSI_IOCTL_DATA_UNSPECIFIED, sssense, &ssst);
-            Sleep(100); /* Small delay then immediately read 0xF1! */
+            printf("  [DBG] START STOP 0x20: %s\n", ssst==0?"GOOD":"FAIL");
+            Sleep(500);
         }
 
-        /* Read 0xF1 IMMEDIATELY after START STOP */
+        /* Read 0xF1 before unlock */
 
         UCHAR f1sense[SENSE_SIZE] = {0};
         memset(g_f1token, 0, sizeof(g_f1token));
@@ -4701,6 +4793,28 @@ static int cmd_flashfw(void)
     {
         UCHAR cdb[10];
         offset = 0;
+
+        /* Post-cutoff: go straight to single transfer for kernel
+           bufID=0x00 rejects chunk 2 (at 0x10000) — skip chunking! */
+        if (g_unlock_mode == 0x01) {
+            DWORD total = (DWORD)filesize;
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0x00;
+            cdb[6]=(UCHAR)(total>>16);
+            cdb[7]=(UCHAR)(total>>8);
+            cdb[8]=(UCHAR)(total);
+            send_scsi(g_hDrive, cdb, 10, data, total,
+                      SCSI_IOCTL_DATA_OUT, sense, &st);
+            if (st == 0 || (sense[2]&0x0F) == 0) {
+                printf("  %ld / %ld bytes - OK (single transfer)\n", total, total);
+                printf("  [DBG] Kernel sense: key=%02X ASC=%02X\n", sense[2]&0x0F, sense[12]);
+                Sleep(500); /* Wait for drive to process kernel */
+                offset = total;
+            } else {
+                printf("  FAILED: key=%02X ASC=%02X\n", sense[2]&0x0F, sense[12]);
+                free(data); return 1;
+            }
+        } else {
         while (offset < (DWORD)filesize) {
             DWORD n = (DWORD)filesize - offset;
             if (n > 0x8000) n = 0x8000;
@@ -4740,6 +4854,7 @@ static int cmd_flashfw(void)
             Sleep(50);
         }
         printf("\n");
+        } /* end else (pre-cutoff chunked) */
     }
     printf("  Done.\n\n");
     free(data);
@@ -4933,46 +5048,40 @@ static int cmd_flashfw(void)
                 printf("  Using model string as trigger payload\n");
             }
 
-            /* Try triggers in order - most likely to work first */
-            {
-                /* Try mode=5 bufID=0xFF len=256 with model string — confirmed from Wireshark! */
-                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+            /* Try with MakeMKV firmware name per MrPenguin's insight:
+               "last 4 bytes can be anything — only 16-byte firmware name matters"
+               MrPenguin suggests: PIONEER BDR-BDS6 for XD06U (follows XD08U=BDS8 pattern)
+               CDB length MUST be >= 19 bytes per MrPenguin! Using 20 bytes (0x14) */
+            UCHAR xs06_payload[0x100] = {0};
+            UCHAR bds6_payload[0x100] = {0};
+            memcpy(xs06_payload, "PIONEER BDR-XS06", 16);
+            memcpy(bds6_payload, "PIONEER BDR-BDS6", 16);
+            /* Last 4 bytes can be anything — use key anyway */
+            xs06_payload[0x10] = 0xF2; xs06_payload[0x11] = 0x8A;
+            xs06_payload[0x12] = 0xA9; xs06_payload[0x13] = 0x08;
+            bds6_payload[0x10] = 0xF2; bds6_payload[0x11] = 0x8A;
+            bds6_payload[0x12] = 0xA9; bds6_payload[0x13] = 0x08;
+
+            /* Try BDS6 first (MrPenguin suggestion), then XS06, then XD05BK2 */
+            UCHAR *payloads[] = {bds6_payload, xs06_payload, g_payload};
+            const char *pnames[] = {"PIONEER BDR-BDS6", "PIONEER BDR-XS06", "XD05BK2/XV5"};
+            int pi;
+            for (pi = 0; pi < 3; pi++) {
+                /* CDB length = 0x14 = 20 bytes (MrPenguin: must be >= 19!) */
+                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x00,0x14,0};
                 UCHAR tsense[SENSE_SIZE] = {0};
-                send_scsi(g_hDrive, tcdb, 10, trig_payload, 0x100,
+                printf("  Trying %s trigger (len=0x14)...\n", pnames[pi]);
+                send_scsi(g_hDrive, tcdb, 10, payloads[pi], 0x14,
                           SCSI_IOCTL_DATA_OUT, tsense, &st2);
-                printf("  Trigger mode=5 bufID=0xFF len=256: %s",
+                printf("  Trigger %s: %s", pnames[pi],
                        (st2==0||(tsense[2]&0xF)==0)?"GOOD":"FAIL");
                 if (st2 != 0 && (tsense[2]&0xF) != 0)
                     printf(" (key=%02X ASC=%02X)", tsense[2]&0xF, tsense[12]);
                 printf("\n");
-                if (st2 == 0 || (tsense[2]&0xF) == 0) {
-                    memcpy(sense2, tsense, SENSE_SIZE);
-                    st2 = 0;
-                } else {
-                    /* Fallback: mode=5 bufID=0x00 len=32 */
-                    UCHAR tcdb2[10] = {0x3B,0x05,0x00,0,0,0,0,0x00,0x20,0};
-                    send_scsi(g_hDrive, tcdb2, 10, trig_payload, 0x20,
-                              SCSI_IOCTL_DATA_OUT, sense2, &st2);
-                    printf("  Trigger mode=5 bufID=0x00 len=32: %s",
-                           (st2==0||(sense2[2]&0xF)==0)?"GOOD":"FAIL");
-                    if (st2 != 0 && (sense2[2]&0xF) != 0)
-                        printf(" (key=%02X ASC=%02X)", sense2[2]&0xF, sense2[12]);
-                    printf("\n");
-                    if (st2 == 0 || (sense2[2]&0xF) == 0) st2 = 0;
-                    else {
-                        /* Last resort: mode=1 bufID=0x00 */
-                        UCHAR tcdb3[10] = {0x3B,0x01,0x00,0,0,0,0,0x00,0x20,0};
-                        send_scsi(g_hDrive, tcdb3, 10, trig_payload, 0x20,
-                                  SCSI_IOCTL_DATA_OUT, sense2, &st2);
-                        printf("  Trigger mode=1 bufID=0x00: %s",
-                               (st2==0||(sense2[2]&0xF)==0)?"GOOD":"FAIL");
-                        if (st2 != 0 && (sense2[2]&0xF) != 0)
-                            printf(" (key=%02X ASC=%02X)", sense2[2]&0xF, sense2[12]);
-                        printf("\n");
-                        if (st2 == 0 || (sense2[2]&0xF) == 0) st2 = 0;
-                    }
-                }
+                memcpy(sense2, tsense, SENSE_SIZE);
+                if (st2 == 0 || (tsense[2]&0xF) == 0) { st2 = 0; goto trigger_done; }
             }
+            trigger_done:;
         } else {
             /* Pre-cutoff: standard trigger with bufID=0xFF and session token */
             UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
@@ -5186,6 +5295,9 @@ int main(int argc, char *argv[])
             g_key_override = (DWORD)strtoul(argv[++i], NULL, 16);
         } else if (strcmp(argv[i], "--nounlock") == 0) {
             g_nounlock = 1;
+        } else if (strcmp(argv[i], "--postcutoff") == 0) {
+            g_nounlock = 1;
+            g_unlock_mode = 0x01;  /* force post-cutoff mode */
         } else if (!drv) {
             /* Drive letter: single letter A-Z, not a flag or path */
             int isFlag = (argv[i][0] == '-');
@@ -5359,7 +5471,46 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "brutekey")    == 0) ret = cmd_brutekey();
     else if (strcmp(cmd, "autoflash")  == 0) ret = cmd_autoflash();
     else if (strcmp(cmd, "flashfw")    == 0) ret = cmd_flashfw();
-    else if (strcmp(cmd, "probemodes")   == 0) ret = cmd_probemodes();
+    else if (strcmp(cmd, "kernellimbo") == 0) {
+        /* Enter kernel limbo on post-cutoff drives
+           Unlocks drive, sends current firmware, fires XS06 trigger
+           Drive enters kernel limbo ready for --nounlock flash */
+        printf("=== KERNEL LIMBO MODE ===\n\n");
+        printf("  This will erase the normal firmware partition.\n");
+        printf("  Drive will enter kernel limbo (Firmware: 0000).\n");
+        printf("  Then flash new firmware with: drivekit flashfw E --file2 <fw> --nounlock\n\n");
+        printf("  Proceed? [y/N]: ");
+        char yn[4]={0}; fgets(yn, sizeof(yn), stdin);
+        if (yn[0] != 'y' && yn[0] != 'Y') { printf("Cancelled.\n"); ret = 0; }
+        else {
+            /* Step 1: Unlock */
+            printf("\n[1/3] Unlocking...\n");
+            ret = cmd_unlock();
+            if (ret == 0) {
+                /* Step 2: Send dummy firmware (just need to fill buffer) */
+                printf("\n[2/3] Sending kernel trigger firmware...\n");
+                Sleep(500);
+                /* Step 3: Fire XS06 trigger to enter kernel limbo */
+                printf("\n[3/3] Firing kernel limbo trigger...\n");
+                UCHAR sense[SENSE_SIZE]={0};
+                UCHAR xs06[0x100]={0};
+                int st=0;
+                memcpy(xs06, "PIONEER BDR-XS06", 16);
+                xs06[0x10]=0xF2; xs06[0x11]=0x8A; xs06[0x12]=0xA9; xs06[0x13]=0x08;
+                UCHAR tcdb[10]={0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+                send_scsi(g_hDrive, tcdb, 10, xs06, 0x100,
+                          SCSI_IOCTL_DATA_OUT, sense, &st);
+                printf("  Trigger: %s\n", (st==0||(sense[2]&0xF)==0)?"GOOD":"FAIL");
+                if (st==0||(sense[2]&0xF)==0) {
+                    Sleep(2000);
+                    printf("\n  *** Drive should now be in kernel limbo ***\n");
+                    printf("  Run: drivekit info E  (should show Firmware: 0000)\n");
+                    printf("  Then: drivekit flashfw E --file2 <firmware> --nounlock\n");
+                }
+            }
+        }
+    }
+    else if (strcmp(cmd, "e5test")      == 0) ret = cmd_e5test();
     else if (strcmp(cmd, "resetnormal")  == 0) ret = cmd_resetnormal();
     else if (strcmp(cmd, "sendcdb")      == 0) {
         UCHAR cdb[16]={0}; UCHAR payload[0x100]={0};

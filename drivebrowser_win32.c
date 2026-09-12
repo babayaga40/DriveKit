@@ -64,6 +64,7 @@
 #define IDM_OPEN_COMPAT 202
 #define IDM_SAVE        203
 #define IDM_EXIT        204
+#define IDM_ABOUT       205
 
 /* Edit dialog IDs */
 #define IDE_MODEL       201
@@ -813,18 +814,8 @@ static int http_post(const wchar_t *path, const char *method, const char *body)
                            (LPVOID)body,(DWORD)strlen(body),(DWORD)strlen(body),0)) goto done;
     if(!WinHttpReceiveResponse(hReq,NULL)) goto done;
     { DWORD status=0,statusSz=sizeof(DWORD);
-      char respbuf[512]={0}; DWORD rd=0;
       WinHttpQueryHeaders(hReq,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,
                           NULL,&status,&statusSz,NULL);
-      /* Read response body for error details */
-      if(status>=400) {
-          DWORD avail=0;
-          WinHttpQueryDataAvailable(hReq,&avail);
-          if(avail>sizeof(respbuf)-1) avail=sizeof(respbuf)-1;
-          WinHttpReadData(hReq,respbuf,avail,&rd);
-          respbuf[rd]=0;
-          MessageBoxA(NULL,respbuf,"Supabase Error",MB_OK|MB_ICONERROR);
-      }
       ok=(int)status; }
 done:
     if(hReq) WinHttpCloseHandle(hReq);
@@ -1183,6 +1174,9 @@ static HMENU build_menu(void)
     AppendMenuA(hFile,MF_SEPARATOR,0,NULL);
     AppendMenuA(hFile,MF_STRING,IDM_EXIT,       "Exit");
     AppendMenuA(hMenu,MF_POPUP,(UINT_PTR)hFile, "File");
+    HMENU hHelp = CreatePopupMenu();
+    AppendMenuA(hHelp,MF_STRING,IDM_ABOUT,"About DriveBrowser...");
+    AppendMenuA(hMenu,MF_POPUP,(UINT_PTR)hHelp,"Help");
     return hMenu;
 }
 
@@ -1349,7 +1343,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDM_OPEN_COMPAT:
             open_compat_file();
             break;
-        case IDM_EXIT:
+        case IDM_ABOUT:
+            MessageBoxA(hwnd,
+                "Razor 1911 presents..\r\n"
+                "DriveBrowser v1.0\r\n"
+                "Pioneer BD Drive Firmware Database Browser\r\n"
+                "\r\n"
+                "By BabaYaga / Razor 1911\r\n"
+                "\r\n"
+                "Companion tool to DriveKit v1.0\r\n"
+                "\r\n"
+                "Thank you for the inspiration and help from:\r\n"
+                "MrPenguin, cxplay, Sayaka, Coppervid,\r\n"
+                "blackened2687, MakeMKV Forum and cdrinfo.pl\r\n"
+                "\r\n"
+                "Database powered by Supabase",
+                "About DriveBrowser",
+                MB_OK|MB_ICONINFORMATION);
+            break;
             SendMessageA(hwnd,WM_CLOSE,0,0);
             break;
         }

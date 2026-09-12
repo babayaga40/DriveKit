@@ -814,6 +814,41 @@ static void on_col_clicked(GtkTreeViewColumn *col, gpointer data)
 /* =========================================================
    MENU CALLBACKS
    ========================================================= */
+static void on_about(GtkMenuItem *mi, gpointer data)
+{
+    static const char *about_text =
+        "Razor 1911 presents..\n"
+        "DriveBrowser v1.0\n"
+        "Pioneer BD Drive Firmware Database Browser\n"
+        "\n"
+        "By BabaYaga / Razor 1911\n"
+        "\n"
+        "Companion tool to DriveKit v1.0\n"
+        "\n"
+        "Thank you for the inspiration and help from:\n"
+        "MrPenguin, cxplay, Sayaka, Coppervid,\n"
+        "blackened2687, MakeMKV Forum and cdrinfo.pl\n"
+        "\n"
+        "Database powered by Supabase";
+
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(
+        "About DriveBrowser",
+        GTK_WINDOW(g_window),
+        GTK_DIALOG_MODAL|GTK_DIALOG_DESTROY_WITH_PARENT,
+        "OK", GTK_RESPONSE_OK,
+        NULL);
+
+    GtkWidget *label = gtk_label_new(about_text);
+    gtk_label_set_justify(GTK_LABEL(label), GTK_JUSTIFY_CENTER);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_add(GTK_CONTAINER(content), label);
+    gtk_container_set_border_width(GTK_CONTAINER(content), 16);
+    gtk_widget_show_all(dlg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
 static void on_sync(GtkMenuItem *mi, gpointer data)
 {
     (void)mi; (void)data;
@@ -1022,6 +1057,17 @@ static void build_ui(void)
       mi=gtk_menu_item_new_with_mnemonic("_Delete entry");
       g_signal_connect(mi,"activate",G_CALLBACK(on_delete),NULL);
       gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu),mi);
+    }
+
+    /* Help menu */
+    {
+      GtkWidget *help_menu=gtk_menu_new();
+      GtkWidget *help_item=gtk_menu_item_new_with_mnemonic("_Help");
+      gtk_menu_item_set_submenu(GTK_MENU_ITEM(help_item),help_menu);
+      gtk_menu_shell_append(GTK_MENU_SHELL(menubar),help_item);
+      GtkWidget *about_mi=gtk_menu_item_new_with_mnemonic("_About...");
+      g_signal_connect(about_mi,"activate",G_CALLBACK(on_about),NULL);
+      gtk_menu_shell_append(GTK_MENU_SHELL(help_menu),about_mi);
     }
 
     gtk_box_pack_start(GTK_BOX(vbox),menubar,FALSE,FALSE,0);

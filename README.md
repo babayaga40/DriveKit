@@ -329,6 +329,9 @@ year letter
 
 Thank you for the inspiration and help from MrPenguin, cxplay, Sayaka, Coppervid, blackened2687, MakeMKV Forum and cdrinfo.pl
 
+**BDRFlash special thanks** (from BDRFlash v1.00 about box):
+Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, BillyCar11, asmcom, payalnik23, aliter404
+
 **Tools:** Wireshark + USBPcap, IDA Pro + hrtng plugin, x64dbg, pypcode, Visual Studio 2022, WSL, GCC
 
 Research and educational purposes only.

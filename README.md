@@ -31,12 +31,22 @@ This tool talks to your optical drive at the raw SCSI/ATAPI command level and in
 
 ## Hardware Research
 
-Pioneer BD drives use the **Renesas H8S/2000** processor — a big-endian 16/32-bit RISC CPU. Confirmed by decoding the 0xB0 READ BUFFER dump and disassembling as H8S/2000 assembly (MrPenguin, pypcode + custom H8S SLA).
+Pioneer BD drives use the **Renesas H8S/2600** processor — a CISC 16/32-bit processor (LDMAC and STMAC instructions confirmed, which raises H8S/2000 to H8S/2600). Confirmed by decoding the 0xB0 READ BUFFER dump and disassembling as H8S/2600 assembly (MrPenguin).
 
 **The firmware files are encrypted using a rolling stream cipher.** Analysis from BDR-S12U (MrPenguin, pypcode/Ghidra) revealed:
 - Multi-byte sliding XOR key with Linear Congruential Generator: `currentKey = (currentKey * 16807) % 0x7FFFFFFF`
 - Crypto/DMA engine at `0xFF3FF000` handles flash programming and key/certificate verification
 - The version check is embedded in the ENCRYPTED binary payload — patching the ASCII header alone is insufficient
+- Firmware memory-maps the unlock payload buffer to `0xA00000`
+
+**Unlock key format — BIG ENDIAN! (confirmed by MrPenguin H8S/2600 disassembly):**
+```
+H8S/2600 assembly: CMP.L #0x9a782361:32, ER0
+→ Universal key 0x6123789A must be sent as bytes: 9A 78 23 61
+→ UD04 key 0x426623FD must be sent as bytes: FD 23 66 42
+→ XD08U key 0xA44F2F55 must be sent as bytes: 55 2F 4F A4
+```
+Minimum payload length = 20 bytes (16 model string + 4 key).
 
 **BDRFlash checksum algorithm (from IDA Pro analysis):**
 ```c
@@ -84,12 +94,17 @@ for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
 
 **Drive trigger keys (from updater dword_5D4B38[index*4]):**
 
-| Drive | Platform | Kernel | Trigger Key | Notes |
-|-------|----------|--------|-------------|-------|
-| BDR-XD06U | SAT 8B30 | ID69 | `0x641E47BD` | XD06U 1.12 updater ✅ CONFIRMED |
-| BDR-XD07 | SAT 8D30 | ID35 | `0xF0116415` | XD07 1.06 updater |
+| Drive | Platform | Kernel | Version | Trigger Key | Source |
+|-------|----------|--------|---------|-------------|--------|
+| BDR-XD06U | SAT 8B30 | ID69 | 1.12 | `0x641E47BD` | XD06U 1.12 updater ✅ CONFIRMED |
+| BDR-XD07 | SAT 8D30 | ID35 | 1.06 | `0xF0116415` | XD07 1.06 updater |
+| BDR-XD08 | SAT 9330 | ID36 | 1.02 | `0x3A932579` | XD08 1.02 updater |
+| BDR-XD08U | SAT 9331 | ID05 | 1.02 | `0xC4C1F37F` | XD08U 1.02 updater |
+| BDR-XD08U | SAT 9331 | ID05 | 1.04 | `0x552F4FA4` | XD08U 1.04 updater init |
 
-Each Pioneer updater contains a 16-entry key table at VA `0x5D4B38` (file offset `0x1D4B38`). Only index 0 is used — remaining 15 slots are padding. Extract with `extract_keys.py`!
+**Important:** Trigger key changes per firmware VERSION — not just per drive model! DriveKit automatically selects the correct key by reading the version from the target firmware file header and looking it up in the built-in `g_tkey_map[]` table. Add new entries as updaters are analyzed with `extract_keys.py`!
+
+Each Pioneer updater contains a 16-entry key table at VA `0x5D4B38` (file offset `0x1D4B38`). Only index 0 is used — remaining 15 slots are padding.
 
 **Key[0] confirmed correct for XD06U** — returns `ASC=4C` (version check) vs `ASC=24` for all other keys!
 
@@ -223,7 +238,7 @@ Result: `ASC=4C` still fires — version check reads encrypted binary not ASCII 
 | `0xA44F2F55` | XD08U (SAT 9331) | Confirmed by MrPenguin |
 | `0x426623FD` | BDR-UD04 | Confirmed by MrPenguin |
 
-**Note (MrPenguin):** Key comparison is against an internal value — last 4 bytes may be flexible on some drives. CDB length must be >= 19 bytes for `bufID=0xFF` commands!
+**Note (MrPenguin):** Minimum payload length must be 16 + 4 = 20 bytes. The firmware memory-maps the payload buffer to `0xA00000`. H8S/2600 assembly shows BE key comparison (`CMP.L #0x9a782361:32`) but LE format works on all tested drives in practice — changing to BE format has no effect on results. DriveKit uses LE throughout.
 
 ---
 
@@ -361,7 +376,28 @@ year letter
 
 ---
 
-## 🎉 Post-Cutoff Flash Protocol CONFIRMED WORKING!
+## XD08 → XD08U Crossflash Attempt (September 13, 2026)
+
+**Goal:** Crossflash BDR-XD08 (SAT9330 ID36, post-cutoff 1.02) to BDR-XD08U (SAT9331 ID05, 1.04) to enable UHD!
+
+**What worked:**
+- XD08 unlock with `PIONEER BDR-BDS8` + `0xAA475E15` ✅
+- `0xE5` Engineering Mode ✅
+- `0xFF` Engineering Mode with `PIONEER BDR-BDS8` ✅
+- Session token → `bufID=0xFE` ✅
+- Normal firmware → `bufID=0xF0` ✅
+- Execution trigger → **GOOD!** ✅
+
+**What failed:**
+- NAND commit — trigger returns GOOD but drive enters kernel limbo!
+- ID36 kernel in NAND refuses to permanently write ID05 firmware
+- Power cycle recovers to 1.02 (kernel partition intact)
+
+**Conclusion:** XD08→XD08U crossflash blocked at NAND write level — ID36 kernel won't boot ID05 firmware. Trigger GOOD ≠ flash success! Same-model same-version flash (1.02→1.02) works fine.
+
+**Key/endianness note:** LE key format works on all tested post-cutoff drives regardless of H8S/2600 assembly showing BE comparison. DriveKit uses LE throughout with confirmed working results.
+
+---
 
 **1.12 → 1.12 same-version flash succeeded!** (September 13, 2026)
 

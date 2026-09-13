@@ -4794,22 +4794,52 @@ static int cmd_flashfw(void)
         UCHAR cdb[10];
         offset = 0;
 
-        /* Post-cutoff: go straight to single transfer for kernel
-           bufID=0x00 rejects chunk 2 (at 0x10000) — skip chunking! */
+        /* Post-cutoff NEW protocol (from XD07 1.06 updater analysis):
+           1. Generate 0x200 random bytes as session token
+           2. Send token to bufID=0xFE offset=0x0000 len=0x200
+           3. Send firmware to bufID=0xFE offset=0x1200
+           4. Trigger uses same random token as payload! */
         if (g_unlock_mode == 0x01) {
-            DWORD total = (DWORD)filesize;
+            /* Step 1: Generate random session token */
+            UCHAR token[0x200] = {0};
+            srand((unsigned int)GetTickCount());
+            DWORD ti;
+            for (ti = 0; ti < 0x200; ti++)
+                token[ti] = (UCHAR)(rand() & 0xFF);
+
+            printf("  [DBG] Generated session token (first 8): %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   token[0],token[1],token[2],token[3],
+                   token[4],token[5],token[6],token[7]);
+
+            /* Step 2: Send token to bufID=0xFE offset=0x0000 len=0x200 */
+            printf("  Sending session token (bufID=0xFE offset=0x0000 len=0x200)...\n");
             memset(cdb, 0, sizeof(cdb));
-            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0x00;
-            cdb[6]=(UCHAR)(total>>16);
-            cdb[7]=(UCHAR)(total>>8);
-            cdb[8]=(UCHAR)(total);
-            send_scsi(g_hDrive, cdb, 10, data, total,
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+            cdb[6]=0x00; cdb[7]=0x02; cdb[8]=0x00; /* len=0x200 */
+            send_scsi(g_hDrive, cdb, 10, token, 0x200,
+                      SCSI_IOCTL_DATA_OUT, sense, &st);
+            printf("  Token send: %s", (st==0||(sense[2]&0xF)==0)?"GOOD":"FAIL");
+            if (st!=0) printf(" (key=%02X ASC=%02X)", sense[2]&0xF, sense[12]);
+            printf("\n");
+
+            /* Step 3: Send kernel to bufID=0xFE offset=0x1200 */
+            printf("  Sending kernel (bufID=0xFE offset=0x1200 len=0x%lX)...\n", (DWORD)filesize);
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+            cdb[3]=0x00; cdb[4]=0x12; cdb[5]=0x00; /* offset=0x1200 */
+            cdb[6]=(UCHAR)(filesize>>16);
+            cdb[7]=(UCHAR)(filesize>>8);
+            cdb[8]=(UCHAR)(filesize);
+            send_scsi(g_hDrive, cdb, 10, data, (DWORD)filesize,
                       SCSI_IOCTL_DATA_OUT, sense, &st);
             if (st == 0 || (sense[2]&0x0F) == 0) {
-                printf("  %ld / %ld bytes - OK (single transfer)\n", total, total);
+                printf("  %ld / %ld bytes - OK\n", (DWORD)filesize, (DWORD)filesize);
                 printf("  [DBG] Kernel sense: key=%02X ASC=%02X\n", sense[2]&0x0F, sense[12]);
-                Sleep(500); /* Wait for drive to process kernel */
-                offset = total;
+                Sleep(500);
+                offset = (DWORD)filesize;
+                /* Save token for trigger */
+                memcpy(g_f1token, token, 0x20);
+                g_has_f1token = 1;
             } else {
                 printf("  FAILED: key=%02X ASC=%02X\n", sense[2]&0x0F, sense[12]);
                 free(data); return 1;
@@ -4819,7 +4849,7 @@ static int cmd_flashfw(void)
             DWORD n = (DWORD)filesize - offset;
             if (n > 0x8000) n = 0x8000;
             memset(cdb, 0, sizeof(cdb));
-            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=(g_unlock_mode==0x01)?0x00:0xFE;
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
             cdb[3]=(UCHAR)(offset>>16);
             cdb[4]=(UCHAR)(offset>>8);
             cdb[5]=(UCHAR)(offset);
@@ -4890,6 +4920,43 @@ static int cmd_flashfw(void)
 
         /* Send complete .153 file including header, 0x8000 chunks */
         {
+            /* Post-cutoff: normal firmware uses bufID=0xF0 offset=0x0000
+               Same as pre-cutoff! Token was already sent to bufID=0xFE */
+            if (g_unlock_mode == 0x01) {
+                printf("  Sending normal firmware (bufID=0xF0 offset=0x0000 len=0x%lX)...\n", (DWORD)fwsize);
+                UCHAR cdb[10];
+                DWORD fw_off = 0;
+                while (fw_off < (DWORD)fwsize) {
+                    DWORD n = (DWORD)fwsize - fw_off;
+                    if (n > 0x8000) n = 0x8000;
+                    memset(cdb, 0, sizeof(cdb));
+                    cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
+                    cdb[3]=(UCHAR)(fw_off>>16);
+                    cdb[4]=(UCHAR)(fw_off>>8);
+                    cdb[5]=(UCHAR)(fw_off);
+                    cdb[6]=(UCHAR)(n>>16);
+                    cdb[7]=(UCHAR)(n>>8);
+                    cdb[8]=(UCHAR)(n);
+                    send_scsi(g_hDrive, cdb, 10, fw + fw_off, n,
+                              SCSI_IOCTL_DATA_OUT, sense, &st);
+                    if (st != 0) {
+                        HANDLE_BUSY();
+                        send_scsi(g_hDrive, cdb, 10, fw + fw_off, n,
+                                  SCSI_IOCTL_DATA_OUT, sense, &st);
+                        if (st != 0) {
+                            printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
+                                   fw_off, sense[2]&0x0F, sense[12]);
+                            free(fw); return 1;
+                        }
+                    }
+                    fw_off += n;
+                    printf("\r  %lu / %lu bytes", fw_off, (DWORD)fwsize);
+                    fflush(stdout);
+                    Sleep(50);
+                }
+                printf("\n");
+                fwoffset = (DWORD)fwsize;
+            } else {
             while (fwoffset < (DWORD)fwsize) {
                 UCHAR cdb[10];
                 DWORD n = (DWORD)fwsize - fwoffset;
@@ -4907,27 +4974,6 @@ static int cmd_flashfw(void)
                 send_scsi(g_hDrive, cdb, 10, fw + fwoffset, n,
                           SCSI_IOCTL_DATA_OUT, sense, &st);
                 if (st != 0) {
-                    if (fwoffset == 0 && g_unlock_mode == 0x01) {
-                        /* Post-cutoff: try single transfer of entire file */
-                        printf("\n  Chunk failed - trying single transfer of full image...\n");
-                        memset(cdb, 0, sizeof(cdb));
-                        cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0x00;
-                        cdb[6]=(UCHAR)(fwsize>>16);
-                        cdb[7]=(UCHAR)(fwsize>>8);
-                        cdb[8]=(UCHAR)(fwsize);
-                        send_scsi(g_hDrive, cdb, 10, fw, (DWORD)fwsize,
-                                  SCSI_IOCTL_DATA_OUT, sense, &st);
-                        if (st == 0) {
-                            printf("  %ld / %ld bytes - OK (single transfer)\n",
-                                   (long)fwsize, (long)fwsize);
-                            fwoffset = (DWORD)fwsize;
-                            break;
-                        }
-                        printf("\n  FAILED single transfer: key=%02X ASC=%02X\n",
-                               sense[2]&0x0F, sense[12]);
-                        free(fw); return 1;
-                    }
-                    /* Drive busy - clear and retry */
                     HANDLE_BUSY();
                     send_scsi(g_hDrive, cdb, 10, fw + fwoffset, n,
                               SCSI_IOCTL_DATA_OUT, sense, &st);
@@ -4942,7 +4988,9 @@ static int cmd_flashfw(void)
                 fflush(stdout);
                 Sleep(50);
             }
-            printf("\n  Done.\n\n");
+            printf("\n");
+            } /* end else (pre-cutoff) */
+            printf("  Done.\n\n");
         }
 
         /* GET EVENT STATUS + REQUEST SENSE after last firmware chunk */
@@ -5035,17 +5083,13 @@ static int cmd_flashfw(void)
             printf("  0xF1 after firmware send: %02X %02X %02X %02X\n",
                    f1buf[0],f1buf[1],f1buf[2],f1buf[3]);
 
-            /* Choose best token: pre-captured 00 00 5C 00 > current 0xF1 > model string */
+            /* Use random session token as trigger payload! */
             if (g_has_f1token) {
-                memcpy(trig_payload, g_f1token, 0x30);
-                printf("  Using pre-captured 0xF1 token: %02X %02X %02X %02X\n",
-                       g_f1token[0],g_f1token[1],g_f1token[2],g_f1token[3]);
-            } else if (f1buf[0] != 0x00 || f1buf[2] == 0x00) {
-                memcpy(trig_payload, f1buf, 0x30);
-                printf("  Using current 0xF1 as trigger payload\n");
+                memcpy(trig_payload, g_f1token, 0x20);
+                printf("  Using random session token as trigger payload\n");
             } else {
                 memcpy(trig_payload, g_payload, 0x20);
-                printf("  Using model string as trigger payload\n");
+                printf("  Using model string as trigger payload (fallback)\n");
             }
 
             /* Try with MakeMKV firmware name per MrPenguin's insight:
@@ -5062,24 +5106,52 @@ static int cmd_flashfw(void)
             bds6_payload[0x10] = 0xF2; bds6_payload[0x11] = 0x8A;
             bds6_payload[0x12] = 0xA9; bds6_payload[0x13] = 0x08;
 
-            /* Try BDS6 first (MrPenguin suggestion), then XS06, then XD05BK2 */
-            UCHAR *payloads[] = {bds6_payload, xs06_payload, g_payload};
-            const char *pnames[] = {"PIONEER BDR-BDS6", "PIONEER BDR-XS06", "XD05BK2/XV5"};
-            int pi;
-            for (pi = 0; pi < 3; pi++) {
-                /* CDB length = 0x14 = 20 bytes (MrPenguin: must be >= 19!) */
-                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x00,0x14,0};
+            /* THE CORRECT TRIGGER:
+               - mode=0x05 bufID=0xFF len=0x100
+               - Payload = random token (0x200 bytes)
+               - BUT bytes 0x10-0x13 replaced with drive-specific key!
+               XD07 index=0 key=0xF0116415 (from dword_5D4B38 table) */
+            /* Try all 16 trigger keys from XD06U updater dword_5D4B38 table */
+            DWORD tkeys[] = {
+                0x641E47BD, /* index  0 */
+                0xAC8B9BF9, /* index  1 */
+                0xB99ACD52, /* index  2 */
+                0x39E96E48, /* index  3 */
+                0xE1DCB652, /* index  4 */
+                0xF70C5C83, /* index  5 */
+                0xDF391C91, /* index  6 */
+                0x1F0D15BF, /* index  7 */
+                0x1A9C28DC, /* index  8 */
+                0xBFF3BF18, /* index  9 */
+                0x3731BC5A, /* index 10 */
+                0x6087B5D7, /* index 11 */
+                0xA350969A, /* index 12 */
+                0xE66FBEB0, /* index 13 */
+                0xDA359A9B, /* index 14 */
+                0x901643DE, /* index 15 */
+            };
+            int tki;
+            for (tki = 0; tki < 16; tki++) {
+                UCHAR tpayload[0x100];
+                memcpy(tpayload, trig_payload, 0x100);
+                tpayload[0x10] = (UCHAR)(tkeys[tki] & 0xFF);
+                tpayload[0x11] = (UCHAR)((tkeys[tki]>>8) & 0xFF);
+                tpayload[0x12] = (UCHAR)((tkeys[tki]>>16) & 0xFF);
+                tpayload[0x13] = (UCHAR)((tkeys[tki]>>24) & 0xFF);
+                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
                 UCHAR tsense[SENSE_SIZE] = {0};
-                printf("  Trying %s trigger (len=0x14)...\n", pnames[pi]);
-                send_scsi(g_hDrive, tcdb, 10, payloads[pi], 0x14,
+                send_scsi(g_hDrive, tcdb, 10, tpayload, 0x100,
                           SCSI_IOCTL_DATA_OUT, tsense, &st2);
-                printf("  Trigger %s: %s", pnames[pi],
+                printf("  Key[%2d]=0x%08X: %s", tki, tkeys[tki],
                        (st2==0||(tsense[2]&0xF)==0)?"GOOD":"FAIL");
                 if (st2 != 0 && (tsense[2]&0xF) != 0)
                     printf(" (key=%02X ASC=%02X)", tsense[2]&0xF, tsense[12]);
                 printf("\n");
                 memcpy(sense2, tsense, SENSE_SIZE);
-                if (st2 == 0 || (tsense[2]&0xF) == 0) { st2 = 0; goto trigger_done; }
+                if (st2 == 0 || (tsense[2]&0xF) == 0) {
+                    st2 = 0;
+                    goto trigger_done;
+                }
             }
             trigger_done:;
         } else {

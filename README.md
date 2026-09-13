@@ -4,7 +4,15 @@
 
 Combined optical drive & storage research toolkit for Windows and Linux, targeting Pioneer BD-R/BD-RE optical drives. All functionality is bundled into a single binary, with the operation selected via a command-line subcommand.
 
-Reverse engineering of the flash protocol was done by capturing USB traffic between the third-party `BDRFlash` tool and a drive (Wireshark/USBPcap), then analyzing the resulting binary with IDA Pro and x64dbg — **reading x86 assembly only, no decompilation to C or other high-level languages was performed at any point**. This project documents the vendor's WRITE BUFFER unlock sequence, the session token mechanism, the firmware pairing requirement, drive-family compatibility groups, and the internal model string table required for newer drive families.
+Reverse engineering was performed through multiple methods:
+
+**Pre-cutoff protocol:** Captured USB traffic between the third-party `BDRFlash` tool and a drive (Wireshark/USBPcap), then analyzed the resulting binary with IDA Pro and x64dbg.
+
+**Post-cutoff protocol:** Reverse engineered the official Pioneer updater executables (`BDR-XD06J-UHD`, `BDR-XD07UHD`) with IDA Pro — reading x86 assembly only, no decompilation to C or other high-level languages was performed. This revealed the complete post-cutoff flash protocol including the session token mechanism, correct buffer IDs and offsets, drive-specific trigger keys, and the Engineering Mode unlock sequence.
+
+**Drive firmware:** H8S/2000 assembly analysis of `READ BUFFER 0xB0` dumps (MrPenguin), revealing the rolling XOR stream cipher and the Engineering Mode gating conditions.
+
+This project documents the vendor's WRITE BUFFER unlock sequence, the session token mechanism, the firmware pairing requirement, drive-family compatibility groups, trigger key table, and the internal model string table required for newer drive families.
 
 ---
 
@@ -57,15 +65,53 @@ for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
 4. WRITE BUFFER mode=5 bufID=0xFF len=0x100  ← execution trigger
 ```
 
-### Post-cutoff sequence (NEW!):
+### Post-cutoff sequence (COMPLETE! From XD07 1.06 updater analysis):
 ```
-1. WRITE BUFFER mode=1 bufID=0x00 len=0x20   ← unlock (undocumented!)
-2. WRITE BUFFER mode=7 bufID=0x00            ← kernel (single transfer)
-3. WRITE BUFFER mode=7 bufID=0x00            ← normal firmware (single transfer)
-4. WRITE BUFFER mode=5 bufID=0xFF len=0x100  ← execution trigger (XS06 payload)
+1. WRITE BUFFER mode=1 bufID=0x00 len=0x20                  ← unlock
+2. WRITE BUFFER mode=7 bufID=0xE5 len=0x02 payload=0x01     ← enable Engineering Mode!
+3. WRITE BUFFER mode=7 bufID=0xFE offset=0x0000 len=0x200   ← random session token
+4. WRITE BUFFER mode=7 bufID=0xFE offset=0x1200 len=<size>  ← kernel
+5. WRITE BUFFER mode=7 bufID=0xF0 offset=0x0000 len=<size>  ← normal firmware (chunked)
+6. WRITE BUFFER mode=5 bufID=0xFF offset=0x0000 len=0x100   ← execution trigger
 ```
 
-**Post-cutoff trigger payload:** `PIONEER BDR-XS06` + key (confirmed working!)
+**Execution trigger payload structure (0x100 bytes):**
+```
+[0x00-0x0F] = first 16 bytes of random session token
+[0x10-0x13] = drive-specific key from updater dword_5D4B38 table!
+[0x14-0xFF] = rest of random session token
+```
+
+**Drive trigger keys (from updater dword_5D4B38[index*4]):**
+
+| Drive | Platform | Kernel | Trigger Key | Notes |
+|-------|----------|--------|-------------|-------|
+| BDR-XD06U | SAT 8B30 | ID69 | `0x641E47BD` | XD06U 1.12 updater ✅ CONFIRMED |
+| BDR-XD07 | SAT 8D30 | ID35 | `0xF0116415` | XD07 1.06 updater |
+
+Each Pioneer updater contains a 16-entry key table at VA `0x5D4B38` (file offset `0x1D4B38`). Only index 0 is used — remaining 15 slots are padding. Extract with `extract_keys.py`!
+
+**Key[0] confirmed correct for XD06U** — returns `ASC=4C` (version check) vs `ASC=24` for all other keys!
+
+**`0xF1` state indicator after normal firmware send:**
+- `70 00 00 00` = firmware accepted into SRAM ✅
+- `70 00 05 00` = drive detected version mismatch in encrypted binary ❌
+
+**CRITICAL DISCOVERY — Spoofed firmware bypasses upload check!**
+- Real 1.11 firmware → `0xF1 = 70 00 05 00` (rejected during upload!)
+- Spoofed 1.11 with ASCII header claiming 1.12 → `0xF1 = 70 00 00 00` (ACCEPTED!) ✅
+- BUT trigger still returns `ASC=4C` — version check happens TWICE!
+- Upload phase: bypassed by ASCII header spoof ✅
+- Trigger phase: checks encrypted binary in SRAM — still blocked ❌
+
+**Remaining barrier:** Version check embedded in ENCRYPTED firmware binary — 1.12 kernel validates incoming version from encrypted data. ASCII header patching alone is insufficient.
+
+**Full DriveKit sequence:**
+```batch
+drivekit.exe unlock E
+drivekit.exe e5test E
+drivekit.exe flashfw E --file S8B30690.111 --file2 S8B30691.111 --postcutoff
+```
 
 ---
 
@@ -226,6 +272,7 @@ drivekit <command> <drive_letter> [options]
 | `--file2 name` | Normal firmware file |
 | `--file3 name` | Second normal firmware pass (post-cutoff) |
 | `--force` | Skip compatibility checks |
+| `--postcutoff` | Skip unlock + force post-cutoff mode (`g_unlock_mode=0x01`) |
 | `--nounlock` | Skip unlock step |
 | `--key 0x5CF2E094` | Override unlock key |
 | `--bufid 0xF4` | Buffer ID for rawdump |
@@ -237,6 +284,7 @@ drivekit <command> <drive_letter> [options]
 | `info` / `inquiry` | Full drive information with serial decode |
 | `unlock` | Service mode unlock (auto-detects pre/post-cutoff) |
 | `flashfw` | Flash kernel + firmware |
+| `e5test` | Test `0xE5` Engineering Mode flag — run after unlock, before flashfw |
 | `kernellimbo` | Enter kernel limbo mode (post-cutoff drives) |
 | `probevendor` | Probe vendor commands 0xC0-0xFF |
 | `rawdump` | Raw READ BUFFER dump |
@@ -309,19 +357,22 @@ year letter
 | `0xFE` | Kernel area (RAM) — pre-cutoff bufID |
 | `0xF0` | Normal firmware area (RAM) — pre-cutoff bufID |
 | `0x00` | Universal firmware buffer (post-cutoff) |
-| `0xE5` | Kernel reinitialize flag (XD08U only, not XD06U) |
+| `0xE5` | Engineering Mode flag setter — enables `0xFF` gating (XD06U confirmed, all modes GOOD!) |
 
 ---
 
 ## Pending Research
 
-- **Post-cutoff downgrade** — version check in encrypted binary payload needs:
-  - Rolling XOR encryption key for ID69 platform
-  - OR pre-cutoff ID69 kernel (no version check)
-  - OR hardware JTAG access
-- **MrPenguin** — H8S/2000 disassembly of XD08U, `0xE5` command analysis
-- **`0xB0` RAM dump** — locked on post-cutoff drives
-- **Billy's method** — collaboration pending
+- **Post-cutoff downgrade** — version check in encrypted binary payload. Confirmed:
+  - `PIONEER BDR-BDS6` is correct trigger → `ASC=4C` reproducibly
+  - `0xE5` + `START STOP 0x20` + chunked transfer all working
+  - XD05 1.21 crossflash attempted — still `ASC=4C`
+  - Need: rolling XOR encryption key for ID69 to patch version in binary
+  - OR: correct `00 00 5C 00` session token from `START STOP 0x20` + `0xF1`
+  - OR: Billy's method (collaboration pending)
+- **`0xB0` RAM dump** — locked on post-cutoff drives, pre-cutoff only
+- **MrPenguin** — testing `mode=0x01` on XD08U 1.02 (borderline post-cutoff)
+- **Coppervid** — working contacts for potential method sharing
 
 ---
 

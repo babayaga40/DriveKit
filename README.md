@@ -361,18 +361,44 @@ year letter
 
 ---
 
+## 🎉 Post-Cutoff Flash Protocol CONFIRMED WORKING!
+
+**1.12 → 1.12 same-version flash succeeded!** (September 13, 2026)
+
+The complete protocol is 100% confirmed working on BDR-XD06U post-cutoff:
+- Session token → `bufID=0xFE offset=0x0000` ✅
+- Kernel → `bufID=0xFE offset=0x1200` ✅
+- Normal firmware → `bufID=0xF0 offset=0x0000` chunked ✅
+- Trigger with key `0x641E47BD` → **GOOD!** ✅
+- Drive reflashed NAND and rebooted successfully! ✅
+
+**Version check behaviour confirmed:**
+- Same version (1.12→1.12) → GOOD ✅
+- Older version (1.11→1.12 spoofed) → `ASC=4C` ❌
+- Different model XD07U 1.04 → `ASC=4C` ❌ (version check is numerical, ignores model!)
+- XD05 1.21 (newer version number) → `ASC=4C` ❌
+- Version check reads ENCRYPTED binary — not ASCII header!
+
+**Buffer discoveries (normal mode, before Engineering Mode):**
+- `READ BUFFER 0xFE` → encrypted firmware in SRAM (2.6MB!) ✅
+- `READ BUFFER 0xFC` → diagnostic/error log buffer (6MB) ✅
+- `0xFD` (direct vendor opcode) → self-test, takes seconds, returns GOOD ✅
+- **Engineering Mode (`0xE5`) LOCKS `0xFE` and `0xFC`!** Must dump before `e5test`!
+
+---
+
 ## Pending Research
 
-- **Post-cutoff downgrade** — version check in encrypted binary payload. Confirmed:
-  - `PIONEER BDR-BDS6` is correct trigger → `ASC=4C` reproducibly
-  - `0xE5` + `START STOP 0x20` + chunked transfer all working
-  - XD05 1.21 crossflash attempted — still `ASC=4C`
-  - Need: rolling XOR encryption key for ID69 to patch version in binary
-  - OR: correct `00 00 5C 00` session token from `START STOP 0x20` + `0xF1`
+- **Post-cutoff downgrade** — version check in encrypted binary is the ONLY remaining barrier:
+  - Complete protocol confirmed working ✅
+  - Version check purely numerical — any firmware < 1.12 rejected regardless of model
+  - Need: rolling XOR encryption key for ID69 to patch version bytes in encrypted binary
+  - OR: command between firmware send and trigger that bypasses version check
   - OR: Billy's method (collaboration pending)
-- **`0xB0` RAM dump** — locked on post-cutoff drives, pre-cutoff only
-- **MrPenguin** — testing `mode=0x01` on XD08U 1.02 (borderline post-cutoff)
+- **`0xFE` dump analysis** — compare encrypted 1.12 firmware dump to 1.11 file — find version bytes!
+- **MrPenguin** — H8S/2000 disassembly, `0xB0` analysis, XD08U testing
 - **Coppervid** — working contacts for potential method sharing
+- **Extract trigger keys** from all updater exes in firmware archive
 
 ---
 

@@ -6320,6 +6320,24 @@ static int cmd_flashfw_precut(void)
     }
     printf("  Payload: %.16s + key\n\n", (char*)g_payload);
 
+    /* Warning and confirmation */
+    {
+        char ans[8] = {0};
+        printf("  *** THIS WILL REWRITE DRIVE FIRMWARE ***\n");
+        printf("  *** Ensure correct drive and firmware files ***\n");
+        printf("  *** You have been warned — proceed at your own risk ***\n");
+        printf("  Proceed? [y/N]: ");
+        fflush(stdout);
+        fgets(ans, sizeof(ans), stdin);
+        if (ans[0] != 'y' && ans[0] != 'Y') {
+            printf("  Cancelled.\n");
+            if (kdata)  free(kdata);
+            if (fwdata) free(fwdata);
+            return 0;
+        }
+        printf("\n");
+    }
+
     /* Check drive ready */
     {
         int attempt, consecutive = 0;
@@ -6693,7 +6711,8 @@ static int cmd_crossflash(void)
     {
         char ans[8] = {0};
         printf("\n  *** THIS WILL REWRITE DRIVE FIRMWARE ***\n");
-        printf("  Protocol: unlock trigger + fw pass1 + token + kernel + fw pass2 + commit\n");
+        printf("  *** Ensure correct drive and firmware files ***\n");
+        printf("  *** You have been warned — proceed at your own risk ***\n");
         printf("  Proceed? [y/N]: ");
         fflush(stdout);
         fgets(ans, sizeof(ans), stdin);

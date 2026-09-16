@@ -69,7 +69,9 @@ static DWORD   g_key_override = 0; /* 0 = use derived key */
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static DWORD   g_maxDumpSize = 0;  /* 0 = no limit */
 static int     g_nounlock = 0;    /* skip unlock step */
+static int     g_pre_cutoff = 0; /* set by cmd_flash when 0xB0 readable */
 static WORD    g_driveID = 0;     /* detected drive ID for trigger key selection */
+static UCHAR   g_payload[PAYLOAD_SIZE]; /* unlock payload buffer — shared across commands */
 static char    g_fw_version[8] = {0}; /* firmware version from target file header */
 static UCHAR   g_bufID     = 0xF4;
 static UCHAR   g_a0token[0x100] = {0}; /* session token from 0xA0 - reused for trigger */
@@ -98,6 +100,8 @@ static int   select_drive_interactive(char *drvOut, size_t drvOutSz);
 static int   cmd_inquiry(void);
 static int   cmd_probef0(void);
 static int   cmd_flashfw(void);
+static int   cmd_flashfw_precut(void);
+static int   cmd_flash(void);
 static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);
 
@@ -4007,6 +4011,8 @@ static void print_help(void)
     printf("Flashing:\n");
     printf("  unlock        Pioneer service mode unlock (auto session token)\n");
     printf("  flashfw       Flash kernel+firmware (--file kernel --file2 normal)\n");
+    printf("  flash         Auto-detect pre/post-cutoff and flash accordingly\n");
+    printf("                  --file kernel.bin --file2 normal.bin\n");
     printf("  crossflash    Post-cutoff downgrade/crossflash (confirmed protocol)\n");
     printf("                  --file kernel.bin --file2 normal.bin [--key 0xAA475E15]\n");
     printf("  xordiff       XOR two encrypted firmware files to find version bytes\n");
@@ -4338,7 +4344,6 @@ static int cmd_autoflash(void)
 static int cmd_flashfw(void)
 {
     UCHAR  sense[SENSE_SIZE];
-    UCHAR  g_payload[PAYLOAD_SIZE];
     int    st = 0;
     FILE  *fp;
     UCHAR *data;
@@ -4746,7 +4751,14 @@ static int cmd_flashfw(void)
             send_scsi(g_hDrive, wcdb, 10, g_payload, PAYLOAD_SIZE,
                       SCSI_IOCTL_DATA_OUT, sense, &st);
             if (st != 0) {
-                /* Try post-cutoff mode=0x01 bufID=0x00 sweep */
+                /* Try post-cutoff mode=0x01 bufID=0x00 sweep
+                   Skip for pre-cutoff drives — they don't need this unlock */
+                if (g_pre_cutoff) {
+                    printf("  Pre-cutoff drive — skipping post-cutoff mode sweep.\n");
+                    printf("  Proceeding without unlock (0xB0 accessible).\n\n");
+                    st = 0; /* treat as OK, proceed without unlock */
+                    g_unlock_mode = 0x04; /* keep pre-cutoff mode */
+                } else {
                 UCHAR alt_modes[]  = {0x01, 0x00, 0x0A, 0x0B, 0x0C, 0x0D};
                 UCHAR alt_bufids[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
                 int found = 0, mi;
@@ -4796,6 +4808,7 @@ static int cmd_flashfw(void)
                            sense[2]&0x0F, sense[12], sense[13]);
                     free(data); return 1;
                 }
+                } /* end else (!g_pre_cutoff) */
             } else {
                 printf("  GOOD\n\n");
             }
@@ -4921,7 +4934,7 @@ static int cmd_flashfw(void)
                 DWORD total = (DWORD)filesize;
                 printf("\n  Chunk failed at 0x%lX - trying single transfer...\n", offset);
                 memset(cdb,0,sizeof(cdb));
-                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=(g_unlock_mode==0x01)?0x00:0xFE;
+                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE; /* always 0xFE for kernel */
                 cdb[6]=(UCHAR)(total>>16);
                 cdb[7]=(UCHAR)(total>>8);
                 cdb[8]=(UCHAR)(total);
@@ -5684,6 +5697,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "brutekey")    == 0) ret = cmd_brutekey();
     else if (strcmp(cmd, "autoflash")  == 0) ret = cmd_autoflash();
     else if (strcmp(cmd, "flashfw")    == 0) ret = cmd_flashfw();
+    else if (strcmp(cmd, "flash")      == 0) ret = cmd_flash();
     else if (strcmp(cmd, "crossflash") == 0) ret = cmd_crossflash();
     else if (strcmp(cmd, "xordiff")    == 0) ret = cmd_xordiff();
     else if (strcmp(cmd, "patchfw")    == 0) ret = cmd_patchfw();
@@ -6202,6 +6216,293 @@ static int xf_send_normal_fw(const UCHAR *fw, DWORD fw_size, int pass)
     }
     printf("\n    Done - pass %d complete.\n", pass);
     return 0;
+}
+
+/* =========================================================
+   CMD_FLASH — Smart flash dispatcher
+   Probes READ BUFFER 0xB0 to detect pre vs post-cutoff drive,
+   then calls cmd_flashfw() or cmd_crossflash() accordingly.
+
+   Usage:
+     drivekit flash E --file kernel.bin --file2 normal.bin
+   ========================================================= */
+/* =========================================================
+   CMD_FLASHFW_PRECUT
+   Pre-cutoff Pioneer flash protocol — exact implementation
+   from older DriveKit source confirmed working on BDR-211M
+   and pre-cutoff BD drives.
+
+   Protocol:
+   1. Unlock: WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
+              payload = model string + key from 0xA0
+              Failure = abort (no sweep)
+   2. Kernel:  WRITE BUFFER mode=0x07 bufID=0xFE
+              full file from offset 0, 0x8000 chunks
+   3. Normal:  WRITE BUFFER mode=0x07 bufID=0xF0
+              full file from offset 0, 0x8000 chunks
+   4. Trigger: WRITE BUFFER mode=0x05 bufID=0xFF len=0x100
+              same payload as unlock
+   ========================================================= */
+static int cmd_flashfw_precut(void)
+{
+    UCHAR  sense[SENSE_SIZE] = {0};
+    UCHAR *kdata = NULL;
+    UCHAR *fwdata = NULL;
+    long   ksize = 0, fwsize = 0;
+    DWORD  offset = 0;
+    FILE  *fp;
+    int    st = 0;
+
+    #define PRECUT_BUSY() do { \
+        UCHAR _es[8], _s2[SENSE_SIZE]; int _st2=0; \
+        UCHAR _escdb[10]={0x4A,0x01,0,0,0x5A,0,0,0,0x08,0}; \
+        send_scsi(g_hDrive,_escdb,10,_es,8,SCSI_IOCTL_DATA_IN,_s2,&_st2); \
+        UCHAR _rscdb[6]={0x03,0,0,0,0x12,0}; UCHAR _rb[18]; \
+        send_scsi(g_hDrive,_rscdb,6,_rb,18,SCSI_IOCTL_DATA_IN,_s2,&_st2); \
+        Sleep(100); \
+    } while(0)
+
+    printf("=== FLASH FIRMWARE (PRE-CUTOFF PROTOCOL) ===\n\n");
+
+    if (!g_outFile[0]) {
+        fprintf(stderr, "Usage: drivekit flash E --file kernel.bin [--file2 normal.bin]\n");
+        return 1;
+    }
+
+    /* Load kernel */
+    fp = fopen(g_outFile, "rb");
+    if (!fp) { fprintf(stderr, "Cannot open kernel: %s\n", g_outFile); return 1; }
+    fseek(fp, 0, SEEK_END); ksize = ftell(fp); fseek(fp, 0, SEEK_SET);
+    kdata = (UCHAR*)malloc(ksize);
+    if (!kdata) { fclose(fp); return 1; }
+    fread(kdata, 1, ksize, fp);
+    fclose(fp);
+
+    printf("  Kernel : %s (%ld bytes)\n", g_outFile, ksize);
+
+    /* Load normal firmware */
+    if (g_outFile2[0]) {
+        fp = fopen(g_outFile2, "rb");
+        if (!fp) { fprintf(stderr, "Cannot open firmware: %s\n", g_outFile2); free(kdata); return 1; }
+        fseek(fp, 0, SEEK_END); fwsize = ftell(fp); fseek(fp, 0, SEEK_SET);
+        fwdata = (UCHAR*)malloc(fwsize);
+        if (!fwdata) { fclose(fp); free(kdata); return 1; }
+        fread(fwdata, 1, fwsize, fp);
+        fclose(fp);
+        printf("  Normal : %s (%ld bytes)\n", g_outFile2, fwsize);
+    }
+
+    /* Build payload — for pre-cutoff drives 0xA0 returns capability data
+       not the unlock string. Override with correct internal model string
+       from g_mdl_map using drive ID from 0xF1 */
+    build_pioneer_payload_auto(g_payload);
+    if (memcmp(g_payload, "PIONEER", 7) != 0) {
+        UCHAR f1buf[0x30] = {0}; UCHAR f1s[SENSE_SIZE];
+        if (rb_data(0xF1, 0, f1buf, 0x30, f1s) == 0) {
+            char plat[16] = {0}; int k; WORD did = 0;
+            for (k=0; k<12 && f1buf[0x10+k]>=0x20 && f1buf[0x10+k]<0x7F; k++)
+                plat[k] = f1buf[0x10+k];
+            const char *p = plat;
+            while (*p && (*p < '0' || *p > '9')) p++;
+            if (*p) did = (WORD)strtol(p, NULL, 16);
+            /* Look up internal model string from g_mdl_map */
+            int mi;
+            for (mi = 0; g_mdl_map[mi].did; mi++) {
+                if (g_mdl_map[mi].did == did) {
+                    memset(g_payload, 0x20, 16);
+                    strncpy((char*)g_payload, g_mdl_map[mi].str, 16);
+                    printf("  [DBG] Model from g_mdl_map[0x%04X]: %.16s\n",
+                           did, (char*)g_payload);
+                    break;
+                }
+            }
+        }
+    }
+    printf("  Payload: %.16s + key\n\n", (char*)g_payload);
+
+    /* Check drive ready */
+    {
+        int attempt, consecutive = 0;
+        printf("[0/4] Checking drive ready...\n");
+        for (attempt = 0; attempt < 30; attempt++) {
+            UCHAR cdb[6] = {0}; UCHAR s2[SENSE_SIZE]; int st2 = 0;
+            send_scsi(g_hDrive, cdb, 6, NULL, 0, SCSI_IOCTL_DATA_UNSPECIFIED, s2, &st2);
+            if (st2 == 0 || s2[12] == 0x3A) {
+                if (++consecutive >= 3) { printf("  READY\n\n"); Sleep(500); break; }
+            } else { consecutive = 0; Sleep(1000); }
+        }
+    }
+
+    /* Read 0xF1 and 0xA0 to put drive in correct state */
+    {
+        UCHAR rb[0x30]; UCHAR a0[0x10]; UCHAR rbs[SENSE_SIZE];
+        printf("[1/4] Pre-flash state reads...\n");
+        rb_data(0xF1, 0,    rb, 0x30, rbs);
+        rb_data(0xA0, 0x90, a0, 0x10, rbs);
+        Sleep(200);
+    }
+
+    /* Unlock: mode=0x04 bufID=0xFF — failure = abort, no sweep */
+    if (!g_nounlock) {
+        UCHAR wcdb[10] = {0x3B,0x04,0xFF,0,0,0,0,0x01,0,0};
+        printf("[2/4] Unlock (mode=0x04 bufID=0xFF)...\n");
+        send_scsi(g_hDrive, wcdb, 10, g_payload, PAYLOAD_SIZE,
+                  SCSI_IOCTL_DATA_OUT, sense, &st);
+        if (st != 0) {
+            printf("  FAILED (key=%02X ASC=%02X) — trying without unlock\n",
+                   sense[2]&0x0F, sense[12]);
+            /* Pre-cutoff drives may not need explicit unlock */
+        } else {
+            printf("  GOOD\n");
+        }
+        Sleep(300);
+    } else {
+        printf("[2/4] Unlock skipped\n");
+    }
+    printf("\n");
+
+    /* Send kernel — full file from offset 0, chunked to bufID=0xFE */
+    printf("[3/4] Sending kernel (%ld bytes)...\n", ksize);
+    offset = 0;
+    while (offset < (DWORD)ksize) {
+        UCHAR cdb[10] = {0};
+        DWORD n = (DWORD)ksize - offset;
+        if (n > 0x8000) n = 0x8000;
+        cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+        cdb[3]=(UCHAR)(offset>>16); cdb[4]=(UCHAR)(offset>>8); cdb[5]=(UCHAR)(offset);
+        cdb[6]=(UCHAR)(n>>16);      cdb[7]=(UCHAR)(n>>8);      cdb[8]=(UCHAR)(n);
+        send_scsi(g_hDrive, cdb, 10, kdata+offset, n, SCSI_IOCTL_DATA_OUT, sense, &st);
+        if (st != 0) {
+            PRECUT_BUSY();
+            send_scsi(g_hDrive, cdb, 10, kdata+offset, n, SCSI_IOCTL_DATA_OUT, sense, &st);
+            if (st != 0) {
+                printf("\n  FAILED at 0x%06X: key=%02X ASC=%02X\n",
+                       offset, sense[2]&0x0F, sense[12]);
+                free(kdata); if (fwdata) free(fwdata); return 1;
+            }
+        }
+        offset += n;
+        printf("\r  %lu / %lu bytes", offset, (DWORD)ksize);
+        fflush(stdout);
+        Sleep(50);
+    }
+    printf("\n  Done.\n\n");
+    free(kdata); kdata = NULL;
+
+    /* Send normal firmware — full file from offset 0, chunked to bufID=0xF0 */
+    if (fwdata) {
+        printf("[3b/4] Sending normal firmware (%ld bytes)...\n", fwsize);
+        offset = 0;
+        while (offset < (DWORD)fwsize) {
+            UCHAR cdb[10] = {0};
+            DWORD n = (DWORD)fwsize - offset;
+            if (n > 0x8000) n = 0x8000;
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
+            cdb[3]=(UCHAR)(offset>>16); cdb[4]=(UCHAR)(offset>>8); cdb[5]=(UCHAR)(offset);
+            cdb[6]=(UCHAR)(n>>16);      cdb[7]=(UCHAR)(n>>8);      cdb[8]=(UCHAR)(n);
+            send_scsi(g_hDrive, cdb, 10, fwdata+offset, n, SCSI_IOCTL_DATA_OUT, sense, &st);
+            if (st != 0) {
+                PRECUT_BUSY();
+                send_scsi(g_hDrive, cdb, 10, fwdata+offset, n, SCSI_IOCTL_DATA_OUT, sense, &st);
+                if (st != 0) {
+                    printf("\n  FAILED at 0x%06X: key=%02X ASC=%02X\n",
+                           offset, sense[2]&0x0F, sense[12]);
+                    free(fwdata); return 1;
+                }
+            }
+            offset += n;
+            printf("\r  %lu / %lu bytes", offset, (DWORD)fwsize);
+            fflush(stdout);
+            Sleep(50);
+        }
+        printf("\n  Done.\n\n");
+        PRECUT_BUSY();
+        free(fwdata); fwdata = NULL;
+    }
+
+    /* Execution trigger: mode=0x05 bufID=0xFF len=0x100 */
+    printf("[4/4] Execution trigger (mode=0x05 bufID=0xFF)...\n");
+    {
+        UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+        UCHAR s2[SENSE_SIZE]; int st2 = 0;
+        send_scsi(g_hDrive, cdb, 10, g_payload, 0x100,
+                  SCSI_IOCTL_DATA_OUT, s2, &st2);
+        printf("  Status: %s", st2==0 ? "GOOD" : "FAIL");
+        if (st2 != 0) printf(" (key=%02X ASC=%02X)", s2[2]&0x0F, s2[12]);
+        printf("\n\n");
+    }
+
+    printf("=== FLASH COMPLETE ===\n");
+    printf("  Wait 15 seconds then run: drivekit inquiry %s\n\n", g_drivePath);
+    Sleep(15000);
+
+    /* Auto verify */
+    {
+        UCHAR inq[96]={0}; UCHAR inqcdb[6]={0x12,0,0,0,96,0};
+        UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        send_scsi(g_hDrive, inqcdb, 6, inq, 96, SCSI_IOCTL_DATA_IN, inqs, &inqst);
+        if (inqst == 0) {
+            char vendor[9]={0}, model[17]={0}, fw[5]={0};
+            memcpy(vendor, inq+8,  8);
+            memcpy(model,  inq+16, 16);
+            memcpy(fw,     inq+32, 4);
+            printf("  +---------------------------+\n");
+            printf("  | Flash verified!           |\n");
+            printf("  | Vendor  : %-15s |\n", vendor);
+            printf("  | Model   : %-15s |\n", model);
+            printf("  | Firmware: %-15s |\n", fw);
+            printf("  +---------------------------+\n\n");
+        }
+    }
+
+    #undef PRECUT_BUSY
+    return 0;
+}
+
+static int cmd_flash(void)
+{
+    UCHAR b0buf[16]      = {0};
+    UCHAR b0cdb[10]      = {0x3C,0x02,0xB0,0,0,0,0,0,0x10,0};
+    UCHAR b0sense[SENSE_SIZE] = {0};
+    int   b0st           = 0;
+    int   is_pre_cutoff  = 0;
+
+    printf("=== FLASH (AUTO-DETECT) ===\n\n");
+
+    /* Probe READ BUFFER 0xB0 — readable on pre-cutoff, errors on post-cutoff */
+    printf("  [1/2] Probing READ BUFFER 0xB0 to detect drive generation...\n");
+    send_scsi(g_hDrive, b0cdb, 10, b0buf, 16,
+              SCSI_IOCTL_DATA_IN, b0sense, &b0st);
+
+    if (b0st == 0 && b0buf[0] != 0xFF) {
+        is_pre_cutoff = 1;
+        printf("        Response  : %02X %02X %02X %02X %02X %02X %02X %02X"
+               " %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               b0buf[0],b0buf[1],b0buf[2],b0buf[3],
+               b0buf[4],b0buf[5],b0buf[6],b0buf[7],
+               b0buf[8],b0buf[9],b0buf[10],b0buf[11],
+               b0buf[12],b0buf[13],b0buf[14],b0buf[15]);
+        printf("        Result    : DATA RETURNED\n");
+        printf("        Generation: PRE-CUTOFF (before 2022-12-27)\n");
+        printf("        Protocol  : flashfw (single-pass)\n\n");
+    } else {
+        is_pre_cutoff = 0;
+        printf("        Response  : ERROR (sense key=0x%02X ASC=0x%02X)\n",
+               b0sense[2]&0x0F, b0sense[12]);
+        printf("        Result    : NOT READABLE\n");
+        printf("        Generation: POST-CUTOFF (after 2022-12-27)\n");
+        printf("        Protocol  : crossflash (two-pass NAND write)\n\n");
+    }
+
+    /* Dispatch */
+    if (is_pre_cutoff) {
+        printf("  [2/2] Dispatching to flashfw_precut (pre-cutoff protocol)...\n\n");
+        g_pre_cutoff  = 1;
+        return cmd_flashfw_precut();
+    } else {
+        printf("  [2/2] Dispatching to crossflash (post-cutoff mode)...\n\n");
+        return cmd_crossflash();
+    }
 }
 
 static int cmd_crossflash(void)

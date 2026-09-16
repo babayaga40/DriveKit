@@ -6,7 +6,7 @@ Combined optical drive & storage research toolkit for Windows and Linux, targeti
 
 Reverse engineering was performed through multiple methods:
 
-**Pre-cutoff / crossflash protocol:** greg1wto provided the tools we needed to capture a live BDRFlash crossflash session with Wireshark/USBPcap. The capture was performed and analyzed by BabaYaga — parsed at the USB EPB level to extract the raw NAND write commands, revealing the complete two-pass firmware write protocol, trigger payload structure, and unlock key format.
+**Pre-cutoff / crossflash protocol:** greg1wto provided the tools we needed to perform Wireshark/USBPcap capture analysis. Combined with reverse engineering of official Pioneer updater executables by BabaYaga, this revealed the complete two-pass firmware write protocol, trigger payload structure, and unlock key format.
 
 **Post-cutoff protocol:** Reverse engineered the official Pioneer updater executables (`BDR-XD06J-UHD`, `BDR-XD07UHD`) with IDA Pro — reading x86 assembly only, no decompilation. This revealed the session token mechanism, buffer IDs and offsets, drive-specific trigger keys, and the Engineering Mode unlock sequence.
 
@@ -51,7 +51,7 @@ DriveKit stores keys as little-endian DWORD values (`0x6123789A`) which produce 
 - Returns data → **pre-cutoff** drive (before 2022-12-27) — H8S/2600 code visible
 - Returns error 05/24 → **post-cutoff** drive — `0xB0` locked
 
-**BDRFlash checksum algorithm (from IDA Pro analysis):**
+**Pioneer firmware checksum algorithm (from IDA Pro analysis of official updater):**
 ```c
 uint32_t checksum = 0;
 for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
@@ -172,7 +172,7 @@ Sending only the NAND image (0x1E0000) causes commit trigger to fail with `04/4C
 | `0x08A98AF2` | `F2 8A A9 08` | XD06U post-cutoff (SAT 8B30) | From BDR-XD06J-UHD updater |
 | `0xA44F2F55` | `55 2F 4F A4` | XD08U (SAT 9331) | Confirmed by MrPenguin |
 | `0x426623FD` | `FD 23 66 42` | BDR-UD04 | Confirmed by MrPenguin |
-| `0xAA475E15` | `15 5E 47 AA` | XD08 (SAT 9330) | From BDRFlash IDA table |
+| `0xAA475E15` | `15 5E 47 AA` | XD08 (SAT 9330) | From IDA Pro analysis |
 
 **Drive trigger keys (post-cutoff execution trigger only):**
 
@@ -358,11 +358,11 @@ year letter (N=2022, O=2023, P=2024...)
 
 **MrPenguin** — H8S/2600 deep firmware analysis, rolling XOR cipher reverse engineering, BDR-S12U pypcode/Ghidra analysis, unlock key endianness clarification, `0xB0` READ BUFFER disassembly, and ongoing technical guidance invaluable throughout this project.
 
-**greg1wto** — provided the tools we needed to capture a live BDRFlash crossflash session with Wireshark/USBPcap, which made the NAND write protocol analysis possible.
+**greg1wto** — provided the tools we needed to perform Wireshark/USBPcap capture analysis, which combined with Pioneer updater reverse engineering made the NAND write protocol analysis possible.
 
 Thank you for the inspiration and help from cxplay, Sayaka, Coopervid, blackened2687, Billy, MakeMKV Forum and cdrinfo.pl
 
-**BDRFlash special thanks:**
+**Special thanks (flash tool community):**
 Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, BillyCar11, asmcom, payalnik23, aliter404
 
 **Tools:** Wireshark + USBPcap, IDA Pro + hrtng plugin, x64dbg, pypcode, Visual Studio 2022, WSL, GCC

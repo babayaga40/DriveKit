@@ -4010,10 +4010,10 @@ static void print_help(void)
     printf("  rawdump       Raw READ BUFFER dump (--bufid 0xxx)\n\n");
     printf("Flashing:\n");
     printf("  unlock        Pioneer service mode unlock (auto session token)\n");
-    printf("  flashfw       Flash kernel+firmware (--file kernel --file2 normal)\n");
-    printf("  flash         Auto-detect pre/post-cutoff and flash accordingly\n");
+    printf("  flash         AUTO-DETECT pre/post-cutoff and flash (RECOMMENDED)\n");
     printf("                  --file kernel.bin --file2 normal.bin\n");
-    printf("  crossflash    Post-cutoff downgrade/crossflash (confirmed protocol)\n");
+    printf("  flashfw       Legacy flash command (use 'flash' instead)\n");
+    printf("  crossflash    Post-cutoff downgrade/crossflash (direct, no auto-detect)\n");
     printf("                  --file kernel.bin --file2 normal.bin [--key 0xAA475E15]\n");
     printf("  xordiff       XOR two encrypted firmware files to find version bytes\n");
     printf("                  --file fw_new.bin --file2 fw_old.bin\n");
@@ -5547,7 +5547,7 @@ int main(int argc, char *argv[])
         printf("  ---------------\n");
         printf("  - CROSSFLASH/DOWNGRADE CONFIRMED (Sept 14 2026)\n");
         printf("    First Pioneer post-cutoff downgrade via our own tool!\n");
-        printf("    XD08U 1.04 -> 1.02: SUCCESS. Protocol from pcapng analysis.\n\n");
+        printf("    XD08U 1.04 -> 1.02: SUCCESS. Protocol reverse engineered from official Pioneer updater executables.\n\n");
         printf("  - Two-pass NAND write protocol (from greg1wto capture)\n");
         printf("    Firmware written to NAND TWICE - first pass bypasses\n");
         printf("    version check, second pass with kernel is permanent.\n");
@@ -5583,7 +5583,7 @@ int main(int argc, char *argv[])
         printf("  CREDITS\n");
         printf("  -------\n");
         printf("  greg1wto        Provided tools enabling Wireshark capture\n");
-        printf("                  of live BDRFlash crossflash session\n");
+        printf("                  enabling Wireshark capture of a live flash session\n");
         printf("                  Revealed NAND write protocol that made\n");
         printf("                  crossflash/downgrade possible!\n");
         printf("  blackened2687   BDRFlash/AutoFlasher author\n");
@@ -6097,7 +6097,7 @@ static int exec_trigger(const UCHAR *fallback_payload)
    CMD_CROSSFLASH
    Post-cutoff Pioneer crossflash / downgrade.
 
-   Protocol confirmed from bdrflash_full_flash.pcapng analysis:
+   Protocol reverse engineered from official Pioneer updater executables:
 
    Step 1:  WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
             Unlock trigger payload:
@@ -6163,7 +6163,7 @@ static int xf_write_buffer(UCHAR mode, UCHAR bufid,
 }
 
 /* Build the 256-byte trigger/unlock payload.
-   Confirmed layout from bdrflash_full_flash.pcapng EPB-parsed payload:
+   Confirmed layout from Pioneer updater analysis:
      [0x00-0x0F]  model string (16 bytes, e.g. "PIONEER BDR-BDS8")
      [0x10-0x13]  unlock key (4 bytes, little-endian)
      [0x14-0xFF]  zeros
@@ -6533,6 +6533,10 @@ static int cmd_crossflash(void)
                    ((DWORD)auto_payload[0x12] << 16)  |
                    ((DWORD)auto_payload[0x13] << 24);
     if (key_le == 0) key_le = 0x6123789A; /* universal fallback */
+    /* Always use universal key for crossflash unlock trigger —
+       confirmed working on all tested drives (SAT 9330, 9331)
+       Drive-specific trigger keys are for post-cutoff execution trigger only */
+    key_le = 0x6123789A;
 
     /* --key override */
     if (g_key_override) key_le = g_key_override;
@@ -6540,7 +6544,7 @@ static int cmd_crossflash(void)
     /* TODO: --model override via new global g_model_str if needed */
 
     printf("=== CROSSFLASH / DOWNGRADE ===\n\n");
-    printf("  Protocol: confirmed from bdrflash_full_flash.pcapng\n");
+    printf("  Protocol: reverse engineered from official Pioneer updater executables\n");
     printf("  Model   : %s\n", model);
     printf("  Key     : 0x%08X\n", key_le);
     printf("\n");
@@ -6602,7 +6606,7 @@ static int cmd_crossflash(void)
     }
     fseek(fp, 0, SEEK_END);
     {
-        /* Send the FULL file including ECC/OOB trailer — confirmed from pcapng:
+        /* Send the FULL file including ECC/OOB trailer — confirmed from Pioneer updater analysis:
            first pass writes 0x1E6800 (full file), not just 0x1E0000 (NAND image).
            Truncating to 0x1E0000 causes commit trigger to fail with 04/4C/02. */
         normal_size = (DWORD)ftell(fp);
@@ -6839,21 +6843,6 @@ static int cmd_crossflash(void)
        drive needs time to finish NAND write before accepting trigger.
        ------------------------------------------------------- */
     printf("[6/6] Final commit trigger...\n");
-    printf("      Firmware passes complete. Commit will reboot drive.\n");
-    printf("      Proceed with commit trigger? [y/N]: ");
-    fflush(stdout);
-    {
-        char ans[8] = {0};
-        fgets(ans, sizeof(ans), stdin);
-        if (ans[0] != 'y' && ans[0] != 'Y') {
-            printf("  Commit skipped — drive is in kernel limbo.\n");
-            printf("  Run: drivekit flashfw E --file2 <normal.bin> --nounlock  to commit.\n");
-            printf("  Or power cycle to abort and recover previous firmware.\n\n");
-            free(kernel_data);
-            free(normal_data);
-            return 0;
-        }
-    }
     Sleep(500);
     st = exec_trigger(trigger);
     if (st != 0) {

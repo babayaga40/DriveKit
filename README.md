@@ -6,7 +6,7 @@ Combined optical drive & storage research toolkit for Windows and Linux, targeti
 
 Reverse engineering was performed through multiple methods:
 
-**Pre-cutoff / crossflash protocol:** greg1wto provided the tools that made Wireshark/USBPcap capture of a real BDRFlash crossflash session possible. The capture was performed and analyzed by BabaYaga — parsed at the USB EPB level to extract the raw NAND write commands, revealing the complete two-pass firmware write protocol, trigger payload structure, and unlock key format. Without greg1wto's tools the capture would not have been possible.
+**Pre-cutoff / crossflash protocol:** greg1wto provided the tools we needed to capture a live BDRFlash crossflash session with Wireshark/USBPcap. The capture was performed and analyzed by BabaYaga — parsed at the USB EPB level to extract the raw NAND write commands, revealing the complete two-pass firmware write protocol, trigger payload structure, and unlock key format.
 
 **Post-cutoff protocol:** Reverse engineered the official Pioneer updater executables (`BDR-XD06J-UHD`, `BDR-XD07UHD`) with IDA Pro — reading x86 assembly only, no decompilation. This revealed the session token mechanism, buffer IDs and offsets, drive-specific trigger keys, and the Engineering Mode unlock sequence.
 
@@ -46,7 +46,7 @@ H8S/2600 assembly: CMP.L #0x9a782361:32, ER0
 → UD04 key     0x426623FD must be sent as bytes: 42 66 23 FD
 → XD08U key    0xA44F2F55 must be sent as bytes: A4 4F 2F 55
 ```
-Minimum payload length = 20 bytes (16 model string + 4 key).
+DriveKit stores keys as little-endian DWORD values (`0x6123789A`) which produce the correct wire bytes (`9A 78 23 61`) when sent LE. Minimum payload length = 20 bytes (16 model string + 4 key).
 
 **BDRFlash checksum algorithm (from IDA Pro analysis):**
 ```c
@@ -67,39 +67,44 @@ for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
 
 ## Flash Protocol
 
-### Pre-cutoff / crossflash sequence (CONFIRMED — from Wireshark EPB capture analysis):
+### Crossflash sequence (CONFIRMED WORKING — from Wireshark EPB capture analysis):
 ```
 1. WRITE BUFFER mode=0x04 bufID=0xFF len=0x100   ← unlock trigger
    payload[0x00-0x0F] = model string (e.g. "PIONEER BDR-BDS8")
-   payload[0x10-0x13] = unlock key (little-endian)
+   payload[0x10-0x13] = unlock key (little-endian, universal: 9A 78 23 61)
    payload[0x14-0xFF] = zeros
 
 2. WRITE BUFFER mode=0x07 bufID=0xF0             ← normal firmware, first pass
-   sequential 0x8000-byte chunks, offset 0x000000 → 0x1E0000
+   FULL FILE in 0x8000-byte chunks (including ECC/OOB trailer!)
+   e.g. 9331051.102 = 0x1E6700 bytes = 61 chunks
 
 3. WRITE BUFFER mode=0x07 bufID=0xFE off=0x0000 len=0x200  ← random session token
 
 4. WRITE BUFFER mode=0x07 bufID=0xFE off=0x1200 len=<size> ← kernel
-   sent in 0x8000-byte chunks starting at NAND offset 0x1200
+   kernel file[0x1200:] sent in 0x8000-byte chunks at NAND offset 0x1200
 
 5. WRITE BUFFER mode=0x07 bufID=0xF0             ← normal firmware, second pass
-   same as step 2
+   same as step 2 (full file)
 
 6. WRITE BUFFER mode=0x05 bufID=0xFF len=0x100   ← final commit trigger
    same payload structure as step 1
 ```
 
-**The firmware is written TWICE** — first pass bypasses version protection, second pass with kernel is the permanent write. The drive physically writes to NAND during this sequence — 1920KB (0x1E0000) per pass.
+**Critical discovery: The FULL file must be sent including ECC/OOB trailer!**
+Sending only the NAND image (0x1E0000) causes the commit trigger to fail with `04/4C/02`.
+The full file (e.g. 0x1E6700) must be sent — the extra 0x6700 bytes are ECC data the drive expects.
+
+**The firmware is written TWICE** — first pass bypasses version protection, second pass with kernel is the permanent write.
 
 **Firmware file format:**
 ```
-[0x000000 - 0x1DFFFF]  = 0x1E0000 bytes  → NAND image (what gets written)
-[0x1E0000 - end]       = ECC/OOB data    → ignored, not sent to drive
+[0x000000 - 0x1DFFFF]  = 0x1E0000 bytes  → NAND image
+[0x1E0000 - end]       = ECC/OOB data    → MUST be sent! (not optional)
 ```
 
 **Kernel file format:**
 ```
-[0x000000 - 0x0011FF]  = Pioneer header (0x1200 bytes)
+[0x000000 - 0x0011FF]  = Pioneer header (0x1200 bytes, NOT sent)
 [0x001200 - end]       = actual kernel code → sent to NAND at offset 0x1200
 ```
 
@@ -111,13 +116,6 @@ for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
 4. WRITE BUFFER mode=0x07 bufID=0xFE offset=0x1200 len=<size>  ← kernel
 5. WRITE BUFFER mode=0x07 bufID=0xF0 offset=0x0000 len=<size>  ← normal firmware (chunked)
 6. WRITE BUFFER mode=0x05 bufID=0xFF offset=0x0000 len=0x100   ← execution trigger
-```
-
-**Execution trigger payload structure (post-cutoff, 0x100 bytes):**
-```
-[0x00-0x0F] = first 16 bytes of random session token
-[0x10-0x13] = drive-specific trigger key from updater dword_5D4B38 table
-[0x14-0xFF] = rest of random session token
 ```
 
 **Drive trigger keys (from updater dword_5D4B38[index*4]):**
@@ -138,34 +136,47 @@ for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
 
 **First confirmed Pioneer post-cutoff crossflash/downgrade using our own tool.**
 
-**Background:** greg1wto provided the tools that enabled Wireshark/USBPcap capture of a real BDRFlash crossflash in progress. BabaYaga performed the capture and analyzed the pcapng at the USB Enhanced Packet Block (EPB) level — stripping the 27-byte usbmon pseudo-header from each packet — extracting the raw NAND write commands. This revealed the two-pass firmware write protocol that BDRFlash uses, which had not been documented anywhere.
+**Background:** greg1wto provided the tools we needed to capture a live BDRFlash crossflash session with Wireshark/USBPcap. BabaYaga performed the capture and analyzed the pcapng at the USB Enhanced Packet Block (EPB) level — stripping the 27-byte usbmon pseudo-header from each packet — extracting the raw NAND write commands. This revealed the two-pass firmware write protocol that BDRFlash uses, which had not been documented anywhere.
 
 **What was discovered from the capture:**
 - Firmware is written to NAND **twice** — not once as previously assumed
+- The FULL file must be sent including ECC/OOB trailer — truncating to 0x1E0000 causes commit failure
 - The unlock trigger payload is dead simple: model string at `[0x00]`, key at `[0x10]`, zeros elsewhere
-- The drive in the capture was a BDR-XD08 (SAT 9330) being crossflashed to XD08U (SAT 9331) v1.04
-- The universal key `0x6123789A` (sent BE: `9A 78 23 61`) works as the unlock for all tested drives
-- Total normal firmware size written to NAND: exactly `0x1E0000` bytes (1920KB) per pass
+- The universal key `0x6123789A` (wire bytes: `9A 78 23 61`) works as the unlock for all tested drives
+- Model string and key are auto-detected from `READ BUFFER 0xA0` by DriveKit
 
 **Test performed:**
-- Drive: BDR-XD08 physically, running BDR-XD08U firmware v1.04 (SAT 9331 ID05) after prior crossflash
-- Target: downgrade to BDR-XD08U v1.02 (files 131=kernel, 132=normal firmware, date 22/12/27)
-- Key used: `0x6123789A` (universal) — `0xAA475E15` (XD08 key) was rejected with sense `05/26/00`
-- Result: **SUCCESS** ✅ — drive rebooted reporting Firmware: 1.02, SAT 9331, ID05
+- Drive: BDR-XD08 physically, running BDR-XD08U firmware (SAT 9331 ID05)
+- Confirmed working: 1.04 ↔ 1.02 crossflash in both directions, single command
+- Key used: `0x6123789A` (universal, auto-detected)
+- Result: **SUCCESS** ✅ — fully automatic, no manual recovery needed
 
-**Sequence that worked:**
+**Complete working command:**
 ```
-drivekit crossflash E --file 131 --file2 132   (key defaults to 0x6123789A)
+drivekit crossflash E --file <kernel> --file2 <normal_firmware>
 ```
-Steps 1-5 completed cleanly. Step 6 (commit trigger `mode=0x05`) returned sense `04/4C/02`
-(LOGICAL UNIT FAILED SELF-CONFIGURATION) — drive entered kernel limbo. Recovery:
-```
-drivekit flashfw E --file2 132 --nounlock
-```
-Drive rebooted with firmware 1.02. ✅
 
-**Commit trigger fix (pending):** Add `Sleep(200)` before step 6 and confirm mode=0x05 is correct.
-When fixed, the entire sequence will be a single `crossflash` command with no recovery step needed.
+**Pre-cutoff downgrade status:**
+- Attempted: XD08U 1.04 → pre-cutoff 1.01 (files S9331050.100 + S9331051.101)
+- Result: commit trigger returns `04/4C/02` — version check in encrypted binary
+- Patching ASCII header only is insufficient — version check reads encrypted payload
+- Pending: kernel modification to remove version check (Billy collaboration)
+
+---
+
+## Version Check Discovery
+
+The downgrade protection version check is embedded in the **encrypted binary firmware payload** — NOT in the ASCII header!
+
+**Confirmed by testing:**
+- ASCII header patch (`1.01` → `1.02` in plaintext header) → still rejected with `04/4C/02`
+- Version check reads from encrypted binary → cannot be bypassed by header patching alone
+- `xordiff` of 1.02 vs 1.01 firmware shows ~1.9M differing bytes — entire encrypted payload differs between versions (different LCG seed per version)
+- Only 5 bytes differ in ASCII header region (version digit, date, filename)
+
+**`0xF1` state indicator after normal firmware send:**
+- `70 00 00 00` = firmware accepted into SRAM ✅
+- `70 00 05 00` = drive detected version mismatch in encrypted binary ❌
 
 ---
 
@@ -207,25 +218,7 @@ Two distinct kernel limbo states discovered on post-cutoff XD06U:
 - LED OFF 💀
 - Firmware: 0000
 - Nothing accessible
-- Drive recovers to 1.12 on power cycle (kernel partition intact!)
-
-**Key difference from XD08 kernel limbo:** XD06U post-cutoff kernel partition remains intact — drive always recovers to 1.12! XD08 had genuinely empty NAND and stayed in limbo until flashed.
-
----
-
-## Version Check Discovery
-
-The downgrade protection version check is embedded in the **encrypted binary firmware payload** — NOT in the ASCII header!
-
-**Confirmed by testing:**
-- ASCII header spoof (`1.11` → `1.12`, date `17/06/22` → `23/03/03`) → still rejected!
-- Version check reads from encrypted binary → cannot be bypassed by header patching alone
-- BDRFlash checksum is over data from `0x10000+` → date patch at `0x130` is safe
-- The encrypted payload contains the version that the drive's kernel validates
-
-**`0xF1` state indicator after normal firmware send:**
-- `70 00 00 00` = firmware accepted into SRAM ✅
-- `70 00 05 00` = drive detected version mismatch in encrypted binary ❌
+- Drive recovers to previous firmware on power cycle (kernel partition intact)
 
 ---
 
@@ -236,6 +229,8 @@ The downgrade protection version check is embedded in the **encrypted binary fir
 - XD06U 1.12 (Generated: 2023-03-03) — post-cutoff, `ID69`
 
 **Last safe pre-cutoff versions:**
+- BDR-XD08U — **1.01** (2022-10-11), kernel ID05
+- BDR-XD08U — **1.00** (2022-04-03), kernel ID05
 - BDR-XD08 — **1.01** (2022-10-11), requires `ID36` firmware pair
 - BDR-XD07U / AD07 — **1.04** (2022-05-31) ✅ UHD capable
 - BDR-XD06U — **1.11** ✅ UHD capable
@@ -262,17 +257,17 @@ The downgrade protection version check is embedded in the **encrypted binary fir
 
 ## Unlock Keys
 
-| Key | Drive family | Notes |
-|-----|-------------|-------|
-| `0x9A782361` | Universal (all drives) | Confirmed working on SAT 9331 ✅ |
-| `0x5CF2E094` | Secondary | Different handler |
-| `0xBE4B8754` | XD05 post-cutoff (SAT 8232) | From BDR-XD05BKXL2 updater.exe |
-| `0x08A98AF2` | XD06U post-cutoff (SAT 8B30) | From BDR-XD06J-UHD updater.exe |
-| `0xA44F2F55` | XD08U (SAT 9331) | Confirmed by MrPenguin |
-| `0x426623FD` | BDR-UD04 | Confirmed by MrPenguin |
-| `0xAA475E15` | XD08 (SAT 9330) | From BDRFlash IDA table — rejected by SAT 9331 |
+| Key (LE DWORD) | Wire bytes | Drive family | Notes |
+|----------------|-----------|-------------|-------|
+| `0x6123789A` | `9A 78 23 61` | Universal (all drives) | Confirmed working on all tested drives ✅ |
+| `0x5CF2E094` | `94 E0 F2 5C` | Secondary | Different handler |
+| `0xBE4B8754` | `54 87 4B BE` | XD05 post-cutoff (SAT 8232) | From BDR-XD05BKXL2 updater.exe |
+| `0x08A98AF2` | `F2 8A A9 08` | XD06U post-cutoff (SAT 8B30) | From BDR-XD06J-UHD updater.exe |
+| `0xA44F2F55` | `55 2F 4F A4` | XD08U (SAT 9331) | Confirmed by MrPenguin |
+| `0x426623FD` | `FD 23 66 42` | BDR-UD04 | Confirmed by MrPenguin |
+| `0xAA475E15` | `15 5E 47 AA` | XD08 (SAT 9330) | From BDRFlash IDA table |
 
-**Note (MrPenguin):** Keys are big-endian in H8S/2600 assembly but sent as-is (BE) in the payload. DriveKit sends keys in the byte order shown above. Universal key `0x9A782361` confirmed working on all tested drives.
+**Note:** DriveKit auto-detects the correct model string and key from `READ BUFFER 0xA0`. The universal key `0x6123789A` is used as fallback when 0xA0 returns zero key bytes.
 
 ---
 
@@ -319,11 +314,9 @@ drivekit <command> <drive_letter> [options]
 |---|---|
 | `--file name` | Kernel firmware file |
 | `--file2 name` | Normal firmware file |
-| `--file3 name` | Second normal firmware pass (post-cutoff) |
-| `--force` | Skip compatibility checks |
-| `--postcutoff` | Skip unlock + force post-cutoff mode (`g_unlock_mode=0x01`) |
+| `--force` | Skip compatibility checks and interactive prompts |
 | `--nounlock` | Skip unlock step |
-| `--key 0x9A782361` | Override unlock key |
+| `--key 0x6123789A` | Override unlock key |
 | `--bufid 0xF4` | Buffer ID for rawdump |
 
 ### Commands
@@ -333,34 +326,45 @@ drivekit <command> <drive_letter> [options]
 | `info` / `inquiry` | Full drive information with serial decode |
 | `unlock` | Service mode unlock (auto-detects pre/post-cutoff) |
 | `flashfw` | Flash kernel + firmware |
-| `crossflash` | Post-cutoff crossflash/downgrade — confirmed protocol from pcapng analysis |
-| `e5test` | Test `0xE5` Engineering Mode flag — run after unlock, before flashfw |
+| `crossflash` | Post-cutoff crossflash/downgrade — confirmed protocol |
+| `e5test` | Test `0xE5` Engineering Mode flag |
 | `kernellimbo` | Enter kernel limbo mode (post-cutoff drives) |
 | `probevendor` | Probe vendor commands 0xC0-0xFF |
 | `rawdump` | Raw READ BUFFER dump |
 | `checkcompat` | Check crossflash compatibility |
-| `sendcdb` | Send raw SCSI CDB (auto-detects read/write direction) |
+| `sendcdb` | Send raw SCSI CDB |
 | `resetnormal` | Attempt to exit kernel/service mode |
+| `xordiff` | XOR two encrypted firmware files to find version bytes |
+| `patchfw` | Patch firmware ASCII header to spoof version |
 
 ### crossflash command
 
 ```
-drivekit crossflash E --file kernel.bin --file2 normal.bin [--key 0x9A782361]
+drivekit crossflash E --file kernel.bin --file2 normal.bin [--key 0x6123789A]
 ```
 
-| Argument | Description |
-|---|---|
-| `--file` | Kernel binary (e.g. file `131`) |
-| `--file2` | Normal firmware binary (e.g. file `132`) |
-| `--key` | Unlock key override (default: `0x9A782361` universal) |
+Model string and key are auto-detected from the drive via `READ BUFFER 0xA0`.
+The universal key `0x6123789A` is used as fallback. Use `--key` to override.
 
-**Default keys by drive:**
+### xordiff command
 
-| Drive | Model string | Key |
-|-------|-------------|-----|
-| XD08 / XD08U (SAT 9330/9331) | `PIONEER BDR-BDS8` | `0x9A782361` |
-| XD06U (SAT 8B30) | `PIONEER BDR-XS06` | `0x9A782361` |
-| Universal fallback | `PIONEER BDR-BDS8` | `0x9A782361` |
+```
+drivekit xordiff --file fw_new.bin --file2 fw_old.bin
+```
+
+XORs two encrypted firmware files to find differing byte positions.
+Non-zero positions = version/date/checksum bytes that differ between versions.
+No drive needed — pure file analysis.
+
+### patchfw command
+
+```
+drivekit patchfw --file fw_ref.bin --file2 fw_target.bin
+```
+
+Patches ASCII header bytes in `fw_target` to match `fw_ref` (version, date, filename).
+Only patches printable ASCII bytes — binary/crypto regions are preserved.
+Output saved as `fw_target_patched.bin`. No drive needed.
 
 ---
 
@@ -402,34 +406,37 @@ year letter
 | ID | Description |
 |----|-------------|
 | `0x92` | Drive config + factory calibration |
-| `0xA0` | Session token / model string + key |
-| `0xB0` | Capability data — H8S/2000 code visible (pre-cutoff only!) |
+| `0xA0` | Model string + unlock key (read before Engineering Mode) |
+| `0xB0` | Capability data — H8S/2600 code visible (pre-cutoff only!) |
 | `0xF1` | Drive identity: serial, platform, kernel ID, firmware version |
 | `0xF4` | NAND flash contents (requires service mode) |
-| `0xFE` | Kernel area (NAND write) — crossflash protocol |
-| `0xF0` | Normal firmware area (NAND write) — crossflash protocol |
+| `0xFE` | Kernel area (NAND write target in crossflash protocol) |
+| `0xF0` | Normal firmware area (NAND write target in crossflash protocol) |
 | `0x00` | Universal firmware buffer (post-cutoff) |
-| `0xE5` | Engineering Mode flag setter — enables `0xFF` gating |
+| `0xE5` | Engineering Mode flag setter |
+| `0xFF` | Execution trigger (commit flash to NAND) |
 
 ---
 
 ## Pending Research
 
-- **Commit trigger fix** — `Sleep(200)` + confirm mode=0x05 is correct for clean single-command crossflash
-- **XD06U post-cutoff downgrade** — version check in encrypted binary is the remaining barrier:
-  - Need: rolling XOR encryption key for ID69 to patch version bytes in encrypted binary
-  - OR: command between firmware send and trigger that bypasses version check
-- **`0xFE` dump analysis** — compare encrypted 1.12 firmware dump to 1.11 file — find version bytes
-- **MrPenguin** — H8S/2000 disassembly, `0xB0` analysis, share `0xFE`/`0xFC` dump method
+- **Pre-cutoff downgrade** — version check in encrypted binary is the remaining barrier:
+  - Version check reads encrypted payload, ASCII header patch insufficient
+  - Need: kernel modification to remove version check (Billy collaboration pending)
+  - OR: LCG seed extraction to re-encrypt firmware with spoofed version bytes
+- **XD06U post-cutoff downgrade** — same encrypted binary version check barrier
+- **MrPenguin** — H8S/2600 disassembly, `0xB0` analysis, share `0xFE`/`0xFC` dump method
 - **Extract trigger keys** from all updater exes in firmware archive
 
 ---
 
 ## Credits
 
-**Special thanks to greg1wto** — provided the Wireshark crossflash capture that made the NAND write protocol analysis possible and directly enabled the first confirmed Pioneer post-cutoff crossflash/downgrade.
+**MrPenguin** — H8S/2600 deep firmware analysis, rolling XOR cipher reverse engineering, BDR-S12U pypcode/Ghidra analysis, unlock key endianness clarification, `0xB0` READ BUFFER disassembly, and ongoing technical guidance that has been invaluable throughout this project.
 
-Thank you for the inspiration and help from MrPenguin, cxplay, Sayaka, Coopervid, blackened2687, MakeMKV Forum and cdrinfo.pl
+**greg1wto** — provided the tools we needed to capture a live BDRFlash crossflash session with Wireshark/USBPcap, which made the NAND write protocol analysis possible.
+
+Thank you for the inspiration and help from cxplay, Sayaka, Coopervid, blackened2687, Billy, MakeMKV Forum and cdrinfo.pl
 
 **BDRFlash special thanks** (from BDRFlash v1.00 about box):
 Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, BillyCar11, asmcom, payalnik23, aliter404

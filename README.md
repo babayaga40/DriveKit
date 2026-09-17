@@ -354,31 +354,6 @@ year letter (N=2022, O=2023, P=2024...)
 
 ---
 
-## Credits
-
-**MrPenguin** — H8S/2600 deep firmware analysis, rolling XOR cipher reverse engineering, BDR-S12U pypcode/Ghidra analysis, unlock key endianness clarification, `0xB0` READ BUFFER disassembly, and ongoing technical guidance invaluable throughout this project.
-
-**greg1wto** — provided the tools we needed to perform Wireshark/USBPcap capture analysis, which combined with Pioneer updater reverse engineering made the NAND write protocol analysis possible.
-
-Thank you for the inspiration and help from cxplay, Sayaka, Coopervid, blackened2687, Billy, MakeMKV Forum and cdrinfo.pl
-
-**Special thanks (flash tool community):**
-Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, BillyCar11, asmcom, payalnik23, aliter404
-
-**Tools:** Wireshark + USBPcap, IDA Pro + hrtng plugin, x64dbg, pypcode, Visual Studio 2022, WSL, GCC
-
-Research and educational purposes only.
-
-*DriveKit v1.0 — cPix / Razor 1911 (c) 2026*
-
-```
-          /\
-         /__\
-        /\  /\
-       /__\/__\
-   Razor 1911 - Since 1985
-```
-
 ---
 
 ## LibreDrive Enable (Post-Cutoff)
@@ -456,3 +431,29 @@ Response[0x0C] = AACS version (e.g. 0x1B = version 27)
 ```
 
 DriveKit displays this as `AACS ver` in drive information.
+
+
+## Credits
+
+**MrPenguin** — H8S/2600 deep firmware analysis, rolling XOR cipher reverse engineering, BDR-S12U pypcode/Ghidra analysis, unlock key endianness clarification, `0xB0` READ BUFFER disassembly, and ongoing technical guidance invaluable throughout this project.
+
+**greg1wto** — provided the tools we needed to perform Wireshark/USBPcap capture analysis, which combined with Pioneer updater reverse engineering made the NAND write protocol analysis possible.
+
+Thank you for the inspiration and help from cxplay, Sayaka, Coopervid, blackened2687, Billy, MakeMKV Forum and cdrinfo.pl
+
+**Special thanks (flash tool community):**
+Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, BillyCar11, asmcom, payalnik23, aliter404
+
+**Tools:** Wireshark + USBPcap, IDA Pro + hrtng plugin, x64dbg, pypcode, Visual Studio 2022, WSL, GCC
+
+Research and educational purposes only.
+
+*DriveKit v1.0 — cPix / Razor 1911 (c) 2026*
+
+```
+          /\
+         /__\
+        /\  /\
+       /__\/__\
+   Razor 1911 - Since 1985
+```

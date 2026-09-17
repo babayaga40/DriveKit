@@ -104,6 +104,7 @@ static int   cmd_flashfw_precut(void);
 static int   cmd_flash(void);
 static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);
+static int   cmd_libredrive(void);
 
 /* =========================================================
    UTILITY: memmem for Windows
@@ -1158,6 +1159,108 @@ static int cmd_unlock(void)
    3. Try WRITE 0xFF with various payloads
    4. Try flashing older firmware
    ========================================================= */
+
+/* =========================================================
+   CMD_LIBREDRIVE
+   Enable LibreDrive mode on post-cutoff Pioneer drives.
+
+   Confirmed from Wireshark capture of MakeMKV session:
+   WRITE BUFFER mode=0x02 bufID=0x41 len=0x03 data=A5 AA AA
+   Status: GOOD on post-cutoff drives.
+
+   After this command:
+   - READ BUFFER 0xB0 becomes accessible (H8S/2600 code readable!)
+   - READ BUFFER 0xF4 NAND dump accessible
+   - LibreDrive features enabled for UHD reading
+
+   Usage:
+     drivekit libredrive E
+   ========================================================= */
+static int cmd_libredrive(void)
+{
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR payload[1] = {0}; /* zero length */
+    UCHAR cdb[12] = {0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0, 0, 0};
+    int   st = 0;
+    
+    printf("=== LIBREDRIVE ENABLE ===\n\n");
+    /* GET EVENT STATUS x4 then immediately 0x41 then 0xF4 then 0xB0 */
+    {
+        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
+        int m;
+        for (m = 0; m < 4; m++) {
+            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
+            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
+            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
+        }
+    }
+    send_scsi(g_hDrive, cdb, 12, payload, 0,
+              SCSI_IOCTL_DATA_OUT, sense, &st);
+
+    if (st == 0) {
+        printf("  WRITE BUFFER 0x41 offset=0xA5AAAA: GOOD\n");
+        /* Immediately read 0xF4 then 0xB0 — window is ~5ms! */
+        {
+            UCHAR f4buf[0xA4] = {0};
+            UCHAR f4cdb[10] = {0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
+            UCHAR f4sense[SENSE_SIZE] = {0};
+            int   f4st = 0;
+            send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4,
+                      SCSI_IOCTL_DATA_IN, f4sense, &f4st);
+        }
+        /* Immediately try 0xB0 */
+        {
+            UCHAR b0buf[0xA4] = {0};
+            UCHAR b0cdb[10] = {0x3C,0x02,0xB0,0x50,0,0,0,0,0xA4,0};
+            UCHAR b0sense[SENSE_SIZE] = {0};
+            int   b0st = 0;
+            send_scsi(g_hDrive, b0cdb, 10, b0buf, 0xA4,
+                      SCSI_IOCTL_DATA_IN, b0sense, &b0st);
+            if (b0st == 0) {
+                /* 0xB0 is accessible! Dump as much as possible before window closes */
+                FILE *fp = fopen("libredrive_b0.bin", "wb");
+                DWORD b0offset = 0x500000;
+                DWORD total = 0;
+                printf("  0xB0 ACCESSIBLE! Dumping H8S/2600 kernel to libredrive_b0.bin...\n");
+                printf("  (window is brief — dumping as fast as possible)\n");
+                fflush(stdout);
+                /* Write first chunk we already have */
+                if (fp) fwrite(b0buf, 1, 0xA4, fp);
+                total += 0xA4;
+                /* Keep reading more chunks while window is open */
+                while (1) {
+                    UCHAR chunk[0xA4] = {0};
+                    UCHAR csense[SENSE_SIZE] = {0};
+                    int   cst = 0;
+                    b0offset += 0xA4;
+                    UCHAR ccdb[10] = {0x3C,0x02,0xB0,
+                        (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+                        0,0,0xA4,0};
+                    send_scsi(g_hDrive, ccdb, 10, chunk, 0xA4,
+                              SCSI_IOCTL_DATA_IN, csense, &cst);
+                    if (cst != 0) break; /* window closed */
+                    if (fp) fwrite(chunk, 1, 0xA4, fp);
+                    total += 0xA4;
+                    printf("\r  Dumped 0x%06X bytes...", total);
+                    fflush(stdout);
+                }
+                if (fp) fclose(fp);
+                printf("\n  Total dumped: 0x%06X bytes to libredrive_b0.bin\n\n", total);
+            } else {
+                printf("  0xB0 still locked (key=%02X ASC=%02X)\n\n",
+                       b0sense[2]&0x0F, b0sense[12]);
+            }
+        }
+    } else {
+        printf("  Status  : FAIL (key=%02X ASC=%02X)\n\n",
+               sense[2]&0x0F, sense[12]);
+        printf("  Drive may already be in LibreDrive mode,\n");
+        printf("  or this drive family uses a different sequence.\n\n");
+    }
+
+    return st == 0 ? 0 : 1;
+}
+
 static int cmd_e5test(void)
 {
     UCHAR sense[SENSE_SIZE] = {0};
@@ -3115,6 +3218,29 @@ static void print_drive_info(HANDLE hDrive, const char *path)
                 if (fwdate[0] && fwdate[2] == '/')
                     printf("  FW Date   : %-28s|\n", fwdate);
             }
+            /* AACS version from GET CONFIGURATION feature 0x010D
+               byte [0x0C] = highest AACS version supported */
+            {
+                UCHAR gcbuf[0x20] = {0};
+                UCHAR gccdb[10] = {0x46,0x00,0x01,0x0C,0,0,0,0,0x1C,0};
+                memset(&sx,0,sizeof(sx));
+                sx.sptd.Length=sizeof(SCSI_PASS_THROUGH_DIRECT);
+                sx.sptd.CdbLength=10;
+                sx.sptd.SenseInfoLength=SENSE_SIZE;
+                sx.sptd.DataIn=SCSI_IOCTL_DATA_IN;
+                sx.sptd.DataTransferLength=0x1C;
+                sx.sptd.TimeOutValue=5;
+                sx.sptd.DataBuffer=gcbuf;
+                sx.sptd.SenseInfoOffset=offsetof(SPTD_EX,sense);
+                memcpy(sx.sptd.Cdb,gccdb,10);
+                DeviceIoControl(hDrive,IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                                &sx,sizeof(sx),&sx,sizeof(sx),&br,NULL);
+                if (sx.sptd.ScsiStatus==0 && gcbuf[8]==0x01 && gcbuf[9]==0x0D) {
+                    char aacs[16]={0};
+                    snprintf(aacs,sizeof(aacs),"%d (0x%02X)",gcbuf[0x0C],gcbuf[0x0C]);
+                    printf("  AACS ver  : %-28s|\n", aacs);
+                }
+            }
             printf("  Type      : %-28s|\n",
                    (inq[0]&0x1F)==0x05 ? "CD/DVD/BD optical" :
                    (inq[0]&0x1F)==0x00 ? "Direct-access" : "Other");
@@ -4031,6 +4157,8 @@ static void print_help(void)
     printf("  rawdump       Raw READ BUFFER dump (--bufid 0xxx)\n\n");
     printf("Flashing:\n");
     printf("  unlock        Pioneer service mode unlock (auto session token)\n");
+    printf("  libredrive    Enable LibreDrive on post-cutoff drives\n");
+    printf("                  WRITE BUFFER 0x41 A5 AA AA (from MakeMKV capture)\n");
     printf("  flash         AUTO-DETECT pre/post-cutoff and flash (RECOMMENDED)\n");
     printf("                  --file kernel.bin --file2 normal.bin\n");
     printf("  flashfw       Legacy flash command (use 'flash' instead)\n");
@@ -5762,6 +5890,7 @@ int main(int argc, char *argv[])
         }
     }
     else if (strcmp(cmd, "e5test")      == 0) ret = cmd_e5test();
+    else if (strcmp(cmd, "libredrive")  == 0) ret = cmd_libredrive();
     else if (strcmp(cmd, "kernelmode")  == 0) {
         /* Send BDRFlash-style kernel mode trigger:
            WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
@@ -5800,7 +5929,11 @@ int main(int argc, char *argv[])
             if (cdb[0] == 0x3C || cdb[0] == 0x12 || cdb[0] == 0x03 ||
                 cdb[0] == 0x4A || cdb[0] == 0x46 || cdb[0] == 0x51)
                 direction = SCSI_IOCTL_DATA_IN;
-            build_pioneer_payload_auto(payload);
+            /* For IN commands use empty buffer, for OUT use unlock payload */
+            if (direction == SCSI_IOCTL_DATA_IN)
+                memset(payload, 0, PAYLOAD_SIZE);
+            else
+                build_pioneer_payload_auto(payload);
             {
                 DWORD xfer = 0;
                 if (nc == 6)  xfer = cdb[4];

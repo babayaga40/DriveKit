@@ -345,12 +345,12 @@ year letter (N=2022, O=2023, P=2024...)
 ## Pending Research
 
 - **Pre-cutoff downgrade** — version check in encrypted binary:
-  - ASCII header patch confirmed insufficient
-  - Need kernel modification to remove version check (Billy collaboration pending)
-  - OR LCG seed extraction to re-encrypt firmware with spoofed version bytes
+  - Post-cutoff kernel dump obtained via `libredrive` command (3.5MB, `libredrive_b0.bin`)
+  - MrPenguin disassembling H8S/2600 code to find version check routine
+  - Once found: patch location known, can modify firmware or patch kernel
 - **XD06U post-cutoff downgrade** — same encrypted binary barrier
-- **MrPenguin** — H8S/2600 kernel disassembly for version check location
-- **Trigger keys** — extract from all updater EXEs in firmware archive
+- **Extract trigger keys** from all updater EXEs in firmware archive
+- **BDR-L13SH** (`REC 8C00 ID92`) — unknown drive family, awaiting `0xB0` dump
 
 ---
 
@@ -378,3 +378,81 @@ Research and educational purposes only.
        /__\/__\
    Razor 1911 - Since 1985
 ```
+
+---
+
+## LibreDrive Enable (Post-Cutoff)
+
+**Confirmed working — September 17, 2026**
+
+Discovered from Wireshark capture analysis of MakeMKV session on post-cutoff BDR-XD08U.
+
+### The command
+
+```
+WRITE BUFFER — 12-byte CDB:
+3B 02 41 A5 AA AA 00 00 00 00 00 00
+
+opcode = 0x3B  (WRITE BUFFER)
+mode   = 0x02
+bufID  = 0x41
+offset = 0xA5AAAA  ← this is the KEY (not data!)
+length = 0x000000  ← zero length write
+```
+
+**Critical discovery:** `A5 AA AA` is the BUFFER OFFSET in the CDB, NOT the payload data. Zero-length write to a specific offset acts as the unlock trigger.
+
+### Full sequence (must execute back to back, ~5ms window):
+
+```
+1. GET EVENT STATUS x4 (masks: 0x5A, 0x58, 0x50, 0x40)
+2. WRITE BUFFER 12-byte CDB: 3B 02 41 A5 AA AA 00 00 00 00 00 00
+3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 A4 00  (trigger read)
+4. READ BUFFER  10-byte CDB: 3C 02 B0 50 00 00 00 00 A4 00  (H8S/2600 code!)
+   → Keep reading sequential 0xA4 chunks until window closes
+```
+
+### Result
+
+After this sequence, `READ BUFFER 0xB0` returns H8S/2600 assembly code from the post-cutoff kernel — **3.5MB (0x38031C bytes) dumped** from BDR-XD08U SAT 9331 firmware 1.02.
+
+This dump has been sent to MrPenguin for H8S/2600 disassembly analysis to find the version check that blocks pre-cutoff downgrade.
+
+### DriveKit command
+
+```
+drivekit libredrive E
+```
+
+Automatically executes the full sequence and dumps `libredrive_b0.bin`.
+
+---
+
+## Firmware Date
+
+Firmware date is available in the standard INQUIRY response at byte offset `0x25`:
+
+```
+INQUIRY[0x08-0x0F] = vendor   "PIONEER "
+INQUIRY[0x10-0x1F] = model    "BD-RW  BDR-XD08U"
+INQUIRY[0x20-0x23] = version  "1.02"
+INQUIRY[0x24]      = space
+INQUIRY[0x25-0x2C] = date     "22/12/27"
+```
+
+Confirmed by MrPenguin: `sg_raw -b -r 16384 /dev/sg2 12 00 00 00 60 00 00`
+
+DriveKit displays this as `FW Date` in drive information.
+
+---
+
+## AACS Version
+
+Available from GET CONFIGURATION feature `0x010D` at response byte `[0x0C]`:
+
+```
+CDB: 46 00 01 0C 00 00 00 00 1C 00
+Response[0x0C] = AACS version (e.g. 0x1B = version 27)
+```
+
+DriveKit displays this as `AACS ver` in drive information.

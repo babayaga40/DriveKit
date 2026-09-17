@@ -248,6 +248,7 @@ drivekit <command> <drive_letter> [options]
 | `checkcompat` | Check crossflash compatibility |
 | `sendcdb` | Send raw SCSI CDB |
 | `resetnormal` | Attempt to exit kernel/service mode |
+| `libredrive` | Enable LibreDrive on post-cutoff drives, dumps `0xB0` H8S/2600 code |
 | `xordiff` | XOR two encrypted firmware files to find version bytes |
 | `patchfw` | Patch firmware ASCII header to spoof version |
 
@@ -330,11 +331,12 @@ year letter (N=2022, O=2023, P=2024...)
 
 | ID | Description |
 |----|-------------|
+| `0x41` | LibreDrive enable — zero-length WRITE BUFFER at offset `0xA5AAAA` (12-byte CDB). Opens `0xB0` access window briefly |
 | `0x92` | Drive config + factory calibration |
 | `0xA0` | Model string + unlock key (post-cutoff) / capability data (pre-cutoff) |
-| `0xB0` | H8S/2600 code — readable on pre-cutoff only, used for generation detection |
+| `0xB0` | H8S/2600 kernel code — readable on pre-cutoff in normal mode; on post-cutoff readable only after `libredrive` command. Read sequentially at offset `0x500000` in `0xA4` chunks. 3.5MB dumped from XD08U SAT 9331 |
 | `0xF1` | Drive identity: serial, platform, kernel ID, firmware version |
-| `0xF4` | NAND flash contents (requires service mode) |
+| `0xF4` | NAND flash contents — readable without unlock on post-cutoff drives. MakeMKV reads in sequential `0xA4` chunks |
 | `0xFE` | Kernel/token write target (crossflash protocol) |
 | `0xF0` | Normal firmware write target (both protocols) |
 | `0xFF` | Execution trigger (commit flash to NAND) |

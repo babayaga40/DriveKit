@@ -1645,7 +1645,16 @@ static int cmd_querydriveinfo(void)
 
         printf("  Vendor   : %s\n", vendor);
         printf("  Model    : %s\n", model);
-        printf("  Firmware : %s\n\n", rev);
+        printf("  Firmware : %s\n", rev);
+        /* Firmware date at INQUIRY[0x25] (confirmed MrPenguin) */
+        {
+            char fwdate[16] = {0}; int k;
+            for (k=0; k<8 && inq[0x25+k]>=0x20 && inq[0x25+k]<=0x7E; k++)
+                fwdate[k] = inq[0x25+k];
+            for (k=7; k>=0 && fwdate[k]==' '; k--) fwdate[k]=0;
+            if (fwdate[0] && fwdate[2]=='/') printf("  FW Date  : %s\n", fwdate);
+        }
+        printf("\n");
 
         /* MakeMKV check: (data_buffer[0]&0x1f)!=5 -> not MMC */
         if ((inq[0] & 0x1F) != 5) {
@@ -3095,6 +3104,17 @@ static void print_drive_info(HANDLE hDrive, const char *path)
             printf("  Vendor    : %-28s|\n", vendor);
             printf("  Model     : %-28s|\n", product);
             printf("  Firmware  : %-28s|\n", rev);
+            /* Firmware date at INQUIRY[0x25-0x2C] e.g. "22/12/27" (confirmed MrPenguin) */
+            {
+                char fwdate[16] = {0};
+                int k;
+                for (k = 0; k < 8 && inq[0x25+k] >= 0x20 && inq[0x25+k] <= 0x7E; k++)
+                    fwdate[k] = inq[0x25+k];
+                /* trim trailing spaces */
+                for (k = 7; k >= 0 && fwdate[k] == ' '; k--) fwdate[k] = 0;
+                if (fwdate[0] && fwdate[2] == '/')
+                    printf("  FW Date   : %-28s|\n", fwdate);
+            }
             printf("  Type      : %-28s|\n",
                    (inq[0]&0x1F)==0x05 ? "CD/DVD/BD optical" :
                    (inq[0]&0x1F)==0x00 ? "Direct-access" : "Other");
@@ -4006,6 +4026,7 @@ static void print_help(void)
     printf("  keycheck      Show unlock key for connected drive\n");
     printf("  checkcompat   Check drive against compatibility.json\n");
     printf("  probevendor   Probe vendor opcodes 0xC0-0xFF\n");
+    printf("  probef0       Probe READ BUFFER IDs 0xF0-0xFF (dumps all buffers incl 0xF1)\n");
     printf("  probeb0       Read/decode RS8801 buffer 0xB0\n");
     printf("  rawdump       Raw READ BUFFER dump (--bufid 0xxx)\n\n");
     printf("Flashing:\n");
@@ -5780,19 +5801,31 @@ int main(int argc, char *argv[])
                 cdb[0] == 0x4A || cdb[0] == 0x46 || cdb[0] == 0x51)
                 direction = SCSI_IOCTL_DATA_IN;
             build_pioneer_payload_auto(payload);
-            printf("Sending CDB: ");
-            for(i=0;i<nc;i++) printf("%02X ",cdb[i]); printf("\n");
-            send_scsi(g_hDrive,cdb,nc,payload,0x100,direction,sense,&st);
+            {
+                DWORD xfer = 0;
+                if (nc == 6)  xfer = cdb[4];
+                else if (nc >= 10) xfer = ((DWORD)cdb[6]<<16)|((DWORD)cdb[7]<<8)|cdb[8];
+                if (xfer == 0 || xfer > PAYLOAD_SIZE) xfer = PAYLOAD_SIZE;
+                printf("Sending CDB: ");
+                for(i=0;i<nc;i++) printf("%02X ",cdb[i]); printf("\n");
+                send_scsi(g_hDrive,cdb,nc,payload,xfer,direction,sense,&st);
+            }
             printf("Status: %s",st==0?"GOOD":"FAIL");
             if(st!=0) printf(" key=%02X ASC=%02X",sense[2]&0x0F,sense[12]);
             printf("\n");
             if(st==0 && direction==SCSI_IOCTL_DATA_IN) {
-                printf("Response (first 32 bytes):\n");
-                for(i=0;i<32;i++) {
+                /* Get transfer length from CDB bytes */
+                DWORD show = 0;
+                if (nc == 6)  show = cdb[4];
+                else if (nc >= 10) show = ((DWORD)cdb[6]<<16)|((DWORD)cdb[7]<<8)|cdb[8];
+                if (show == 0 || show > 0x1000) show = 0x100;
+                printf("Response (%lu bytes):\n", show);
+                for(i=0;i<(int)show;i++) {
                     if(i%16==0) printf("  %04X  ",i);
                     printf("%02X ",payload[i]);
                     if(i%16==15) printf("\n");
                 }
+                if(show%16!=0) printf("\n");
             }
         }
         ret=0;

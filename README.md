@@ -248,7 +248,7 @@ drivekit <command> <drive_letter> [options]
 | `checkcompat` | Check crossflash compatibility |
 | `sendcdb` | Send raw SCSI CDB |
 | `resetnormal` | Attempt to exit kernel/service mode |
-| `libredrive` | Enable LibreDrive on post-cutoff drives, dumps `0xB0` H8S/2600 code |
+| `hwdump` | Dump H8S/2600 kernel from RAM via `0xB0` — works on both pre and post-cutoff |
 | `xordiff` | XOR two encrypted firmware files to find version bytes |
 | `patchfw` | Patch firmware ASCII header to spoof version |
 
@@ -331,10 +331,10 @@ year letter (N=2022, O=2023, P=2024...)
 
 | ID | Description |
 |----|-------------|
-| `0x41` | LibreDrive enable — zero-length WRITE BUFFER at offset `0xA5AAAA` (12-byte CDB). Opens `0xB0` access window briefly |
+| `0x41` | H8S/2600 kernel dump enable — zero-length WRITE BUFFER (12-byte CDB). Pre-cutoff: offset `0x00AAAA`. Post-cutoff: offset `0xA5AAAA`. Drive requires power cycle between attempts |
 | `0x92` | Drive config + factory calibration |
 | `0xA0` | Model string + unlock key (post-cutoff) / capability data (pre-cutoff) |
-| `0xB0` | H8S/2600 kernel code — readable on pre-cutoff in normal mode; on post-cutoff readable only after `libredrive` command. Read sequentially at offset `0x500000` in `0xA4` chunks. 3.5MB dumped from XD08U SAT 9331 |
+| `0xB0` | H8S/2600 kernel code running in RAM — decrypted, ready for disassembly. After `hwdump`: read from offset `0x100000` in `0x800` chunks up to absolute limit `0x880800`. Pre-cutoff: 8.7MB dump. Post-cutoff: 7.5MB dump |
 | `0xF1` | Drive identity: serial, platform, kernel ID, firmware version |
 | `0xF4` | NAND flash contents — readable without unlock on post-cutoff drives. MakeMKV reads in sequential `0xA4` chunks |
 | `0xFE` | Kernel/token write target (crossflash protocol) |
@@ -347,7 +347,8 @@ year letter (N=2022, O=2023, P=2024...)
 ## Pending Research
 
 - **Pre-cutoff downgrade** — version check in encrypted binary:
-  - Post-cutoff kernel dump obtained via `libredrive` command (3.5MB, `libredrive_b0.bin`)
+  - Post-cutoff kernel dump: 7.5MB (`hwdump_b0.bin`) via `hwdump` command
+  - Pre-cutoff kernel dump: 8.7MB via `hwdump` command
   - MrPenguin disassembling H8S/2600 code to find version check routine
   - Once found: patch location known, can modify firmware or patch kernel
 - **XD06U post-cutoff downgrade** — same encrypted binary barrier
@@ -358,7 +359,7 @@ year letter (N=2022, O=2023, P=2024...)
 
 ---
 
-## LibreDrive Enable (Post-Cutoff)
+## H8S/2600 Hardware Dump (`hwdump`)
 
 **Confirmed working — September 17, 2026**
 
@@ -373,7 +374,8 @@ WRITE BUFFER — 12-byte CDB:
 opcode = 0x3B  (WRITE BUFFER)
 mode   = 0x02
 bufID  = 0x41
-offset = 0xA5AAAA  ← this is the KEY (not data!)
+offset = 0x00AAAA  ← pre-cutoff offset (not data!)
+offset = 0xA5AAAA  ← post-cutoff offset (not data!)
 length = 0x000000  ← zero length write
 ```
 
@@ -381,27 +383,44 @@ length = 0x000000  ← zero length write
 
 ### Full sequence (must execute back to back, ~5ms window):
 
+**Post-cutoff:**
 ```
 1. GET EVENT STATUS x4 (masks: 0x5A, 0x58, 0x50, 0x40)
-2. WRITE BUFFER 12-byte CDB: 3B 02 41 A5 AA AA 00 00 00 00 00 00
-3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 A4 00  (trigger read)
-4. READ BUFFER  10-byte CDB: 3C 02 B0 50 00 00 00 00 A4 00  (H8S/2600 code!)
-   → Keep reading sequential 0xA4 chunks until window closes
+2. WRITE BUFFER 12-byte CDB: 3B 02 41 A5 AA AA 00 00 00 00 00 00  (offset 0xA5AAAA)
+3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 08 00  (F4 trigger read)
+4. READ BUFFER  10-byte CDB: 3C 02 B0 50 00 00 00 00 08 00  (H8S/2600 from 0x500000)
+   → Keep reading sequential 0x800 chunks until 0x880800
 ```
+
+**Pre-cutoff:**
+```
+1. GET EVENT STATUS x4 (masks: 0x5A, 0x58, 0x50, 0x40)
+2. WRITE BUFFER 12-byte CDB: 3B 02 41 00 AA AA 00 00 00 00 00 00  (offset 0x00AAAA)
+3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 08 00  (F4 trigger read)
+4. READ BUFFER  10-byte CDB: 3C 02 B0 10 00 00 00 00 08 00  (H8S/2600 from 0x100000)
+   → Keep reading sequential 0x800 chunks until 0x880800
+```
+
+**Note:** Drive requires full power cycle between `hwdump` attempts.
+DriveKit auto-detects pre/post-cutoff via INQUIRY date and uses the correct sequence.
 
 ### Result
 
-After this sequence, `READ BUFFER 0xB0` returns H8S/2600 assembly code from the post-cutoff kernel — **3.5MB (0x38031C bytes) dumped** from BDR-XD08U SAT 9331 firmware 1.02.
+After this sequence, `READ BUFFER 0xB0` returns decrypted H8S/2600 assembly code from the running kernel:
+- **Post-cutoff**: 7.5MB (`0x780800` bytes) — reads from `0x500000`, stops at `0x880800`
+- **Pre-cutoff**: 8.7MB — reads from `0x100000`, stops at `0x880800`
+
+Chunk size: `0x800` bytes (2KB). Drive requires **power cycle** between `hwdump` attempts.
 
 This dump has been sent to MrPenguin for H8S/2600 disassembly analysis to find the version check that blocks pre-cutoff downgrade.
 
 ### DriveKit command
 
 ```
-drivekit libredrive E
+drivekit hwdump E
 ```
 
-Automatically executes the full sequence and dumps `libredrive_b0.bin`.
+Automatically executes the full sequence and dumps `hwdump_b0.bin`.
 
 ---
 

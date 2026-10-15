@@ -12,6 +12,8 @@ Reverse engineering was performed through multiple methods:
 
 **Drive firmware:** H8S/2600 assembly analysis of `READ BUFFER 0xB0` dumps (MrPenguin), revealing the rolling XOR stream cipher and the Engineering Mode gating conditions.
 
+**KernelFront cipher:** Reverse engineered by heisenberg — the XOR/rotate cipher protecting Pioneer H8S/2600 kernel files, enabling direct kernel inspection and patching.
+
 ---
 
 ## ⚠️ Risk
@@ -60,6 +62,28 @@ for (uint32_t offset = 0x10000; offset < filesize; offset += 4) {
 // Stored at firmware[0x8000]
 // Date patch at 0x130 is OUTSIDE checksum range — safe to patch!
 ```
+
+**KernelFront cipher (reverse engineered by heisenberg):**
+
+Pioneer kernel files use a per-dword XOR/rotate cipher over the payload body. The key table and encrypted payload are both embedded in the file:
+
+```
+file[0x000:0x200]    — 512-byte ASCII envelope header
+file[0x200:0x1200]   — 1024 × LE DWORD key table
+file[0x1200:0x11200] — 65536-byte encrypted payload (16384 dwords)
+```
+
+Decryption per dword at index `i`:
+```c
+DWORD key = keytable[i % 1024];
+DWORD plaintext = ROR32(ciphertext ^ key, key & 31);
+```
+
+The decoded payload contains:
+- **Generation marker** at dword offset `0xFE` (byte `0`: `0xFF` = old generation, `0x01` = new generation)
+- **Body checksum** at dword offset `0x408` — additive BE32 sum of all body dwords must equal `0x00000000`
+
+Use `decryptkernel --patch` to flip the generation marker `0xFF→0x01` and recompute the checksum automatically.
 
 ---
 
@@ -142,7 +166,7 @@ Sending only the NAND image (0x1E0000) causes commit trigger to fail with `04/4C
 **Pre-cutoff downgrade (pending):**
 - XD08U 1.04 → pre-cutoff 1.01 — blocked by version check in encrypted binary
 - ASCII header patch insufficient — version check reads encrypted payload
-- Pending: kernel modification (Billy collaboration)
+- Pending: kernel modification
 
 ---
 
@@ -227,10 +251,12 @@ drivekit <command> <drive_letter> [options]
 |---|---|
 | `--file name` | Kernel firmware file |
 | `--file2 name` | Normal firmware file |
+| `--file3 name` | Third filename (second normal firmware pass) |
 | `--force` | Skip compatibility checks and interactive prompts |
 | `--nounlock` | Skip unlock step |
 | `--key 0x6123789A` | Override unlock key |
 | `--bufid 0xF4` | Buffer ID for rawdump |
+| `--patch` | Apply generation marker patch (`decryptkernel`) |
 
 ### Commands
 
@@ -251,6 +277,7 @@ drivekit <command> <drive_letter> [options]
 | `hwdump` | Dump H8S/2600 kernel from RAM via `0xB0` — works on both pre and post-cutoff |
 | `xordiff` | XOR two encrypted firmware files to find version bytes |
 | `patchfw` | Patch firmware ASCII header to spoof version |
+| `decryptkernel` | Decode KernelFront XOR/rotate cipher on a Pioneer H8S kernel file; outputs raw plaintext body for IDA analysis. `--patch` additionally flips the generation marker (`0xFF→0x01`) and recomputes the body checksum |
 
 ### flash command (recommended)
 
@@ -283,6 +310,33 @@ drivekit patchfw --file fw_ref.bin --file2 fw_target.bin
 Patches ASCII header bytes in `fw_target` to match `fw_ref` version/date.
 Only patches printable ASCII — binary/crypto regions preserved.
 Output: `fw_target_patched.bin`. No drive needed.
+
+### decryptkernel command
+
+```
+drivekit decryptkernel --file S9331050.100
+drivekit decryptkernel --file S9331050.100 --patch --file2 S9331050_decoded_patched.bin
+```
+
+Decodes the KernelFront XOR/rotate cipher and outputs a flat binary suitable for loading in IDA Pro as H8S/2600 code. `--patch` additionally flips the generation marker byte (`0xFF→0x01`) and recomputes the body checksum. No drive needed.
+
+---
+
+## KernelFront Cipher
+
+Pioneer kernel files (e.g. `S9331050.100`) use a XOR/rotate cipher over the H8S/2600 payload (reverse engineered by heisenberg):
+
+```
+file[0x000:0x200]    — 512-byte ASCII envelope header
+file[0x200:0x1200]   — 1024 × LE DWORD key table
+file[0x1200:0x11200] — 65536-byte encrypted payload (16384 dwords)
+
+decode(ciphertext, key) = ROR32(ciphertext ^ key, key & 31)
+```
+
+Key index wraps: `key = keytable[i % 1024]`
+
+Use `decryptkernel` to produce a flat binary suitable for loading in IDA Pro as H8S/2600 code.
 
 ---
 
@@ -351,6 +405,7 @@ year letter (N=2022, O=2023, P=2024...)
   - Pre-cutoff kernel dump: 8.7MB via `hwdump` command
   - MrPenguin disassembling H8S/2600 code to find version check routine
   - Once found: patch location known, can modify firmware or patch kernel
+  - MattJackson identified kernel patch locations — full set may not yet be fully implemented in `decryptkernel --patch`; cross-reference his code to verify all required patches are covered
 - **XD06U post-cutoff downgrade** — same encrypted binary barrier
 - **Extract trigger keys** from all updater EXEs in firmware archive
 - **BDR-L13SH** (`REC 8C00 ID92`) — unknown drive family, awaiting `0xB0` dump
@@ -456,14 +511,18 @@ DriveKit displays this as `AACS ver` in drive information.
 
 ## Credits
 
+**heisenberg** — KernelFront cipher decryption and analysis; Wireshark capture analysis for SAT 9331; development support and testing throughout. Huge thanks — this tool would not exist without you.
+
+**MattJackson** — Decrypted the kernel file and identified the patch locations required for a successful downgrade below version lock. Shared his code openly and has been invaluable in helping everyone with problems. ([cdrinfo.pl profile](https://forum.cdrinfo.pl/members/112645.html))
+
 **MrPenguin** — H8S/2600 deep firmware analysis, rolling XOR cipher reverse engineering, BDR-S12U pypcode/Ghidra analysis, unlock key endianness clarification, `0xB0` READ BUFFER disassembly, and ongoing technical guidance invaluable throughout this project.
 
 **greg1wto** — provided the tools we needed to perform Wireshark/USBPcap capture analysis, which combined with Pioneer updater reverse engineering made the NAND write protocol analysis possible.
 
-Thank you for the inspiration and help from cxplay, Sayaka, Coopervid, blackened2687, Billy, MakeMKV Forum and cdrinfo.pl
+Thank you for the inspiration and help from cxplay, Sayaka, Coopervid, blackened2687, MakeMKV Forum and cdrinfo.pl
 
 **Special thanks (flash tool community):**
-Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, BillyCar11, asmcom, payalnik23, aliter404
+Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen, ala42, czary2mary, jadburner, cvs, alexx12345, seku, Leman39, wujooj, jurireal, alphaville0527, SnowFox, Kirby, haysey70, Majestic12, elflorek, floppydumper, redwine, cryptojoe3737, TeddyRaspin, asmcom, payalnik23, aliter404
 
 **Tools:** Wireshark + USBPcap, IDA Pro + hrtng plugin, x64dbg, pypcode, Visual Studio 2022, WSL, GCC
 

@@ -11,7 +11,7 @@
  *
  * Commands:
  *   inquiry          Read drive firmware version and identity
- *   libredrive       Probe LibreDrive capability
+ *   hwdump           Dump H8S/2600 kernel from RAM via 0xB0
  *   probef0          Probe READ BUFFER IDs 0xF0-0xFF
  *   rawdump          Raw READ BUFFER dump (use --bufid 0xF4 etc)
  *   unlock           Pioneer RS8801 service mode unlock
@@ -43,7 +43,7 @@
    CONSTANTS
    ========================================================= */
 #define SENSE_SIZE       32
-#define CHUNK_SIZE       0xA4
+#define CHUNK_SIZE       0x0800  /* 2KB — matches drive's actual max transfer per read */
 #define MAX_DUMP_SIZE    0x02000000
 #define PAYLOAD_SIZE     256
 #define VERSION          "1.0"
@@ -66,11 +66,13 @@ static UCHAR   g_unlock_mode  = 0x04;
 static UCHAR   g_unlock_bufid = 0xFF;
 static int     g_force = 0;
 static DWORD   g_key_override = 0; /* 0 = use derived key */
+static int     g_patch_flag   = 0; /* --patch: apply generation marker patch */
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static DWORD   g_maxDumpSize = 0;  /* 0 = no limit */
 static int     g_nounlock = 0;    /* skip unlock step */
 static int     g_pre_cutoff = 0; /* set by cmd_flash when 0xB0 readable */
 static WORD    g_driveID = 0;     /* detected drive ID for trigger key selection */
+static char    g_kernelID[5] = {0}; /* kernel ID string from 0xF1 response (e.g. "9331") */
 static UCHAR   g_payload[PAYLOAD_SIZE]; /* unlock payload buffer — shared across commands */
 static char    g_fw_version[8] = {0}; /* firmware version from target file header */
 static UCHAR   g_bufID     = 0xF4;
@@ -86,12 +88,22 @@ typedef struct PIONEER_DRIVE_S {
     int         cap;
 } PIONEER_DRIVE;
 
+
+/* New and updated FULL key table */
+typedef struct {
+    WORD        platform_id;
+    const char *kernel_id;
+    DWORD       key;
+} PIONEER_KEY;
+
+
 /* =========================================================
    FORWARD DECLARATIONS
    ========================================================= */
 static void  build_pioneer_payload(UCHAR *payload, DWORD key);
 static void  build_pioneer_payload_auto(UCHAR *payload);
 static DWORD pioneer_key(WORD driveID, UCHAR cl);
+static DWORD pioneer_key_lookup(WORD platform_id, const char *kernel_id);
 static const PIONEER_DRIVE * pioneer_lookup(WORD driveID);
 static void  pioneer_serial_decode(const char *serial, char *month_out, char *year_out, char *country_out);
 static void  print_drive_info(HANDLE hDrive, const char *path);
@@ -104,7 +116,12 @@ static int   cmd_flashfw_precut(void);
 static int   cmd_flash(void);
 static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);
-static int   cmd_libredrive(void);
+static int   cmd_hwdump(void);
+static int   cmd_flashinfo(void);
+static int   cmd_dumpfw(void);
+static int   xf_write_buffer(UCHAR mode, UCHAR bufid, DWORD offset,
+                             const UCHAR *data, DWORD len, const char *desc);
+static void  xf_build_trigger(UCHAR *payload, const char *model, DWORD key_le);
 
 /* =========================================================
    UTILITY: memmem for Windows
@@ -459,13 +476,6 @@ static int select_drive_interactive(char *drvOut, size_t drvOutSz)
     }
 }
 
-/* =========================================================
-   PIONEER PAYLOAD BUILDER
-   Builds the 256-byte unlock/trigger payload from live
-   INQUIRY data. Reads vendor+model from the drive itself
-   so it works for any Pioneer drive automatically.
-   key = 0x6123789A for ASUS/OEM drives (default)
-   ========================================================= */
 static int rb_descriptor(UCHAR bufID, DWORD *cap)
 {
     UCHAR cdb[10] = { 0x3C,0x03,bufID,0,0,0,0,0,4,0 };
@@ -537,9 +547,6 @@ static int cmd_inquiry(void)
     return 0;
 }
 
-/* =========================================================
-   COMMAND: libredrive
-   ========================================================= */
 static int cmd_driveinfo2(void)
 {
     UCHAR buf[256], sense[SENSE_SIZE], cdb[12];
@@ -916,41 +923,487 @@ static int cmd_rawdump(void)
     return 0;
 }
 
-
-
-
 /* =========================================================
-   COMMAND: unlock (Pioneer RS8801 service mode)
+   COMMAND: dumpfw
+   Experimental Pioneer firmware read via MODE SENSE(10).
+
+   Captured CDB:
+       5A 08 2A 00 00 00 00 FF F0 00
+
+   The command itself does NOT unlock or alter drive state.
+
+   Observed behavior:
+     - locked/normal state: ordinary 0x2A response, mostly zero
+     - manually unlocked:  extended Pioneer response containing
+                           platform identity and firmware data
+
+   Keep unlock separate while the dump protocol is still being
+   mapped.  Typical research flow:
+
+       drivekit unlock E
+       drivekit dumpfw E --file pioneer_firmware_dump.bin
+
+   This command reads the proven 0xFFF0-byte response, saves it
+   byte-for-byte, and scans its contents.  It does not currently
+   attempt to advance to later firmware windows.
    ========================================================= */
+static int cmd_dumpfw(void)
+{
+    enum { DUMPFW_XFER_SIZE = 0xFFF0 };
+
+    UCHAR cdb[12] = {
+        0x5A, 0x08, 0x2A, 0x00, 0x00, 0x00,
+        0x00, 0xFF, 0xF0, 0x00, 0x00, 0x00
+    };
+
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR *buf = NULL;
+    FILE *fp = NULL;
+    int st = 0;
+    int rc;
+    DWORD i;
+    char fname[256];
+
+    static const char *markers[] = {
+        "PIONEER",
+        "Copyright",
+        "SAT ",
+        "ATA ",
+        "ID",
+        "BDR-",
+        "DVD",
+        "GENERAL"
+    };
+    const int marker_count = sizeof(markers) / sizeof(markers[0]);
+
+    if (g_outFile[0]) {
+        strncpy(fname, g_outFile, sizeof(fname) - 1);
+        fname[sizeof(fname) - 1] = '\0';
+    } else {
+        strcpy(fname, "pioneer_firmware_dump.bin");
+    }
+
+    printf("=== PIONEER FIRMWARE DUMP / CROSSFLASH KERNEL TRIGGER TEST ===\n\n");
+    printf("  Output    : %s\n\n", fname);
+
+    /* Read 0xF1 first to populate g_driveID and g_kernelID */
+    {
+      /*  UCHAR f1[0x30] = {0};
+        UCHAR f1s[SENSE_SIZE] = {0};
+        if (rb_data(0xF1, 0, f1, 0x30, f1s) == 0) {
+            int j; char plat[16] = {0}; char kid[8] = {0};
+            for (j=0; j<12 && f1[0x10+j]>=0x20 && f1[0x10+j]<0x7F; j++) plat[j]=f1[0x10+j];
+            for (j=0; j<8  && f1[0x18+j]>=0x20 && f1[0x18+j]<0x7F; j++) kid[j] =f1[0x18+j];
+            const char *p = plat; while(*p && (*p<'0'||*p>'9')) p++;
+            if (*p) g_driveID = (WORD)strtol(p, NULL, 16);
+                strncpy(g_kernelID, kid, sizeof(g_kernelID)-1);
+            printf("  [DBG] 0xF1: platform='%s' driveID=0x%04X kernel='%s'\n\n",
+                   plat, g_driveID, g_kernelID);
+        } else {
+            printf("  [WARN] 0xF1 read failed — model/key may be wrong\n\n");
+        } */
+    }
+
+    /* -----------------------------------------------------
+       Enter the same kernel/service state used by cmd_crossflash().
+
+       This is deliberately the exact crossflash unlock trigger:
+
+           WRITE BUFFER
+           mode   = 0x04
+           bufID  = 0xFF
+           offset = 0
+           length = 0x100
+
+       Payload is generated by xf_build_trigger() using the same
+       auto-detected model and platform/kernel key as crossflash.
+       No later crossflash steps are performed here.
+       ----------------------------------------------------- */
+    {
+        UCHAR auto_payload[256] = {0};
+        UCHAR trigger[256]      = {0};
+        char  model_str[17]     = {0};
+        const char *model;
+        DWORD key_le;
+        int ust;
+
+        build_pioneer_payload_auto(auto_payload);
+        memcpy(model_str, auto_payload, 16);
+        model_str[16] = 0;
+        model = model_str;
+
+        key_le = ((DWORD)auto_payload[0x10])        |
+                 ((DWORD)auto_payload[0x11] <<  8) |
+                 ((DWORD)auto_payload[0x12] << 16) |
+                 ((DWORD)auto_payload[0x13] << 24);
+
+        if (key_le == 0)
+            key_le = 0x6123789A;
+
+        if (g_key_override)
+            key_le = g_key_override;
+
+        printf("=== CROSSFLASH KERNEL TRIGGER ===\n\n");
+        printf("[1] Unlock trigger (mode=0x04 bufID=0xFF)...\n");
+
+        xf_build_trigger(trigger, model, key_le);
+
+        printf("    Model : '%.16s'\n", model);
+        printf("    Key   : 0x%08lX\n", key_le);
+        printf("    CDB   : 3B 04 FF 00 00 00 00 01 00 00 00 00 (12-byte)\n");
+        printf("    Payload first 20 bytes:");
+        for (i = 0; i < 20; i++)
+            printf(" %02X", trigger[i]);
+        printf("\n");
+
+        ust = xf_write_buffer(0x04, 0xFF, 0,
+                              trigger, 0x100,
+                              "unlock_trigger");
+
+        if (ust != 0) {
+            fprintf(stderr,
+                    "  FAILED: Crossflash kernel trigger rejected by drive.\n");
+            fprintf(stderr,
+                    "  Check model string and platform/kernel key.\n");
+            return 1;
+        }
+
+        printf("    OK\n\n");
+        Sleep(200);
+    }
+
+    /* -----------------------------------------------------
+       Reproduce the exact read-only command sequence observed
+       in BDRFlash immediately before MODE SENSE(10) 0x2A.
+
+       1) READ BUFFER F1, 0x30 bytes
+       2) READ BUFFER A0, offset 0x90, 0x10 bytes
+       3) REQUEST SENSE, 0x12 bytes
+       4) GET CONFIGURATION, RT=01, 0x28 bytes
+       5) MODE SENSE(10) page 0x2A, allocation 0xFFF0
+
+       The crossflash kernel trigger above deliberately establishes
+       the service/kernel state first; this preamble then mirrors
+       the BDRFlash reads immediately before MODE SENSE(10).
+       ----------------------------------------------------- */
+
+    printf("=== BDRFLASH PREAMBLE ===\n\n");
+
+    /* 1. READ BUFFER F1 - identity */
+    {
+        UCHAR pcdb[10] = {
+            0x3C, 0x02, 0xF1, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x30, 0x00
+        };
+        UCHAR pbuf[0x30];
+
+        memset(pbuf, 0, sizeof(pbuf));
+        memset(sense, 0, sizeof(sense));
+        st = 0;
+
+        rc = send_scsi(g_hDrive, pcdb, 10,
+                       pbuf, sizeof(pbuf),
+                       SCSI_IOCTL_DATA_IN,
+                       sense, &st);
+
+        printf("[1] READ BUFFER F1 : ");
+        if (rc == 0 && st == 0) {
+            printf("GOOD\n");
+            printf("    Serial   : '%.12s'\n", (char *)&pbuf[0x00]);
+            printf("    Platform : '%.12s'\n", (char *)&pbuf[0x10]);
+            printf("    Kernel   : '%.4s'\n",  (char *)&pbuf[0x18]);
+        } else {
+            printf("FAIL rc=%d status=%02X sense=%02X/%02X/%02X\n",
+                   rc, st, sense[2] & 0x0F, sense[12], sense[13]);
+        }
+    }
+
+    /* 2. READ BUFFER A0 - model string at offset 0x90 */
+    {
+        UCHAR pcdb[10] = {
+            0x3C, 0x02, 0xA0, 0x00, 0x00,
+            0x90, 0x00, 0x00, 0x10, 0x00
+        };
+        UCHAR pbuf[0x10];
+
+        memset(pbuf, 0, sizeof(pbuf));
+        memset(sense, 0, sizeof(sense));
+        st = 0;
+
+        rc = send_scsi(g_hDrive, pcdb, 10,
+                       pbuf, sizeof(pbuf),
+                       SCSI_IOCTL_DATA_IN,
+                       sense, &st);
+
+        printf("[2] READ BUFFER A0/0x90 : ");
+        if (rc == 0 && st == 0) {
+            printf("GOOD\n");
+            printf("    Model raw: '");
+            for (i = 0; i < sizeof(pbuf); i++) {
+                UCHAR ch = pbuf[i];
+                putchar((ch >= 0x20 && ch <= 0x7E) ? ch : '.');
+            }
+            printf("'\n");
+        } else {
+            printf("FAIL rc=%d status=%02X sense=%02X/%02X/%02X\n",
+                   rc, st, sense[2] & 0x0F, sense[12], sense[13]);
+        }
+    }
+
+    /* 3. REQUEST SENSE */
+    {
+        UCHAR pcdb[6] = {
+            0x03, 0x00, 0x00, 0x00, 0x12, 0x00
+        };
+        UCHAR pbuf[0x12];
+
+        memset(pbuf, 0, sizeof(pbuf));
+        memset(sense, 0, sizeof(sense));
+        st = 0;
+
+        rc = send_scsi(g_hDrive, pcdb, 6,
+                       pbuf, sizeof(pbuf),
+                       SCSI_IOCTL_DATA_IN,
+                       sense, &st);
+
+        printf("[3] REQUEST SENSE : ");
+        if (rc == 0 && st == 0) {
+            printf("GOOD  key=%02X ASC=%02X ASCQ=%02X\n",
+                   pbuf[2] & 0x0F, pbuf[12], pbuf[13]);
+        } else {
+            printf("FAIL rc=%d status=%02X sense=%02X/%02X/%02X\n",
+                   rc, st, sense[2] & 0x0F, sense[12], sense[13]);
+        }
+    }
+
+    /* 4. GET CONFIGURATION - exact BDRFlash CDB */
+    {
+        UCHAR pcdb[10] = {
+            0x46, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x28, 0x00
+        };
+        UCHAR pbuf[0x28];
+
+        memset(pbuf, 0, sizeof(pbuf));
+        memset(sense, 0, sizeof(sense));
+        st = 0;
+
+        rc = send_scsi(g_hDrive, pcdb, 10,
+                       pbuf, sizeof(pbuf),
+                       SCSI_IOCTL_DATA_IN,
+                       sense, &st);
+
+        printf("[4] GET CONFIGURATION : ");
+        if (rc == 0 && st == 0) {
+            printf("GOOD\n");
+        } else {
+            printf("FAIL rc=%d status=%02X sense=%02X/%02X/%02X\n",
+                   rc, st, sense[2] & 0x0F, sense[12], sense[13]);
+        }
+    }
+
+    printf("\n=== EXTENDED MODE SENSE READ ===\n\n");
+    printf("  CDB       : 5A 08 2A 00 00 00 00 FF F0 00 00 00\n");
+    printf("  CDB length: 12 bytes (matches USB BOT bCBWCBLength=0x0C)\n");
+    printf("  Read size : 0x%04X (%u bytes)\n\n",
+           DUMPFW_XFER_SIZE, DUMPFW_XFER_SIZE);
+
+    buf = (UCHAR *)malloc(DUMPFW_XFER_SIZE);
+    if (!buf) {
+        fprintf(stderr, "Cannot allocate dump buffer.\n");
+        return 1;
+    }
+
+    memset(buf, 0, DUMPFW_XFER_SIZE);
+    memset(sense, 0, sizeof(sense));
+    st = 0;
+
+    rc = send_scsi(g_hDrive,
+                   cdb,
+                   12,
+                   buf,
+                   DUMPFW_XFER_SIZE,
+                   SCSI_IOCTL_DATA_IN,
+                   sense,
+                   &st);
+
+    if (rc != 0 || st != 0) {
+        fprintf(stderr,
+                "Firmware dump command failed: "
+                "rc=%d status=%02X sense=%02X/%02X/%02X\n",
+                rc,
+                st,
+                sense[2] & 0x0F,
+                sense[12],
+                sense[13]);
+        free(buf);
+        return 1;
+    }
+
+    printf("  Command   : GOOD\n");
+
+    if (DUMPFW_XFER_SIZE >= 2) {
+        WORD mode_len = ((WORD)buf[0] << 8) | buf[1];
+        DWORD standard_end = (DWORD)mode_len + 2;
+        printf("  MODE SENSE declared length : 0x%04X (%u)\n",
+               mode_len, mode_len);
+        printf("  Standard response end      : 0x%04lX\n",
+               standard_end);
+        printf("  Trailing Pioneer data      : 0x%04lX bytes\n",
+               (standard_end < DUMPFW_XFER_SIZE)
+                   ? (DUMPFW_XFER_SIZE - standard_end)
+                   : 0);
+    }
+
+    printf("  Identity @0x60             : '%.16s'\n\n",
+           (char *)&buf[0x60]);
+
+    fp = fopen(fname, "wb");
+    if (!fp) {
+        fprintf(stderr, "Cannot create %s\n", fname);
+        free(buf);
+        return 1;
+    }
+
+    if (fwrite(buf, 1, DUMPFW_XFER_SIZE, fp) != DUMPFW_XFER_SIZE) {
+        fprintf(stderr, "Error writing %s\n", fname);
+        fclose(fp);
+        free(buf);
+        return 1;
+    }
+
+    fclose(fp);
+    fp = NULL;
+
+    printf("  Saved     : %u bytes (0x%04X)\n",
+           DUMPFW_XFER_SIZE, DUMPFW_XFER_SIZE);
+    printf("  File      : %s\n\n", fname);
+
+    printf("  First 256 bytes:\n");
+
+    for (i = 0; i < 0x100; i += 16) {
+        DWORD j;
+
+        printf("  %04lX  ", i);
+
+        for (j = 0; j < 16; j++)
+            printf("%02X ", buf[i + j]);
+
+        printf(" ");
+
+        for (j = 0; j < 16; j++) {
+            UCHAR ch = buf[i + j];
+            putchar((ch >= 0x20 && ch <= 0x7E) ? ch : '.');
+        }
+
+        printf("\n");
+    }
+
+    printf("\n=== KNOWN MARKERS ===\n\n");
+
+    {
+        int m;
+
+        for (m = 0; m < marker_count; m++) {
+            const char *needle = markers[m];
+            DWORD nlen = (DWORD)strlen(needle);
+            int found = 0;
+
+            for (i = 0; i + nlen <= DUMPFW_XFER_SIZE; i++) {
+                if (memcmp(buf + i, needle, nlen) == 0) {
+                    printf("  %-10s at 0x%04lX\n", needle, i);
+                    found = 1;
+                }
+            }
+
+            if (!found)
+                printf("  %-10s not found\n", needle);
+        }
+    }
+
+    printf("\n=== 0x8000 BOUNDARY CHECK ===\n\n");
+
+    for (i = 0; i < DUMPFW_XFER_SIZE; i += 0x8000) {
+        DWORD j;
+        DWORD show = 64;
+
+        if (i + show > DUMPFW_XFER_SIZE)
+            show = DUMPFW_XFER_SIZE - i;
+
+        printf("  Boundary 0x%04lX:\n", i);
+
+        for (j = 0; j < show; j += 16) {
+            DWORD k;
+
+            printf("    %04lX  ", i + j);
+
+            for (k = 0; k < 16 && j + k < show; k++)
+                printf("%02X ", buf[i + j + k]);
+
+            for (; k < 16; k++)
+                printf("   ");
+
+            printf(" ");
+
+            for (k = 0; k < 16 && j + k < show; k++) {
+                UCHAR ch = buf[i + j + k];
+                putchar((ch >= 0x20 && ch <= 0x7E) ? ch : '.');
+            }
+
+            printf("\n");
+        }
+
+        printf("\n");
+    }
+
+    printf("=== SUMMARY ===\n\n");
+    printf("  BDRFlash preamble reproduced immediately before 0x5A.\n");
+    printf("  Unlock/service mode is still controlled manually.\n");
+    printf("  Saved complete response: %s\n", fname);
+    printf("  Size                   : 0x%04X (%u bytes)\n\n",
+           DUMPFW_XFER_SIZE, DUMPFW_XFER_SIZE);
+
+    free(buf);
+    return 0;
+}
+
 /* Internal model string lookup table */
 static const struct { WORD did; const char *str; } g_mdl_map[] = {
-    { 0x8000, "PIONEER BDR-S07J" },
+    { 0x8000, "PIONEER  BDR-207" },
+    { 0x8130, "PIONEER BDR-XD04" }, /* from BDRFlash IDA */
+    { 0x8211, "PIONEER BDR-TD05" },  /* 8211 -> TD05 per BDRFlash */
     { 0x8221, "PIONEER BDR-XS05" },
     { 0x8231, "PIONEER BDR-XD05" },
     { 0x8232, "PIONEER BDR-XD05" },
-    { 0x8301, "PIONEER BDR-208  " },
-    { 0x8410, "PIONEER BDR-UD02 " },
-    { 0x8490, "PIONEER BDC-UD02 " },
-    { 0x8510, "PIONEER BDR-UD03 " },
-    { 0x8511, "PIONEER BDR-UD03 " },
-    { 0x8600, "PIONEER BDR-209  " },
-    { 0x8601, "PIONEER BDR-209M " },
+    { 0x8291, "PIONEER BDR-TD05" },  /* from BDRFlash IDA */
+    { 0x8420, "PIONEER BDR-US02" },  /* from BDRFlash IDA */
+    { 0x8520, "PIONEER BDR-US03" },  /* from BDRFlash IDA */
+    { 0x8301, "PIONEER  BDR-208" },
+    { 0x8410, "PIONEER BDR-US02" },
+    { 0x8490, "PIONEER BDR-US02" },
+    { 0x8510, "PIONEER BDR-US03" },
+    { 0x8511, "PIONEER BDR-US03" },
+    { 0x8600, "PIONEER  BDR-209" },
+    { 0x8601, "PIONEER  BDR-209" },
     { 0x8721, "PIONEER BDR-XS06 " },
     { 0x8722, "PIONEER BDR-XS06 " },
-    { 0x8800, "PIONEER BDR-211  " },
-    { 0x8801, "PIONEER BDR-BDS5 " },
-    { 0x8A10, "PIONEER BDR-UD04 " },
-    { 0x8B30, "XD05BK2/XV5     " }, /* post-cutoff internal model string */
+    { 0x8800, "PIONEER  BDR-211" },
+    { 0x8801, "PIONEER  BDR-211" },
+    { 0x8A10, "PIONEER BDR-US04" },
+    { 0x8B30, "PIONEER BDR-XS06" }, /* XD06U — confirmed from official updater */
     { 0x8D30, "PIONEER BDR-BDS7 " },
     { 0x8D31, "PIONEER BDR-BDS7 " },
     { 0x8E20, "PIONEER BDR-BDS7 " },
     { 0x8E21, "PIONEER BDR-BDS7 " },
-    { 0x8F00, "PIONEER BDR-212  " },
-    { 0x8F01, "PIONEER BDR-BDS6 " },
+    { 0x8F00, "PIONEER BDR-212T" },
+    { 0x9000, "PIONEER BDR-X12T" },  /* from BDRFlash IDA */
+    { 0x9001, "PIONEER BDR-X12T" },
+    { 0x8F01, "PIONEER BDR-212T" },
     { 0x9330, "PIONEER BDR-BDS8 " },
-    { 0x9330, "BDR-XD08LE      " }, /* internal model on some XD08 variants */
     { 0x9331, "PIONEER BDR-BDS8 " },
     { 0x9400, "PIONEER BDR-X13  " },
+    { 0x9620, "PIONEER BDR-XS08U" },
+    { 0x9621, "PIONEER BDR-XS08U" },
     { 0, NULL }
 };
 
@@ -973,6 +1426,7 @@ static int cmd_unlock(void)
     char  vendor[9]    = {0};
     char  model[17]    = {0};
     char  platform[12] = {0};
+    char  kernelID[5]  = {0};
     char  serial[16]   = {0};
     int   j, i, k, scsiStatus = 0, st = 0;
     DWORD cap = 0;
@@ -1026,20 +1480,17 @@ static int cmd_unlock(void)
     /* Parse 0xF1 for serial/platform */
     for (j=0; j<12 && rb[j]>=0x20&&rb[j]<0x7F; j++) serial[j]   = rb[j];
     for (j=0; j<8  && rb[16+j]>=0x20&&rb[16+j]<0x7F; j++) platform[j] = rb[16+j];
+    for (j=0; j<4  && rb[24+j]>=0x20&&rb[24+j]<0x7F; j++) kernelID[j] = rb[24+j];
     p = platform;
     while (*p && (*p < '0' || *p > '9')) p++;
     if (*p) driveID = (WORD)strtol(p, NULL, 16);
-    unlockKey = pioneer_key(driveID, 0);
+    unlockKey = pioneer_key_lookup(driveID, kernelID);
     if (!unlockKey) unlockKey = 0x6123789A;
     if (g_key_override) unlockKey = g_key_override;
 
-    /* 2c: Build payload */
+    /* 2c: Build payload — always use g_mdl_map, 0xA0 never returns correct model string */
     memset(payload, 0, PAYLOAD_SIZE);
-    if (g_has_token == 2 && g_a0token[0] >= 0x20) {
-        /* Use model string from 0xA0 pre-read */
-        memcpy(payload, g_a0token, 0x10);
-    } else {
-        /* Use g_mdl_map */
+    {
         int mi;
         for (mi = 0; g_mdl_map[mi].did; mi++) {
             if (g_mdl_map[mi].did == driveID) {
@@ -1143,6 +1594,134 @@ static int cmd_unlock(void)
 }
 
 /* =========================================================
+   CMD_HWDUMP
+   Enable hardware dump mode on post-cutoff Pioneer drives.
+
+   Confirmed from Wireshark capture of MakeMKV session:
+   WRITE BUFFER mode=0x02 bufID=0x41 len=0x03 data=A5 AA AA
+   Status: GOOD on post-cutoff drives.
+
+   After this command:
+   - READ BUFFER 0xB0 becomes accessible (H8S/2600 code readable!)
+   - READ BUFFER 0xF4 NAND dump accessible
+   - LibreDrive features enabled for UHD reading
+
+   Usage:
+     drivekit hwdump E
+   ========================================================= */
+static int cmd_hwdump(void)
+{
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR payload[1] = {0}; /* zero length */
+    int   st = 0;
+
+    printf("=== HWDUMP ===\n\n");
+
+    /* Detect pre vs post-cutoff via INQUIRY date at [0x25]
+       BDRFlash cutoff: 22/12/01
+       Pre-cutoff:  offset 0x00AAAA, 0xB0 from 0x100000
+       Post-cutoff: offset 0xA5AAAA, 0xB0 from 0x500000 */
+    int is_pre_cutoff = 1;
+    {
+        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        if (inqst == 0 && inq[0x25] >= 0x20) {
+            char date[9]={0}; int di;
+            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                date[di]=inq[0x25+di];
+            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        }
+        printf("  Generation: %s\n\n",
+               is_pre_cutoff ? "PRE-CUTOFF  (offset 0x00AAAA, 0xB0 from 0x100000)"
+                             : "POST-CUTOFF (offset 0xA5AAAA, 0xB0 from 0x500000)");
+    }
+
+    UCHAR cdb[12] = {0x3B,0x02,0x41,
+                     (UCHAR)(is_pre_cutoff ? 0x00 : 0xA5),0xAA,0xAA,
+                     0,0,0,0,0,0};
+    DWORD b0_start = 0x100000; /* both pre and post-cutoff start at 0x100000 */
+
+    /* GET EVENT STATUS x4 then immediately 0x41 then 0xF4 then 0xB0 */
+    {
+        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
+        int m;
+        for (m = 0; m < 4; m++) {
+            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
+            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
+            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
+        }
+    }
+    send_scsi(g_hDrive, cdb, 12, payload, 0,
+              SCSI_IOCTL_DATA_OUT, sense, &st);
+
+    if (st == 0) {
+        printf("  WRITE BUFFER 0x41 offset=%s: GOOD\n",
+               is_pre_cutoff ? "0x00AAAA" : "0xA5AAAA");
+        /* Immediately read 0xF4 then 0xB0 — window is ~5ms! */
+        {
+            UCHAR f4buf[0xA4] = {0};
+            UCHAR f4cdb[10] = {0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
+            UCHAR f4sense[SENSE_SIZE] = {0};
+            int   f4st = 0;
+            send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4,
+                      SCSI_IOCTL_DATA_IN, f4sense, &f4st);
+        }
+        /* Immediately try 0xB0 */
+        {
+            UCHAR b0buf[CHUNK_SIZE] = {0};
+            UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
+                (UCHAR)(b0_start>>16),(UCHAR)(b0_start>>8),(UCHAR)(b0_start),
+                0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+            UCHAR b0sense[SENSE_SIZE] = {0};
+            int   b0st = 0;
+            send_scsi(g_hDrive, b0cdb, 10, b0buf, CHUNK_SIZE,
+                      SCSI_IOCTL_DATA_IN, b0sense, &b0st);
+            if (b0st == 0) {
+                FILE *fp = fopen("hwdump_b0.bin", "wb");
+                DWORD b0offset = b0_start;
+                DWORD total = 0;
+                printf("  0xB0 ACCESSIBLE! Dumping H8S/2600 kernel to hwdump_b0.bin...\n");
+                printf("  (window is brief — dumping as fast as possible)\n");
+                fflush(stdout);
+                if (fp) fwrite(b0buf, 1, CHUNK_SIZE, fp);
+                total += CHUNK_SIZE;
+                while (1) {
+                    UCHAR chunk[CHUNK_SIZE] = {0};
+                    UCHAR csense[SENSE_SIZE] = {0};
+                    int   cst = 0;
+                    b0offset += CHUNK_SIZE;
+                    UCHAR ccdb[10] = {0x3C,0x02,0xB0,
+                        (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+                        0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+                    send_scsi(g_hDrive, ccdb, 10, chunk, CHUNK_SIZE,
+                              SCSI_IOCTL_DATA_IN, csense, &cst);
+                    if (cst != 0) break;
+                    if (fp) fwrite(chunk, 1, CHUNK_SIZE, fp);
+                    total += CHUNK_SIZE;
+                    printf("\r  Dumped 0x%06X bytes...", total);
+                    fflush(stdout);
+                }
+                if (fp) fclose(fp);
+                printf("\n  Total dumped: 0x%06X bytes to hwdump_b0.bin\n\n", total);
+            } else {
+                printf("  0xB0 still locked (key=%02X ASC=%02X)\n\n",
+                       b0sense[2]&0x0F, b0sense[12]);
+            }
+        }
+    } else {
+        printf("  Status  : FAIL (key=%02X ASC=%02X)\n\n",
+               sense[2]&0x0F, sense[12]);
+        printf("  Drive may already be in hardware dump mode,\n");
+        printf("  or this drive family uses a different sequence.\n\n");
+    }
+
+    return st == 0 ? 0 : 1;
+}
+
+
+
+/* =========================================================
    COMMAND: e5test
    Tests the WRITE BUFFER 0xE5 "Engineering Mode" flag setter
    discovered by MrPenguin in XD08U H8S/2600 disassembly.
@@ -1159,108 +1738,6 @@ static int cmd_unlock(void)
    3. Try WRITE 0xFF with various payloads
    4. Try flashing older firmware
    ========================================================= */
-
-/* =========================================================
-   CMD_LIBREDRIVE
-   Enable LibreDrive mode on post-cutoff Pioneer drives.
-
-   Confirmed from Wireshark capture of MakeMKV session:
-   WRITE BUFFER mode=0x02 bufID=0x41 len=0x03 data=A5 AA AA
-   Status: GOOD on post-cutoff drives.
-
-   After this command:
-   - READ BUFFER 0xB0 becomes accessible (H8S/2600 code readable!)
-   - READ BUFFER 0xF4 NAND dump accessible
-   - LibreDrive features enabled for UHD reading
-
-   Usage:
-     drivekit libredrive E
-   ========================================================= */
-static int cmd_libredrive(void)
-{
-    UCHAR sense[SENSE_SIZE] = {0};
-    UCHAR payload[1] = {0}; /* zero length */
-    UCHAR cdb[12] = {0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0, 0, 0};
-    int   st = 0;
-    
-    printf("=== LIBREDRIVE ENABLE ===\n\n");
-    /* GET EVENT STATUS x4 then immediately 0x41 then 0xF4 then 0xB0 */
-    {
-        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
-        int m;
-        for (m = 0; m < 4; m++) {
-            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
-            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
-            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
-        }
-    }
-    send_scsi(g_hDrive, cdb, 12, payload, 0,
-              SCSI_IOCTL_DATA_OUT, sense, &st);
-
-    if (st == 0) {
-        printf("  WRITE BUFFER 0x41 offset=0xA5AAAA: GOOD\n");
-        /* Immediately read 0xF4 then 0xB0 — window is ~5ms! */
-        {
-            UCHAR f4buf[0xA4] = {0};
-            UCHAR f4cdb[10] = {0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
-            UCHAR f4sense[SENSE_SIZE] = {0};
-            int   f4st = 0;
-            send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4,
-                      SCSI_IOCTL_DATA_IN, f4sense, &f4st);
-        }
-        /* Immediately try 0xB0 */
-        {
-            UCHAR b0buf[0xA4] = {0};
-            UCHAR b0cdb[10] = {0x3C,0x02,0xB0,0x50,0,0,0,0,0xA4,0};
-            UCHAR b0sense[SENSE_SIZE] = {0};
-            int   b0st = 0;
-            send_scsi(g_hDrive, b0cdb, 10, b0buf, 0xA4,
-                      SCSI_IOCTL_DATA_IN, b0sense, &b0st);
-            if (b0st == 0) {
-                /* 0xB0 is accessible! Dump as much as possible before window closes */
-                FILE *fp = fopen("libredrive_b0.bin", "wb");
-                DWORD b0offset = 0x500000;
-                DWORD total = 0;
-                printf("  0xB0 ACCESSIBLE! Dumping H8S/2600 kernel to libredrive_b0.bin...\n");
-                printf("  (window is brief — dumping as fast as possible)\n");
-                fflush(stdout);
-                /* Write first chunk we already have */
-                if (fp) fwrite(b0buf, 1, 0xA4, fp);
-                total += 0xA4;
-                /* Keep reading more chunks while window is open */
-                while (1) {
-                    UCHAR chunk[0xA4] = {0};
-                    UCHAR csense[SENSE_SIZE] = {0};
-                    int   cst = 0;
-                    b0offset += 0xA4;
-                    UCHAR ccdb[10] = {0x3C,0x02,0xB0,
-                        (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
-                        0,0,0xA4,0};
-                    send_scsi(g_hDrive, ccdb, 10, chunk, 0xA4,
-                              SCSI_IOCTL_DATA_IN, csense, &cst);
-                    if (cst != 0) break; /* window closed */
-                    if (fp) fwrite(chunk, 1, 0xA4, fp);
-                    total += 0xA4;
-                    printf("\r  Dumped 0x%06X bytes...", total);
-                    fflush(stdout);
-                }
-                if (fp) fclose(fp);
-                printf("\n  Total dumped: 0x%06X bytes to libredrive_b0.bin\n\n", total);
-            } else {
-                printf("  0xB0 still locked (key=%02X ASC=%02X)\n\n",
-                       b0sense[2]&0x0F, b0sense[12]);
-            }
-        }
-    } else {
-        printf("  Status  : FAIL (key=%02X ASC=%02X)\n\n",
-               sense[2]&0x0F, sense[12]);
-        printf("  Drive may already be in LibreDrive mode,\n");
-        printf("  or this drive family uses a different sequence.\n\n");
-    }
-
-    return st == 0 ? 0 : 1;
-}
-
 static int cmd_e5test(void)
 {
     UCHAR sense[SENSE_SIZE] = {0};
@@ -1391,33 +1868,6 @@ static int cmd_probevendor(void)
     return 0;
 }
 
-/* =========================================================
-   COMMAND: mt1959 - HLDS/LG MediaTek MT1959 probe
-   Identifies the drive, checks LibreDrive feature 0x0113,
-   probes the HIT vendor command 0xE7, dumps READ BUFFER
-   regions and checks ARM reset vector for IDA analysis.
-   ========================================================= */
-/* =========================================================
-   COMMAND: discstruct
-   READ DISC STRUCTURE (opcode 0xAD)
-   Ported from MakeMKV QueryDiscStructure to plain C SPTI.
-
-   Usage:
-     drivekit discstruct G
-     drivekit discstruct G --code 0x0001
-     drivekit discstruct G --code 0x0000 --file struct.bin
-
-   Common structure codes:
-     0x0000  Physical format information (layer 0)
-     0x0001  Physical format information (layer 1)
-     0x0004  Disc manufacturing information
-     0x0008  Copyright information
-     0x0009  Disc key
-     0x000C  BCA (Burst Cutting Area)
-     0x000E  Disc definition structure
-     0x0100  BD disc structure
-     0x0200  HD DVD structure
-   ========================================================= */
 /* =========================================================
    COMMAND: discinfo
    Reads and parses BD/DVD disc information from standard
@@ -1627,20 +2077,6 @@ static int cmd_discinfo(void)
     printf("\n");
     return 0;
 }
-
-/* =========================================================
-   COMMAND: driveinfo
-   Ported from MakeMKV QueryDriveInfo() in stdquery.cpp.
-
-   Queries full drive identity via INQUIRY then iterates
-   ALL MMC feature descriptors via GET CONFIGURATION
-   (opcode 0x46) in a loop until exhausted - exactly as
-   MakeMKV does when it first opens a drive.
-
-   Usage:
-     drivekit driveinfo G
-     drivekit driveinfo G --file features.bin
-   ========================================================= */
 
 /* Feature code names - covers all defined MMC features */
 static const char *feature_name(WORD code)
@@ -2328,108 +2764,83 @@ static void build_pioneer_payload(UCHAR *payload, DWORD key)
     payload[0x13] = (UCHAR)(key>>24);
 }
 
-static void build_pioneer_payload_auto(UCHAR *payload)
+ static void build_pioneer_payload_auto(UCHAR *payload)
 {
-    UCHAR rb[0x30];
-    UCHAR sense[SENSE_SIZE];
-    DWORD key = 0x6123789A;
     WORD  driveID = 0;
-    char  tmp[5] = {0};
     char  platform[16] = {0};
-    int   ti;
-    const char *p;
+    char  kernelID[5] = {0};
+    int   k;
 
-    /* Try 0xA0 FIRST before 0xF1 — post-cutoff drives return model+key from 0xA0
-       but 0xF1 may trigger kernel mode on post-cutoff drives! */
+    /* Clear payload */
+    memset(payload, 0, 256);
+
+    /* READ BUFFER 0xF1 layout:
+       +0x10 = platform string, e.g. "SAT 9331ID05"
+       +0x18 = kernel ID, e.g. "ID05" */
     {
-        UCHAR a0buf[0x100] = {0};
-        UCHAR a0sense[SENSE_SIZE];
-        UCHAR a0cdb[10] = {0x3C,0x02,0xA0,0,0,0x90,0,0,0x10,0};
-        int a0st = 0;
-        /* Request 0x10 bytes but provide 0x100 buffer — drive returns key at 0x10-0x13 */
-        send_scsi(g_hDrive, a0cdb, 10, a0buf, 0x100,
-                  SCSI_IOCTL_DATA_IN, a0sense, &a0st);
-        if (a0st == 0 && a0buf[0] >= 0x20) {
-            memcpy(payload, a0buf, 0x14);
-            /* Override internal model strings with correct trigger strings */
-            if (memcmp(payload, "BDR-XD08LE", 10) == 0 ||
-                memcmp(payload, "BDR-XD08  ", 10) == 0) {
-                memcpy(payload, "PIONEER BDR-BDS8", 16);
-                printf("  [DBG] Overriding XD08LE -> PIONEER BDR-BDS8\n");
-            }
-            printf("  [DBG] Using 0xA0: %.16s key=%02X%02X%02X%02X\n",
-                   (char*)payload,
-                   payload[0x10],payload[0x11],payload[0x12],payload[0x13]);
-            /* If key is zero, use derived key from actual driveID */
-            if (payload[0x10]==0 && payload[0x11]==0 && 
-                payload[0x12]==0 && payload[0x13]==0) {
-                /* Read driveID from 0xF1 platform string */
-                UCHAR f1buf[48] = {0};
-                UCHAR f1sense[SENSE_SIZE];
-                WORD did = 0x8B30; /* fallback */
-                if (rb_data(0xF1, 0, f1buf, 48, f1sense) == 0) {
-                    char plat[16] = {0};
-                    int k;
-                    for (k=0; k<12 && f1buf[0x10+k]>=0x20 && f1buf[0x10+k]<0x7F; k++)
-                        plat[k] = f1buf[0x10+k];
-                    if      (strstr(plat,"9331")) did = 0x9331;
-                    else if (strstr(plat,"9330")) did = 0x9330;
-                    else if (strstr(plat,"8D31")) did = 0x8D31;
-                    else if (strstr(plat,"8D30")) did = 0x8D30;
-                    else if (strstr(plat,"8B30")) did = 0x8B30;
-                }
-                DWORD k = pioneer_key(did, 0);
-                if (!k) k = 0x6123789A;
-                payload[0x10]=(UCHAR)(k>> 0);
-                payload[0x11]=(UCHAR)(k>> 8);
-                payload[0x12]=(UCHAR)(k>>16);
-                payload[0x13]=(UCHAR)(k>>24);
-                printf("  [DBG] Key was zero, using derived 0x%08lX\n", k);
-            }
-            return;
+        UCHAR f1buf[0x30] = {0};
+        UCHAR f1sense[SENSE_SIZE];
+
+        if (rb_data(0xF1, 0, f1buf, 0x30, f1sense) == 0) {
+            for (k = 0;
+                 k < 12 && f1buf[0x10 + k] >= 0x20 && f1buf[0x10 + k] < 0x7F;
+                 k++)
+                platform[k] = (char)f1buf[0x10 + k];
+
+            /* The new key table uses the first four kernel characters. */
+            for (k = 0;
+                 k < 4 && f1buf[0x18 + k] >= 0x20 && f1buf[0x18 + k] < 0x7F;
+                 k++)
+                kernelID[k] = (char)f1buf[0x18 + k];
         }
     }
 
-    memset(rb, 0, sizeof(rb));
-    if (rb_data(0xF1, 0, rb, 0x30, sense) == 0) {
-        /* Copy platform string properly with null termination */
-        {
-            int k;
-            for (k=0; k<12 && rb[0x10+k]>=0x20 && rb[0x10+k]<0x7F; k++)
-                platform[k] = rb[0x10+k];
-            platform[k] = 0;
-        }
-        
-        p = platform;
-        while (*p && !(*p>='0'&&*p<='9')) p++;
-        for (ti=0; ti<4 && p[ti] && ((p[ti]>='0'&&p[ti]<='9')||(p[ti]>='A'&&p[ti]<='F')||(p[ti]>='a'&&p[ti]<='f')); ti++)
-            tmp[ti] = p[ti];
-        driveID = (WORD)strtol(tmp, NULL, 16);
-        if (driveID == 0 || driveID < 0x8000) {
-            if      (strstr(platform,"8231")) driveID = 0x8231;
-            else if (strstr(platform,"8232")) driveID = 0x8232;
-            else if (strstr(platform,"8801")) driveID = 0x8801;
-            else if (strstr(platform,"8800")) driveID = 0x8800;
-            else if (strstr(platform,"8D30")) driveID = 0x8D30;
-            else if (strstr(platform,"8D31")) driveID = 0x8D31;
-            else if (strstr(platform,"8B30")) driveID = 0x8B30;
-            else if (strstr(platform,"8F00")) driveID = 0x8F00;
-            else if (strstr(platform,"8F01")) driveID = 0x8F01;
-            else if (strstr(platform,"9000")) driveID = 0x9000;
-            else if (strstr(platform,"9001")) driveID = 0x9001;
-            else if (strstr(platform,"9330")) driveID = 0x9330;
-            else if (strstr(platform,"9331")) driveID = 0x9331;
-            else if (strstr(platform,"9200")) driveID = 0x9200;
-            else if (strstr(platform,"9201")) driveID = 0x9201;
-            else if (strstr(platform,"9400")) driveID = 0x9400;
-            else if (strstr(platform,"9401")) driveID = 0x9401;
-        }
-        if (driveID) {
-            DWORD derived = pioneer_key(driveID, 0);
-            if (derived) key = derived;
+    /* Extract hex drive/platform ID, e.g. "SAT 9331ID05" -> 0x9331. */
+    {
+        const char *p = platform;
+        while (*p && (*p < '0' || *p > '9'))
+            p++;
+        if (*p)
+            driveID = (WORD)strtol(p, NULL, 16);
+    }
+
+    g_driveID = driveID;
+
+    printf("  [DBG] Platform: %s DriveID: 0x%04X Kernel: %s\n",
+           platform, driveID, kernelID[0] ? kernelID : "(none)");
+
+    /* Look up internal model string from g_mdl_map. */
+    if (driveID) {
+        int mi;
+        for (mi = 0; g_mdl_map[mi].did; mi++) {
+            if (g_mdl_map[mi].did == driveID) {
+                memset(payload, 0x20, 16);
+                strncpy((char *)payload, g_mdl_map[mi].str, 16);
+                printf("  [DBG] Model from g_mdl_map[0x%04X]: %.16s\n",
+                       driveID, (char *)payload);
+                break;
+            }
         }
     }
-    build_pioneer_payload(payload, key);
+
+    if (payload[0] == 0) {
+        memcpy(payload, "PIONEER BDR     ", 16);
+        printf("  [DBG] Drive 0x%04X not in g_mdl_map, using generic\n",
+               driveID);
+    }
+
+    /* Single source of truth: platform ID + kernel ID -> key table. */
+    {
+        DWORD dk = pioneer_key_lookup(driveID, kernelID);
+
+        payload[0x10] = (UCHAR)(dk >>  0);
+        payload[0x11] = (UCHAR)(dk >>  8);
+        payload[0x12] = (UCHAR)(dk >> 16);
+        payload[0x13] = (UCHAR)(dk >> 24);
+
+        printf("  [DBG] Key: 0x%08lX (platform 0x%04X / kernel %s)\n",
+               dk, driveID, kernelID[0] ? kernelID : "(none)");
+    }
 }
 
 static int cmd_modelcheck(void)
@@ -2617,7 +3028,7 @@ static const VENDOR_KEY g_vendor_keys[] = {
     { "ACER    ", 0xD3604201, "Acer variant"     },
     { "ARIMA   ", 0xB0000011, "Arima variant"    },
     { "ON MEDI", 0x86EDA2D1,  "On Media"        },
-    { "SONY TD ", 0x0DFD63A8, "Sony TD"          },
+    { "SONY TD ", 0x0DFD63AD, "Sony TD"          },
     { "_LN    ", 0xF65EE49C, "Lenovo"            },
     { "ATAP IOD", 0xB0000015, "ATAPI IODA"       },
     { "IBIA TOS", 0xB0000009, "Toshiba IBI"      },
@@ -2646,6 +3057,9 @@ static const VENDOR_KEY g_vendor_keys[] = {
    Cross-referenced against BDRFlash drive table
    and sub_40F2A8 branches.                              */
 
+#if 0
+/* ARCHIVED: old hard-coded tkey research.
+   Do not use for active key selection; pioneer_keys[] is authoritative. */
 /* Trigger key table — from updater dword_5D4B38[index=0]
    Keyed by driveID + target firmware version string
    Add new entries as updaters are analyzed with extract_keys.py */
@@ -2660,7 +3074,7 @@ static const struct {
     { 0x9330, "1.02", 0x3A932579 }, /* BDR-XD08  SAT9330 1.02 */
     { 0x9331, "1.02", 0xC4C1F37F }, /* BDR-XD08U SAT9331 1.02 */
     { 0x9331, "1.04", 0x552F4FA4 }, /* BDR-XD08U SAT9331 1.04 */
-    { 0,      "",     0x641E47BD }, /* default fallback */
+    { 0,      "",     0x6123789A }, /* universal fallback */
 };
 
 static DWORD tkey_lookup(WORD driveID) {
@@ -2675,8 +3089,9 @@ static DWORD tkey_lookup(WORD driveID) {
     for (i = 0; g_tkey_map[i].driveID; i++)
         if (g_tkey_map[i].driveID == driveID)
             return g_tkey_map[i].tkey;
-    return 0x641E47BD; /* final fallback */
+    return 0x6123789A; /* universal fallback */
 }
+#endif
 
 static DWORD pioneer_key(WORD driveID, UCHAR cl)
 {
@@ -2689,8 +3104,10 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     case 0x8211: return 0xC2DAB751;
     /* BDR-XD05 pre-cutoff */
     case 0x8221:
-    case 0x8231: return 0x6123789A; /* uses default key */
-    /* BDR-XD05 post-cutoff (2232 variant) - key found in BDR-XD05BKXL2 updater.exe */
+    case 0x8231: return 0x6123789A; /* XD05 SAT8231 — default key */
+    /* BDR-XD05 SAT8232 — kernel-ID specific keys from BDRFlash IDA:
+       ID32 → 0xBE4B8754, ID34 → 0xBD4B8754, ID69 → 0xDE59883C
+       Using ID32 key as default (most common) */
     case 0x8232: return 0xBE4B8754;
     /* BDR-US02 */
     case 0x8410:
@@ -2709,6 +3126,8 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     case 0x8721:
     case 0x8722:
     case 0x8B30: return 0x08A98AF2; /* XD06U — post-cutoff key from updater.exe */
+    case 0x8D30: return 0x72C07157; /* XD07  SAT8D30 — confirmed from Wireshark capture */
+    case 0x8D31: return 0x72C07157; /* XD07U SAT8D31 — same platform */
     /* BDR-XD06U post-cutoff — key from BDR-XD06J-UHD updater.exe */
     case 0x8B31: return 0x08A98AF2;
     /* BDR-211M  <- your drive (rebranded, uses ASUS key) */
@@ -2728,6 +3147,8 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     /* BDR-BDS8 */
     case 0x9330: return 0xAA475E15; /* XD08  SAT9330 — from XD08 updater */
     case 0x9331: return 0x552F4FA4; /* XD08U SAT9331 — from XD08U 1.02 updater */
+    case 0x9620: return 0x6123789A; /* BDR-XS08U — unknown, using universal */
+    case 0x9621: return 0x6123789A; /* BDR-XS08U variant */
     /* BDR-213T */
     case 0x9200:
     case 0x9201: return 0x6123789A;
@@ -2745,6 +3166,468 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     }
     (void)cl;
 }
+
+static const PIONEER_KEY pioneer_keys[] =
+{
+    /* platform 0x1000 */
+    { 0x1000, "GENE", 0xE98F6A5B },
+    { 0x1000, "PLAY", 0xC1B2D3A2 },
+    { 0x1000, "SONY", 0x03B2D22F },
+
+    /* platform 0x1003 */
+    { 0x1003, "GENE", 0x656DC5AE },
+    { 0x1003, "ID58", 0x0147131B },
+    { 0x1003, "ASUS", 0xEEBE8891 },
+    { 0x1003, "ID66", 0xD7FA4BB2 },
+    { 0x1003, "OEM_", 0x5F3924CA },
+    { 0x1003, "LCSH", 0x6123789A },
+    { 0x1003, "PIO_", 0xC23AD8B9 },
+
+    /* platform 0x1005 */
+    { 0x1005, "ID68", 0x5F3924CA },
+    { 0x1005, "ID70", 0x8145145B },
+    { 0x1005, "ID92", 0x6123789A },
+    { 0x1005, "ID69", 0x55B7DAC2 },
+    { 0x1005, "GENE", 0x656DC5AE },
+
+    /* platform 0x1007 */
+    { 0x1007, "ID61", 0xBF4014BE },
+    { 0x1007, "ID60", 0xBC17DF2E },
+    { 0x1007, "ID64", 0x41987D64 },
+    { 0x1007, "ID67", 0x67809B56 },
+
+    /* platform 0x1010 */
+    { 0x1010, "ID01", 0x6123789A },
+    { 0x1010, "GENE", 0x6123789A },
+
+    /* platform 0x1011 */
+    { 0x1011, "ID01", 0xFF9FE1A2 },
+    { 0x1011, "ID09", 0x6123789A },
+
+    /* platform 0x1013 */
+    { 0x1013, "ID02", 0x6123789A },
+
+    /* platform 0x1014 */
+    { 0x1014, "ID43", 0x9522F716 },
+    { 0x1014, "ID52", 0x588FFF81 },
+    { 0x1014, "ID92", 0x6123789A },
+    { 0x1014, "GENE", 0x440652FC },
+    { 0x1014, "OEM_", 0x7363485B },
+    { 0x1014, "ID17", 0x895F5DF4 },
+
+    /* platform 0x1027 */
+    { 0x1027, "ID72", 0x6123789A },
+    { 0x1027, "ID01", 0x6123789A },
+    { 0x1027, "ID52", 0x6123789A },
+    { 0x1027, "ID59", 0x6123789A },
+    { 0x1027, "GENE", 0x6123789A },
+    { 0x1027, "ID09", 0x6123789A },
+
+    /* platform 0x1028 */
+    { 0x1028, "ID33", 0x6123789A },
+    { 0x1028, "ID90", 0x6123789A },
+    { 0x1028, "ID01", 0x6123789A },
+
+    /* platform 0x1030 */
+    { 0x1030, "ID43", 0xE7AF8111 },
+    { 0x1030, "ID61", 0x042793FF },
+    { 0x1030, "ID20", 0x931DD801 },
+    { 0x1030, "ID60", 0x53577D5C },
+    { 0x1030, "ID71", 0x6123789A },
+    { 0x1030, "ID52", 0xC72448EB },
+    { 0x1030, "ID58", 0x0A348709 },
+    { 0x1030, "ID75", 0x86323189 },
+    { 0x1030, "ID76", 0x16014250 },
+    { 0x1030, "GENE", 0x8DDC65A9 },
+    { 0x1030, "OEM_", 0x015AECDB },
+
+    /* platform 0x1031 */
+    { 0x1031, "ID79", 0x56155524 },
+    { 0x1031, "GENE", 0x6123789A },
+    { 0x1031, "ID61", 0x6123789A },
+
+    /* platform 0x1032 */
+    { 0x1032, "ID92", 0x6123789A },
+
+    /* platform 0x1034 */
+    { 0x1034, "ID58", 0x5CCB06A9 },
+    { 0x1034, "GENE", 0x928AAAD0 },
+    { 0x1034, "ID52", 0x894ABE6C },
+
+    /* platform 0x1040 */
+    { 0x1040, "ID84", 0xF0B8D560 },
+    { 0x1040, "ID72", 0xFCC444B9 },
+    { 0x1040, "ID01", 0x70557D9C },
+    { 0x1040, "ID41", 0x06189378 },
+    { 0x1040, "ID73", 0x2B9A1128 },
+    { 0x1040, "ID74", 0x300DBEDF },
+    { 0x1040, "ID19", 0x797DD2C6 },
+    { 0x1040, "ID75", 0x9860F0D7 },
+    { 0x1040, "ID78", 0x3E648C59 },
+    { 0x1040, "ID79", 0xCD75D648 },
+    { 0x1040, "GENE", 0x4E7C283C },
+
+    /* platform 0x1041 */
+    { 0x1041, "ID01", 0xD1E5B2EB },
+
+    /* platform 0x1046 */
+    { 0x1046, "ID19", 0xE611A516 },
+    { 0x1046, "GENE", 0xEC0F1689 },
+    { 0x1046, "ID24", 0x8C25F3D7 },
+
+    /* platform 0x1050 */
+    { 0x1050, "ID19", 0xEFBA9BFC },
+    { 0x1050, "GENE", 0xE35349E4 },
+
+    /* platform 0x1051 */
+    { 0x1051, "ID01", 0x8EB83545 },
+
+    /* BDR-207 */
+    { 0x8000, "ID24", 0x986378B6 },
+    { 0x8000, "ID81", 0x2B802BCF },
+    { 0x8000, "ID61", 0x2B802BCF },
+    { 0x8000, "ID71", 0x6123789A },
+    { 0x8000, "ID60", 0x6D557535 },
+    { 0x8000, "ID82", 0x0A2A40F4 },
+    { 0x8000, "ID52", 0xC41C9377 },
+    { 0x8000, "ID43", 0xA0341B78 },
+    { 0x8000, "ID73", 0x12E70655 },
+    { 0x8000, "ID58", 0x159D656C },
+    { 0x8000, "ID76", 0xD04C126C },
+    { 0x8000, "ID86", 0x2BACEC6C },
+    { 0x8000, "ID74", 0x922B7531 },
+    { 0x8000, "ID79", 0xB67C887C },
+    { 0x8000, "ID88", 0x60347C59 },
+    { 0x8000, "ID89", 0x94050BC8 },
+    { 0x8000, "GENE", 0xB3FB8F90 },
+
+    /* platform 0x8130 */
+    { 0x8130, "ID69", 0xDD59883C },
+    { 0x8130, "GENE", 0xC9C89138 },
+    { 0x8130, "ID52", 0x27746AAF },
+
+    /* BDR-TD05 */
+    { 0x8211, "ID23", 0x0BC7F2A6 },
+    { 0x8211, "ID01", 0x46993520 },
+    { 0x8211, "ID72", 0x6A390DB5 },
+    { 0x8211, "ID20", 0x6123789A },
+    { 0x8211, "ID84", 0xCC1536D5 },
+    { 0x8211, "ID74", 0x8F4351C6 },
+    { 0x8211, "ID09", 0x6123789A },
+    { 0x8211, "GENE", 0x23206FB1 },
+
+    /* BDR-XD05 pre-cutoff */
+    { 0x8221, "ID69", 0xDF59883C },
+    { 0x8221, "GENE", 0x6B3CA458 },
+    { 0x8221, "ID25", 0x8686459F },
+
+    /* BDR-XD05 pre-cutoff */
+    { 0x8231, "ID35", 0xBC4B8754 },
+    { 0x8231, "ID32", 0xBE4B8754 },
+    { 0x8231, "ID34", 0xBD4B8754 },
+    { 0x8231, "ID69", 0xDE59883C },
+    { 0x8231, "GENE", 0xCAC89138 },
+
+    /* BDR-XD05 post-cutoff / 2232 variant */
+    { 0x8232, "ID35", 0xBC4B8754 },
+    { 0x8232, "ID32", 0xBE4B8754 },
+    { 0x8232, "ID34", 0xBD4B8754 },
+    { 0x8232, "ID69", 0xDE59883C },
+    { 0x8232, "GENE", 0xCAC89138 },
+
+    /* platform 0x8291 */
+    { 0x8291, "ID01", 0xD0049AB2 },
+
+    /* platform 0x8301 */
+    { 0x8301, "ID81", 0x66E133E6 },
+    { 0x8301, "ID60", 0x20B42DB4 },
+    { 0x8301, "ID20", 0xCAE19F71 },
+    { 0x8301, "ID61", 0xD1C34901 },
+    { 0x8301, "ID71", 0x53C22F09 },
+    { 0x8301, "ID43", 0x490A87AA },
+    { 0x8301, "ID52", 0xE84DA45D },
+    { 0x8301, "ID58", 0x03D98695 },
+    { 0x8301, "GENE", 0x688BF58E },
+
+    /* platform 0x8410 */
+    { 0x8410, "ID84", 0x7DE0CFE5 },
+    { 0x8410, "ID01", 0x8591188F },
+    { 0x8410, "ID23", 0xB2F980DF },
+    { 0x8410, "ID19", 0x79E22013 },
+    { 0x8410, "GENE", 0xDD1B8ECB },
+
+    /* platform 0x8420 */
+    { 0x8420, "ID02", 0x86AAF57E },
+    { 0x8420, "GENE", 0x460EDD35 },
+
+    /* platform 0x8490 */
+    { 0x8490, "ID23", 0x9FDF5C5C },
+    { 0x8490, "ID84", 0x62BA1F65 },
+    { 0x8490, "ID01", 0x8E3E0AFC },
+
+    /* platform 0x8510 */
+    { 0x8510, "ID26", 0x86CFCC88 },
+    { 0x8510, "ID22", 0xF7FBF820 },
+    { 0x8510, "ID84", 0x24B23015 },
+    { 0x8510, "ID19", 0x6A410A9B },
+    { 0x8510, "GENE", 0x87A62C65 },
+
+    /* platform 0x8511 */
+    { 0x8511, "ID26", 0x86CFCC88 },
+    { 0x8511, "ID22", 0xF7FBF820 },
+    { 0x8511, "ID84", 0x24B23015 },
+    { 0x8511, "ID19", 0x6A410A9B },
+    { 0x8511, "GENE", 0x87A62C65 },
+
+    /* platform 0x8520 */
+    { 0x8520, "ID69", 0x446875C8 },
+    { 0x8520, "GENE", 0xD455BCB1 },
+    { 0x8520, "ID02", 0x0145962B },
+
+    /* platform 0x8590 */
+    { 0x8590, "ID22", 0xC1BE2212 },
+
+    /* platform 0x8591 */
+    { 0x8591, "ID22", 0xC1BE2212 },
+
+    /* platform 0x8600 */
+    { 0x8600, "ID72", 0x80847AFA },
+    { 0x8600, "ID61", 0xB7E4F43E },
+    { 0x8600, "ID20", 0x7336B3DC },
+    { 0x8600, "ID60", 0x4BE1E094 },
+    { 0x8600, "ID81", 0x82FB6A59 },
+    { 0x8600, "ID52", 0x2FABA571 },
+    { 0x8600, "ID71", 0x72C94CC2 },
+    { 0x8600, "ID75", 0x1B5E0309 },
+    { 0x8600, "ID43", 0xCE1F2B98 },
+    { 0x8600, "ID44", 0x32F5F0E7 },
+    { 0x8600, "ID13", 0xD8555B03 },
+    { 0x8600, "ID58", 0x93816CD1 },
+    { 0x8600, "GENE", 0xB025BEB8 },
+    { 0x8600, "ID76", 0xA3E8E1DC },
+
+    /* platform 0x8601 */
+    { 0x8601, "ID72", 0x80847AFA },
+    { 0x8601, "ID61", 0xB7E4F43E },
+    { 0x8601, "ID20", 0x7336B3DC },
+    { 0x8601, "ID60", 0x4BE1E094 },
+    { 0x8601, "ID81", 0x82FB6A59 },
+    { 0x8601, "ID52", 0x2FABA571 },
+    { 0x8601, "ID71", 0x72C94CC2 },
+    { 0x8601, "ID75", 0x1B5E0309 },
+    { 0x8601, "ID43", 0xCE1F2B98 },
+    { 0x8601, "ID44", 0x32F5F0E7 },
+    { 0x8601, "ID13", 0xD8555B03 },
+    { 0x8601, "ID58", 0x93816CD1 },
+    { 0x8601, "GENE", 0xB025BEB8 },
+    { 0x8601, "ID76", 0xA3E8E1DC },
+
+    /* platform 0x8680 */
+    { 0x8680, "ID79", 0x9C4CB347 },
+
+    /* platform 0x8721 */
+    { 0x8721, "ID03", 0x20C253FE },
+    { 0x8721, "ID02", 0x19C253FE },
+    { 0x8721, "ID69", 0xE059883C },
+    { 0x8721, "GENE", 0x6C3CA458 },
+
+    /* platform 0x8722 */
+    { 0x8722, "ID03", 0x20C253FE },
+    { 0x8722, "ID02", 0x19C253FE },
+    { 0x8722, "ID69", 0xE059883C },
+    { 0x8722, "GENE", 0x6C3CA458 },
+
+    /* platform 0x8800 */
+    { 0x8800, "ID86", 0xD02A0432 },
+    { 0x8800, "ID43", 0xDF302B98 },
+    { 0x8800, "ID60", 0x5CF2E094 },
+    { 0x8800, "ID72", 0x91957AFA },
+    { 0x8800, "ID36", 0xAA6C0AF0 },
+    { 0x8800, "ID76", 0x4636CE34 },
+    { 0x8800, "ID88", 0x6123789A },
+    { 0x8800, "ID87", 0xE083950B },
+    { 0x8800, "ID58", 0xA4926CD1 },
+    { 0x8800, "ID89", 0xC6752984 },
+    { 0x8800, "GENE", 0xF2125032 },
+    { 0x8800, "ID79", 0x6123789A },
+
+    /* platform 0x8801 */
+    { 0x8801, "ID86", 0xD02A0432 },
+    { 0x8801, "ID43", 0xDF302B98 },
+    { 0x8801, "ID60", 0x5CF2E094 },
+    { 0x8801, "ID72", 0x91957AFA },
+    { 0x8801, "ID36", 0xAA6C0AF0 },
+    { 0x8801, "ID76", 0x4636CE34 },
+    { 0x8801, "ID88", 0x6123789A },
+    { 0x8801, "ID87", 0xE083950B },
+    { 0x8801, "ID58", 0xA4926CD1 },
+    { 0x8801, "ID89", 0xC6752984 },
+    { 0x8801, "GENE", 0xF2125032 },
+    { 0x8801, "ID79", 0x6123789A },
+
+    /* platform 0x8A10 */
+    { 0x8A10, "ID19", 0x25ED9753 },
+    { 0x8A10, "GENE", 0xFD236642 },
+    { 0x8A10, "ID84", 0x34B23A15 },
+
+    /* platform 0x8B30 */
+    { 0x8B30, "ID69", 0x08A98AF2 },
+
+    /* platform 0x8D30 */
+    { 0x8D30, "ID35", 0x486F1D43 },
+    { 0x8D30, "ID32", 0x72C07157 },
+    { 0x8D30, "ID05", 0xFF8A27B1 },
+    { 0x8D30, "ID69", 0x53E94495 },
+    { 0x8D30, "GENE", 0xDD53014A },
+    { 0x8D30, "ID36", 0x6989B625 },
+    { 0x8D30, "ID05", 0xAC32E144 },
+    { 0x8D30, "ID02", 0x69FCD693 },
+    { 0x8D30, "ID03", 0xE079EA97 },
+    { 0x8D30, "ID69", 0xE0B7435E },
+    { 0x8D30, "GENE", 0x88710AE7 },
+
+    /* platform 0x8D31 */
+    { 0x8D31, "ID35", 0x486F1D43 },
+    { 0x8D31, "ID32", 0x72C07157 },
+    { 0x8D31, "ID05", 0xFF8A27B1 },
+    { 0x8D31, "ID69", 0x53E94495 },
+    { 0x8D31, "GENE", 0xDD53014A },
+    { 0x8D31, "ID36", 0x6989B625 },
+    { 0x8D31, "ID05", 0xAC32E144 },
+    { 0x8D31, "ID02", 0x69FCD693 },
+    { 0x8D31, "ID03", 0xE079EA97 },
+    { 0x8D31, "ID69", 0xE0B7435E },
+    { 0x8D31, "GENE", 0x88710AE7 },
+
+    /* platform 0x8F00 */
+    { 0x8F00, "ID43", 0xEE9A5CDB },
+    { 0x8F00, "ID81", 0x0014D2B2 },
+    { 0x8F00, "ID61", 0x336820AE },
+    { 0x8F00, "ID71", 0x6625A108 },
+    { 0x8F00, "ID20", 0x6123789A },
+    { 0x8F00, "ID72", 0xDDC36D21 },
+    { 0x8F00, "ID13", 0x22193AC8 },
+    { 0x8F00, "ID52", 0x6123789A },
+    { 0x8F00, "ID06", 0x552F618F },
+    { 0x8F00, "ID04", 0xEEDAC536 },
+    { 0x8F00, "ID45", 0xAA2885C4 },
+    { 0x8F00, "ID83", 0xBC76DAE8 },
+    { 0x8F00, "ID58", 0x22D95426 },
+    { 0x8F00, "GENE", 0xCCEBD625 },
+    { 0x8F00, "ID56", 0x44E72AB1 },
+
+    /* platform 0x8F01 */
+    { 0x8F01, "ID43", 0xEE9A5CDB },
+    { 0x8F01, "ID81", 0x0014D2B2 },
+    { 0x8F01, "ID61", 0x336820AE },
+    { 0x8F01, "ID71", 0x6625A108 },
+    { 0x8F01, "ID20", 0x6123789A },
+    { 0x8F01, "ID72", 0xDDC36D21 },
+    { 0x8F01, "ID13", 0x22193AC8 },
+    { 0x8F01, "ID52", 0x6123789A },
+    { 0x8F01, "ID06", 0x552F618F },
+    { 0x8F01, "ID04", 0xEEDAC536 },
+    { 0x8F01, "ID45", 0xAA2885C4 },
+    { 0x8F01, "ID83", 0xBC76DAE8 },
+    { 0x8F01, "ID58", 0x22D95426 },
+    { 0x8F01, "GENE", 0xCCEBD625 },
+    { 0x8F01, "ID56", 0x44E72AB1 },
+
+    /* platform 0x9000 */
+    { 0x9000, "ID15", 0x69A174C0 },
+    { 0x9000, "ID56", 0x99C48009 },
+    { 0x9000, "ID43", 0xEE70D781 },
+
+    /* platform 0x9001 */
+    { 0x9001, "ID15", 0x69A174C0 },
+    { 0x9001, "ID56", 0x99C48009 },
+    { 0x9001, "ID43", 0xEE70D781 },
+
+    /* platform 0x9200 */
+    { 0x9200, "ID43", 0xCCC20AB6 },
+    { 0x9200, "ID72", 0x33408F2D },
+    { 0x9200, "ID56", 0x4251D62B },
+    { 0x9200, "ID58", 0xAA2109FA },
+    { 0x9200, "ID35", 0x11311837 },
+    { 0x9200, "ID32", 0x334F2F0B },
+    { 0x9200, "ID05", 0x552F4FA4 },
+    { 0x9200, "ID69", 0x66F43913 },
+    { 0x9200, "GENE", 0xDD9524AC }, /* GENERAL variant -> sends AC 24 95 DD */
+    { 0x9200, "ID36", 0xAA475E15 },
+
+    /* platform 0x9201 */
+    { 0x9201, "ID43", 0xCCC20AB6 },
+    { 0x9201, "ID72", 0x33408F2D },
+    { 0x9201, "ID56", 0x4251D62B },
+    { 0x9201, "ID58", 0xAA2109FA },
+    { 0x9201, "ID35", 0x11311837 },
+    { 0x9201, "ID32", 0x334F2F0B },
+    { 0x9201, "ID05", 0x552F4FA4 },
+    { 0x9201, "ID69", 0x66F43913 },
+    { 0x9201, "GENE", 0xDD9524AC }, /* GENERAL variant -> sends AC 24 95 DD */
+    { 0x9201, "ID36", 0xAA475E15 },
+
+    /* platform 0x9330 */
+    { 0x9330, "ID35", 0x11311837 },
+    { 0x9330, "ID32", 0x334F2F0B },
+    { 0x9330, "ID05", 0x552F4FA4 },
+    { 0x9330, "ID69", 0x66F43913 },
+    { 0x9330, "GENE", 0xDD9524AC },
+    { 0x9330, "ID36", 0xAA475E15 },
+
+    /* platform 0x9331 */
+    { 0x9331, "ID35", 0x11311837 },
+    { 0x9331, "ID32", 0x334F2F0B },
+    { 0x9331, "ID05", 0x552F4FA4 },
+    { 0x9331, "ID69", 0x66F43913 },
+    { 0x9331, "GENE", 0xDD9524AC },
+    { 0x9331, "ID36", 0xAA475E15 },
+
+    /* platform 0x9400 */
+    { 0x9400, "ID15", 0xBF9D3112 },
+    { 0x9400, "ID43", 0x98C07527 },
+    { 0x9400, "ID56", 0xC74780E8 },
+    { 0x9400, "ID29", 0x92F07E84 },
+
+    /* platform 0x9401 */
+    { 0x9401, "ID15", 0xBF9D3112 },
+    { 0x9401, "ID43", 0x98C07527 },
+    { 0x9401, "ID56", 0xC74780E8 },
+    { 0x9401, "ID29", 0x92F07E84 },
+
+    /* platform 0x9620 */
+    { 0x9620, "ID69", 0x8AC7B764 },
+
+    /* platform 0x9621 */
+    { 0x9621, "ID69", 0x8AC7B764 }
+};
+
+#define PIONEER_DEFAULT_KEY 0x6123789A
+
+/*
+ * Authoritative Pioneer key lookup.
+ *
+ * Duplicate platform/kernel rows are intentionally preserved.  Until an
+ * additional discriminator is understood, the first matching row wins,
+ * matching the table order recovered from BDRFlash.
+ */
+static DWORD pioneer_key_lookup(WORD platform_id, const char *kernel_id)
+{
+    size_t i;
+
+    if (!platform_id || !kernel_id || !kernel_id[0])
+        return PIONEER_DEFAULT_KEY;
+
+    for (i = 0; i < sizeof(pioneer_keys) / sizeof(pioneer_keys[0]); i++) {
+        if (pioneer_keys[i].platform_id == platform_id &&
+            pioneer_keys[i].kernel_id != NULL &&
+            strncmp(pioneer_keys[i].kernel_id, kernel_id, 4) == 0)
+            return pioneer_keys[i].key;
+    }
+
+    return PIONEER_DEFAULT_KEY;
+}
+
 
 static int cmd_keycheck(void)
 {
@@ -2777,7 +3660,7 @@ static int cmd_keycheck(void)
 
     /* Step 2: READ BUFFER 0xF1 for drive ID */
     WORD   driveID = 0;
-    UCHAR  cl      = 0;
+    char   kernelID[5] = {0};
     printf("[2] READ BUFFER 0xF1...\n");
     {
         UCHAR rb[64];
@@ -2789,6 +3672,8 @@ static int cmd_keycheck(void)
                 platform[j] = rb[16+j];
             for (j=0; j<6  && rb[24+j]>=0x20&&rb[24+j]<0x7F; j++)
                 kernel[j]   = rb[24+j];
+            for (j=0; j<4 && kernel[j]; j++)
+                kernelID[j] = kernel[j];
             printf("  Platform: %s\n", platform);
             printf("  Kernel  : %s\n\n", kernel);
 
@@ -2809,10 +3694,10 @@ static int cmd_keycheck(void)
 
     if (strncmp(vendor, "PIONEER", 7) == 0) {
         isPioneer = 1;
-        foundKey = pioneer_key(driveID, cl);
+        foundKey = pioneer_key_lookup(driveID, kernelID);
         printf("  *** PIONEER drive detected ***\n");
-        printf("  Pioneer key (driveID=0x%04X, cl=%u): 0x%08lX\n",
-               driveID, cl, foundKey);
+        printf("  Pioneer key (driveID=0x%04X, kernel=%s): 0x%08lX\n",
+               driveID, kernelID[0] ? kernelID : "(none)", foundKey);
         printf("  Key bytes (payload): %02X %02X %02X %02X\n\n",
                (UCHAR)(foundKey),
                (UCHAR)(foundKey>>8),
@@ -2865,20 +3750,6 @@ static int cmd_keycheck(void)
     return 0;
 }
 
-/* =========================================================
-   COMMAND: probewb
-   Probes WRITE BUFFER 0xFF with different modes and
-   payload lengths to find the correct unlock combination
-   for the Pioneer RS8801.
-
-   Tries all combinations of:
-     mode    : 4, 5, 6, 7
-     length  : 0x10, 0x14, 0x18, 0x1C, 0x20, 0x100
-   with the correct model string + key payload.
-
-   Usage:
-     drivekit probewb G
-   ========================================================= */
 /* =========================================================
    COMMAND: brutekey
    Tries all known Pioneer keys with the correct CDB
@@ -3021,12 +3892,6 @@ static int cmd_brutekey(void)
     return 0;
 }
 
-/* =========================================================
-   PRINT DRIVE INFO
-   Called after banner on every run that has a drive letter.
-   Queries INQUIRY, mode page 0x2A, GET CONFIGURATION,
-   READ BUFFER 0xF1 and 0xE2 for full drive identification.
-   ========================================================= */
 /* =========================================================
    PIONEER SERIAL NUMBER DECODER
    Format: P M CC NNNN XX
@@ -3491,17 +4356,17 @@ static int cmd_resetnormal(void)
 static int cmd_triggerkernel(void)
 {
     UCHAR sense[SENSE_SIZE];
-    UCHAR buf[0xA4];
+    UCHAR buf[0xA400];
     int   st = 0, b;
 
     printf("=== KERNEL MODE TRIGGER ===\n\n");
-    printf("  Sending READ BUFFER 0xB0 offset=0x04 len=0xA4 (164 bytes)...\n");
+    printf("  Sending READ BUFFER 0xB0 offset=0x04 len=0xA400 (41KB)...\n");
     printf("  (This triggers drive to enter kernel mode and reboot)\n\n");
 
     {
         UCHAR cdb[10] = {0x3C,0x02,0xB0,0x00,0x00,0x04,0x00,0x00,0xA4,0x00};
         memset(buf, 0, sizeof(buf));
-        send_scsi(g_hDrive, cdb, 10, buf, 0xA4,
+        send_scsi(g_hDrive, cdb, 10, buf, 0xA400,
                   SCSI_IOCTL_DATA_IN, sense, &st);
         printf("  Status: %s", st==0?"GOOD":"FAIL");
         if (st != 0)
@@ -3554,7 +4419,7 @@ static int cmd_triggerkernel(void)
                 send_scsi(g_hDrive, f1cdb, 10, rb, 0x30,
                           SCSI_IOCTL_DATA_IN, sense2, &st2);
                 if (st2 == 0) {
-                    int is_kernel = (memcmp(rb+0x20,"        ",8)==0);
+                    int is_kernel = (memcmp(rb+0x14,"        ",8)!=0);
                     printf("  Drive mode: %s\n\n",
                            is_kernel?"*** KERNEL MODE ***":"normal mode");
                     if (is_kernel)
@@ -3685,67 +4550,66 @@ static int cmd_checkfw(void)
 
     printf("  Searching drives.json...\n\n");
 
-    /* Simple JSON line scan - look for matching firmware version */
-    while (fgets(line, sizeof(line), fp)) {
+    /* JSON parser — handles both compact (one object per line)
+       and pretty-printed (multi-line) JSON objects */
+    {
+        char obj[2048] = {0};
+        int  obj_len = 0;
+        int  depth = 0;
 
-        /* Count total firmware entries */
-        if (strstr(line, "\"checksum\"")) total++;
-
-        /* Look for our firmware version */
-        fw_ptr = strstr(line, "\"fw\"");
-        if (!fw_ptr) continue;
-
-        /* Look for matching firmware version in this JSON block */
-        {
-            char fw_val[8] = {0};
-            char cs[10]    = {0};
-            char date[12]  = {0};
-            char did[8]    = {0};
-            char *q, *p, *p2, *p3;
-            int  ii;
-
-            q = strchr(fw_ptr, ':');
-            if (!q) continue;
-            q++; while(*q==' '||*q=='"') q++;
-            ii=0; while(q[ii]&&q[ii]!='"'&&ii<7) {fw_val[ii]=q[ii];ii++;}
-
-            if (strcmp(fw_val, fw) != 0) continue;
-
-            /* Firmware version matches — get checksum, date, drive_id */
-            cs_ptr   = strstr(line, "\"checksum\"");
-            date_ptr = strstr(line, "\"date\"");
-            drv_ptr  = strstr(line, "\"drive_id\"");
-
-            if (!cs_ptr) continue;
-
-            p = strchr(cs_ptr, ':');
-            if (p) {
-                p++; while(*p==' '||*p=='"') p++;
-                ii=0; while(p[ii]&&p[ii]!='"'&&ii<9) {cs[ii]=p[ii];ii++;}
-            }
-
-            if (date_ptr) {
-                p2 = strchr(date_ptr, ':');
-                if (p2) {
-                    p2++; while(*p2==' '||*p2=='"') p2++;
-                    ii=0; while(p2[ii]&&p2[ii]!='"'&&ii<11) {date[ii]=p2[ii];ii++;}
+        while (fgets(line, sizeof(line), fp)) {
+            int li;
+            for (li = 0; line[li]; li++) {
+                if (obj_len < (int)sizeof(obj)-2)
+                    obj[obj_len++] = line[li];
+                if (line[li] == '{') depth++;
+                else if (line[li] == '}') {
+                    depth--;
+                    if (depth <= 0 && obj_len > 2) {
+                        obj[obj_len] = 0;
+                        if (strstr(obj, "\"checksum\"")) total++;
+                        fw_ptr = strstr(obj, "\"fw\"");
+                        if (fw_ptr) {
+                            char fw_val[8]={0}, cs[10]={0};
+                            char date[12]={0}, did[8]={0};
+                            char *q, *p, *p2, *p3;
+                            int  ii;
+                            q = strchr(fw_ptr, ':');
+                            if (q) {
+                                q++; while(*q==' '||*q=='"') q++;
+                                ii=0; while(q[ii]&&q[ii]!='"'&&ii<7){fw_val[ii]=q[ii];ii++;}
+                            }
+                            if (strcmp(fw_val, fw) == 0) {
+                                cs_ptr   = strstr(obj, "\"checksum\"");
+                                date_ptr = strstr(obj, "\"date\"");
+                                drv_ptr  = strstr(obj, "\"drive_id\"");
+                                if (cs_ptr) {
+                                    p = strchr(cs_ptr,':');
+                                    if(p){p++;while(*p==' '||*p=='"')p++;
+                                        ii=0;while(p[ii]&&p[ii]!='"'&&ii<9){cs[ii]=p[ii];ii++;}}
+                                }
+                                if (date_ptr) {
+                                    p2 = strchr(date_ptr,':');
+                                    if(p2){p2++;while(*p2==' '||*p2=='"')p2++;
+                                        ii=0;while(p2[ii]&&p2[ii]!='"'&&ii<11){date[ii]=p2[ii];ii++;}}
+                                }
+                                if (drv_ptr) {
+                                    p3 = strchr(drv_ptr,':');
+                                    if(p3){p3++;while(*p3==' '||*p3=='"')p3++;
+                                        ii=0;while(p3[ii]&&p3[ii]!='"'&&ii<7){did[ii]=p3[ii];ii++;}}
+                                }
+                                printf("  MATCH FOUND:\n");
+                                printf("    Checksum : %s\n", cs);
+                                printf("    Drive ID : %s\n", did);
+                                printf("    Date     : %s\n", date);
+                                printf("    Status   : LibreDrive supported (original firmware)\n");
+                                found++;
+                            }
+                        }
+                        obj_len = 0; obj[0] = 0; depth = 0;
+                    }
                 }
             }
-
-            if (drv_ptr) {
-                p3 = strchr(drv_ptr, ':');
-                if (p3) {
-                    p3++; while(*p3==' '||*p3=='"') p3++;
-                    ii=0; while(p3[ii]&&p3[ii]!='"'&&ii<7) {did[ii]=p3[ii];ii++;}
-                }
-            }
-
-            printf("  MATCH FOUND:\n");
-            printf("    Checksum : %s\n", cs);
-            printf("    Drive ID : %s\n", did);
-            printf("    Date     : %s\n", date);
-            printf("    Status   : LibreDrive supported (original firmware)\n");
-            found++;
         }
     }
     fclose(fp);
@@ -4154,19 +5018,22 @@ static void print_help(void)
     printf("  probevendor   Probe vendor opcodes 0xC0-0xFF\n");
     printf("  probef0       Probe READ BUFFER IDs 0xF0-0xFF (dumps all buffers incl 0xF1)\n");
     printf("  probeb0       Read/decode RS8801 buffer 0xB0\n");
-    printf("  rawdump       Raw READ BUFFER dump (--bufid 0xxx)\n\n");
+    printf("  rawdump       Raw READ BUFFER dump (--bufid 0xxx)\n");
+    printf("  dumpfw        Read/scan Pioneer 5A/2A firmware window (does not unlock)\n\n");
     printf("Flashing:\n");
     printf("  unlock        Pioneer service mode unlock (auto session token)\n");
-    printf("  libredrive    Enable LibreDrive on post-cutoff drives\n");
-    printf("                  WRITE BUFFER 0x41 A5 AA AA (from MakeMKV capture)\n");
+    printf("  hwdump        Enable 0xB0 dump on both pre/post-cutoff drives\n");
+    printf("                  Dumps H8S/2600 kernel code to hwdump_b0.bin\n");
     printf("  flash         AUTO-DETECT pre/post-cutoff and flash (RECOMMENDED)\n");
     printf("                  --file kernel.bin --file2 normal.bin\n");
     printf("  flashfw       Legacy flash command (use 'flash' instead)\n");
     printf("  crossflash    Post-cutoff downgrade/crossflash (direct, no auto-detect)\n");
     printf("                  --file kernel.bin --file2 normal.bin [--key 0xAA475E15]\n");
+    printf("  flashinfo     Show flash-relevant drive info (model string, key, platform)\n");
     printf("  xordiff       XOR two encrypted firmware files to find version bytes\n");
     printf("                  --file fw_new.bin --file2 fw_old.bin\n");
     printf("  patchfw       Patch firmware header to spoof version for downgrade\n");
+    printf("  decryptkernel Decode KernelFront cipher; --patch applies gen-marker fix\n");
     printf("                  --file fw_ref.bin --file2 fw_target.bin\n");
     printf("  autoflash     Auto-detect and flash from firmware\\ folder\n");
     printf("  resetnormal   Attempt to exit kernel/service mode\n");
@@ -4182,23 +5049,18 @@ static void print_help(void)
     printf("  --bufid 0xF4        Buffer ID for rawdump (default 0xF4)\n");
     printf("  --force             Skip compatibility checks\n");
     printf("  --nounlock          Skip unlock step\n");
-    printf("  --key 0x5CF2E094    Override unlock key\n\n");
+    printf("  --key 0x5CF2E094    Override unlock key\n");
+    printf("  --patch             Apply generation marker patch (decryptkernel)\n\n");
     printf("Examples:\n");
     printf("  drivekit info G\n");
     printf("  drivekit unlock G\n");
     printf("  drivekit flashfw G --file S9330360.102 --file2 S9330361.101 --nounlock\n");
     printf("  drivekit rawdump G --bufid 0xB0\n");
+    printf("  drivekit dumpfw G --file firmware_dump.bin\n");
     printf("  drivekit sendcdb G 3B 05 FF 00 00 00 00 01 00 00\n\n");
     printf("Note: Always eject disc before unlock/flash. Run as Administrator.\n");
 }
 
-/* =========================================================
-   COMMAND: autoflash
-   Scans ./firmware/ folder for Pioneer firmware files,
-   detects valid files by content (Pioneer copyright header)
-   regardless of filename, matches compatible kernel+firmware
-   to connected drive, then flashes automatically.
-   ========================================================= */
 /* FW153 candidate structure for autoflash */
 typedef struct {
     char path[MAX_PATH];
@@ -4209,6 +5071,13 @@ typedef struct {
     long filesize;
 } FW153;
 
+/* =========================================================
+   COMMAND: autoflash
+   Scans ./firmware/ folder for Pioneer firmware files,
+   detects valid files by content (Pioneer copyright header)
+   regardless of filename, matches compatible kernel+firmware
+   to connected drive, then flashes automatically.
+   ========================================================= */
 static int cmd_autoflash(void)
 {
     /* .153 header offsets */
@@ -4489,6 +5358,7 @@ static int cmd_autoflash(void)
     #undef H153_VER
     #undef H153_MODEL
 }
+
 
 static int cmd_flashfw(void)
 {
@@ -5331,9 +6201,12 @@ static int cmd_flashfw(void)
                - Payload = random token (0x200 bytes)
                - BUT bytes 0x10-0x13 replaced with drive-specific key!
                XD07 index=0 key=0xF0116415 (from dword_5D4B38 table) */
-            /* Drive-specific trigger key from updater dword_5D4B38[0] table
-               Add new drives to g_tkey_map[] above */
-            DWORD tkey = tkey_lookup(g_driveID);
+            /* Use exactly the same key selected by build_pioneer_payload_auto().
+               g_payload[0x10..0x13] came from pioneer_keys[]. */
+            DWORD tkey = ((DWORD)g_payload[0x10]      ) |
+                         ((DWORD)g_payload[0x11] <<  8) |
+                         ((DWORD)g_payload[0x12] << 16) |
+                         ((DWORD)g_payload[0x13] << 24);
             {
                 UCHAR tpayload[0x100];
                 memcpy(tpayload, trig_payload, 0x100);
@@ -5341,10 +6214,10 @@ static int cmd_flashfw(void)
                 tpayload[0x11] = (UCHAR)((tkey>>8) & 0xFF);
                 tpayload[0x12] = (UCHAR)((tkey>>16) & 0xFF);
                 tpayload[0x13] = (UCHAR)((tkey>>24) & 0xFF);
-                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+                UCHAR tcdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
                 UCHAR tsense[SENSE_SIZE] = {0};
                 printf("  Trigger: mode=5 bufID=0xFF len=0x100 key=0x%08X\n", tkey);
-                send_scsi(g_hDrive, tcdb, 10, tpayload, 0x100,
+                send_scsi(g_hDrive, tcdb, 12, tpayload, 0x100,
                           SCSI_IOCTL_DATA_OUT, tsense, &st2);
                 printf("  Trigger: %s",
                        (st2==0||(tsense[2]&0xF)==0)?"GOOD":"FAIL");
@@ -5358,11 +6231,11 @@ static int cmd_flashfw(void)
             trigger_done:;
         } else {
             /* Pre-cutoff: standard trigger with bufID=0xFF and session token */
-            UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+            UCHAR cdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
             UCHAR *trig_payload = g_has_token ? g_a0token : g_payload;
             if (g_has_token)
                 printf("  Using 0xA0 session token for trigger\n");
-            send_scsi(g_hDrive, cdb, 10, trig_payload, 0x100,
+            send_scsi(g_hDrive, cdb, 12, trig_payload, 0x100,
                       SCSI_IOCTL_DATA_OUT, sense2, &st2);
         }
         printf("  Status: %s", st2==0?"GOOD":"FAIL");
@@ -5598,12 +6471,6 @@ static int cmd_flashfw(void)
 }
 
 /* =========================================================
-   COMMAND: sendfirmware
-   Sends the main firmware image after kernel is loaded.
-   Usage: drivekit sendfirmware G --file firmware.bin
-   bufID = 0xF0, mode = 7
-   ========================================================= */
-/* =========================================================
    MAIN
    ========================================================= */
 int main(int argc, char *argv[])
@@ -5643,6 +6510,8 @@ int main(int argc, char *argv[])
             g_force = 1;
         } else if (strcmp(argv[i], "--key") == 0 && i+1 < argc) {
             g_key_override = (DWORD)strtoul(argv[++i], NULL, 16);
+        } else if (strcmp(argv[i], "--patch") == 0) {
+            g_patch_flag = 1;
         } else if (strcmp(argv[i], "--nounlock") == 0) {
             g_nounlock = 1;
         } else if (strcmp(argv[i], "--postcutoff") == 0) {
@@ -5717,7 +6586,11 @@ int main(int argc, char *argv[])
         printf("  - Rolling XOR encrypted firmware (MrPenguin H8S analysis)\n");
         printf("    Crypto engine at 0xFF3FF000, key: x*(16807)%%0x7FFFFFFF\n");
         printf("  - Version check in ENCRYPTED binary - header patch fails\n");
-        printf("  - Serial number year encoding confirmed (cxplay)\n\n");
+        printf("  - Serial number year encoding confirmed (cxplay)\n");
+        printf("  - KernelFront cipher reverse engineered (heisenberg)\n");
+        printf("    H8S/2600 kernel payload XOR/rotate cipher fully decoded\n");
+        printf("    decode(v,k) = ROR32(v^k, k&31) using 1024-entry LE key table\n");
+        printf("    Enables direct kernel inspection, patching and re-encryption\n\n");
 
         printf("  HARDWARE\n");
         printf("  --------\n");
@@ -5747,7 +6620,11 @@ int main(int argc, char *argv[])
         printf("  Sayaka          Firmware hunting methodology\n");
         printf("                  BDR-UD04 UHD confirmation\n");
         printf("  Coopervid       Support, testing, community liaison\n");
-        printf("  MakeMKV comm.   Drive testing and firmware contributions\n\n");
+        printf("  MakeMKV comm.   Drive testing and firmware contributions\n");
+        printf("  heisenberg      KernelFront cipher decryption and analysis\n");
+        printf("                  Development support and testing throughout\n");
+        printf("                  Wireshark capture analysis for SAT 9331\n");
+        printf("                  Huge thanks - this tool would not exist without you\n\n");
 
         printf("  BDRFlash special thanks:\n");
         printf("  Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen,\n");
@@ -5817,8 +6694,9 @@ int main(int argc, char *argv[])
     }
 
     /* xordiff and patchfw are pure file analysis — no drive needed */
-    if (strcmp(cmd, "xordiff") == 0) return cmd_xordiff();
-    if (strcmp(cmd, "patchfw") == 0) return cmd_patchfw();
+    if (strcmp(cmd, "xordiff")       == 0) return cmd_xordiff();
+    if (strcmp(cmd, "patchfw")       == 0) return cmd_patchfw();
+    if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
 
     if (open_drive(drv)) return 1;
 
@@ -5827,6 +6705,7 @@ int main(int argc, char *argv[])
         strcmp(cmd, "crossflash")  != 0 &&
         strcmp(cmd, "xordiff")     != 0 &&
         strcmp(cmd, "triggerflash")!= 0 &&
+        strcmp(cmd, "dumpfw")      != 0 &&
         strcmp(cmd, "unlock")      != 0 &&
         strcmp(cmd, "brutekey")    != 0)
         print_drive_info(g_hDrive, g_drivePath);
@@ -5836,6 +6715,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "driveinfo")  == 0) ret = cmd_driveinfo2();
     else if (strcmp(cmd, "probef0")     == 0) ret = cmd_probef0();
     else if (strcmp(cmd, "rawdump")     == 0) ret = cmd_rawdump();
+    else if (strcmp(cmd, "dumpfw")      == 0) ret = cmd_dumpfw();
     else if (strcmp(cmd, "unlock")      == 0) ret = cmd_unlock();
     else if (strcmp(cmd, "probevendor") == 0) ret = cmd_probevendor();
     else if (strcmp(cmd, "discinfo")    == 0) ret = cmd_discinfo();
@@ -5849,7 +6729,9 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "flash")      == 0) ret = cmd_flash();
     else if (strcmp(cmd, "crossflash") == 0) ret = cmd_crossflash();
     else if (strcmp(cmd, "xordiff")    == 0) ret = cmd_xordiff();
-    else if (strcmp(cmd, "patchfw")    == 0) ret = cmd_patchfw();
+    else if (strcmp(cmd, "flashinfo")  == 0) ret = cmd_flashinfo();
+    else if (strcmp(cmd, "patchfw")        == 0) ret = cmd_patchfw();
+    else if (strcmp(cmd, "decryptkernel")  == 0) ret = cmd_decryptkernel();
     else if (strcmp(cmd, "kernellimbo") == 0) {
         /* Enter kernel limbo on post-cutoff drives
            Unlocks drive, sends current firmware, fires XS06 trigger
@@ -5869,13 +6751,12 @@ int main(int argc, char *argv[])
                 /* Step 2: Send dummy firmware (just need to fill buffer) */
                 printf("\n[2/3] Sending kernel trigger firmware...\n");
                 Sleep(500);
-                /* Step 3: Fire XS06 trigger to enter kernel limbo */
+                /* Step 3: Fire commit trigger with correct model string from g_mdl_map */
                 printf("\n[3/3] Firing kernel limbo trigger...\n");
                 UCHAR sense[SENSE_SIZE]={0};
                 UCHAR xs06[0x100]={0};
                 int st=0;
-                memcpy(xs06, "PIONEER BDR-XS06", 16);
-                xs06[0x10]=0xF2; xs06[0x11]=0x8A; xs06[0x12]=0xA9; xs06[0x13]=0x08;
+                build_pioneer_payload_auto(xs06);
                 UCHAR tcdb[10]={0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
                 send_scsi(g_hDrive, tcdb, 10, xs06, 0x100,
                           SCSI_IOCTL_DATA_OUT, sense, &st);
@@ -5890,7 +6771,7 @@ int main(int argc, char *argv[])
         }
     }
     else if (strcmp(cmd, "e5test")      == 0) ret = cmd_e5test();
-    else if (strcmp(cmd, "libredrive")  == 0) ret = cmd_libredrive();
+    else if (strcmp(cmd, "hwdump")  == 0) ret = cmd_hwdump();
     else if (strcmp(cmd, "kernelmode")  == 0) {
         /* Send BDRFlash-style kernel mode trigger:
            WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
@@ -5985,10 +6866,140 @@ int main(int argc, char *argv[])
     return ret;
 }
 
-/* Shared execution trigger — pre-cutoff path, confirmed working.
-   Sends WRITE BUFFER mode=0x05 bufID=0xFF len=0x100 with the
-   0xA0 session token (or fallback payload) as payload.
-   Returns 0 on success. */
+/* =========================================================
+   CMD_FLASHINFO
+   Diagnostic command — shows all flash-relevant drive info:
+   model string, key, platform, what DriveKit would use for
+   unlock payload. Use this to diagnose unknown drives.
+
+   Usage: drivekit flashinfo E
+   ========================================================= */
+static int cmd_flashinfo(void)
+{
+    UCHAR sense[SENSE_SIZE] = {0};
+    int   st = 0;
+
+    printf("=== FLASH INFO ===\n\n");
+
+    /* INQUIRY */
+    {
+        UCHAR inq[96]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,96,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,96,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        if (inqst==0) {
+            char vendor[9]={0},model[17]={0},rev[5]={0},date[9]={0};
+            int k;
+            memcpy(vendor,inq+8,8); memcpy(model,inq+16,16);
+            memcpy(rev,inq+32,4);
+            for(k=0;k<8&&inq[0x25+k]>=0x20&&inq[0x25+k]<=0x7E;k++) date[k]=inq[0x25+k];
+            printf("  INQUIRY:\n");
+            printf("    Vendor   : %s\n", vendor);
+            printf("    Model    : %s\n", model);
+            printf("    Firmware : %s\n", rev);
+            printf("    FW Date  : %s\n", date);
+            printf("    Post-cutoff: %s\n\n",
+                   strcmp(date,"22/12/01")>=0 ? "YES" : "NO");
+        }
+    }
+
+    /* 0xF1 — platform, serial, kernel */
+    {
+        UCHAR f1[0x30]={0}; UCHAR f1s[SENSE_SIZE]={0};
+        char serial[16]={0}, platform[16]={0}, kernel[8]={0};
+        WORD did=0; int k;
+        if (rb_data(0xF1,0,f1,0x30,f1s)==0) {
+            for(k=0;k<12&&f1[k]>=0x20&&f1[k]<0x7F;k++) serial[k]=f1[k];
+            for(k=0;k<12&&f1[0x10+k]>=0x20&&f1[0x10+k]<0x7F;k++) platform[k]=f1[0x10+k];
+            for(k=0;k<8&&f1[0x18+k]>=0x20&&f1[0x18+k]<0x7F;k++) kernel[k]=f1[0x18+k];
+            /* Extract drive ID from platform string */
+            const char *p=platform;
+            while(*p&&(*p<'0'||*p>'9')) p++;
+            if(*p) did=(WORD)strtol(p,NULL,16);
+            printf("  0xF1 (identity):\n");
+            printf("    Serial   : %s\n", serial);
+            printf("    Platform : %s\n", platform);
+            printf("    Drive ID : 0x%04X\n", did);
+            printf("    Kernel   : %s\n\n", kernel);
+        } else {
+            printf("  0xF1: not readable (post-cutoff normal mode)\n\n");
+        }
+    }
+
+    /* 0xA0 at offset 0x90 — model string the drive returns */
+    {
+        UCHAR a0[0x20]={0}; UCHAR a0s[SENSE_SIZE]={0};
+        UCHAR a0cdb[10]={0x3C,0x02,0xA0,0,0,0x90,0,0,0x20,0};
+        int a0st=0;
+        send_scsi(g_hDrive,a0cdb,10,a0,0x20,SCSI_IOCTL_DATA_IN,a0s,&a0st);
+        printf("  0xA0 offset=0x90 (drive model string):\n");
+        if(a0st==0) {
+            char mdl[17]={0}; int k;
+            for(k=0;k<16&&a0[k]>=0x20&&a0[k]<=0x7E;k++) mdl[k]=a0[k];
+            printf("    Raw     : ");
+            for(k=0;k<16;k++) printf("%02X ",a0[k]);
+            printf("\n");
+            printf("    String  : '%.16s'\n", mdl);
+            printf("    Key     : %02X %02X %02X %02X (0x%02X%02X%02X%02X)\n\n",
+                   a0[0x10],a0[0x11],a0[0x12],a0[0x13],
+                   a0[0x13],a0[0x12],a0[0x11],a0[0x10]);
+        } else {
+            printf("    ERROR (key=%02X ASC=%02X)\n\n", a0s[2]&0x0F, a0s[12]);
+        }
+    }
+
+    /* What DriveKit would use */
+    {
+        UCHAR payload[256]={0};
+        WORD  did=0;
+        char  kernelID[8]={0};
+        build_pioneer_payload_auto(payload);
+        printf("  DriveKit unlock payload:\n");
+        printf("    Model   : '%.16s'\n", (char*)payload);
+        printf("    Key     : %02X %02X %02X %02X (0x%02X%02X%02X%02X)\n",
+               payload[0x10],payload[0x11],payload[0x12],payload[0x13],
+               payload[0x13],payload[0x12],payload[0x11],payload[0x10]);
+        printf("    Raw[0..19]: ");
+        int k; for(k=0;k<20;k++) printf("%02X ",payload[k]);
+        printf("\n\n");
+
+        /* Show commit trigger key from tkey_map if post-cutoff */
+        {
+            UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+            UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+            char date[9]={0};
+            send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+            if(inqst==0){int di;for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++) date[di]=inq[0x25+di];}
+            if(strcmp(date,"22/12/01")>=0) {
+                /* Post-cutoff — show tkey info */
+                UCHAR f1[0x30]={0}; UCHAR f1s[SENSE_SIZE]={0};
+                char plat[16]={0};
+                if(rb_data(0xF1,0,f1,0x30,f1s)==0){
+                    int ki; for(ki=0;ki<12&&f1[0x10+ki]>=0x20&&f1[0x10+ki]<0x7F;ki++) plat[ki]=f1[0x10+ki];
+                    const char *p=plat; while(*p&&(*p<'0'||*p>'9')) p++;
+                    if(*p) did=(WORD)strtol(p,NULL,16);
+                    for(ki=0;ki<8&&f1[0x18+ki]>=0x20&&f1[0x18+ki]<0x7F;ki++) kernelID[ki]=f1[0x18+ki];
+                }
+                printf("  Commit trigger key (post-cutoff):\n");
+                {
+                    char kernel4[5] = {0};
+                    DWORD tkey;
+                    int ki;
+                    for (ki = 0; ki < 4 && kernelID[ki]; ki++)
+                        kernel4[ki] = kernelID[ki];
+                    tkey = pioneer_key_lookup(did, kernel4);
+                    printf("    DriveID 0x%04X / kernel %s -> 0x%08lX (from pioneer_keys)\n",
+                           did, kernel4[0] ? kernel4 : "(none)", tkey);
+                }
+                printf("    Current kernel: %s\n\n", kernelID);
+            }
+        }
+    }
+
+    printf("  If unlock fails: check model string and key above.\n");
+    printf("  Override with: --key 0xXXXXXXXX\n\n");
+
+    return 0;
+}
 
 /* =========================================================
    CMD_XORDIFF
@@ -6237,6 +7248,223 @@ static int cmd_patchfw(void)
     return 0;
 }
 
+/* =========================================================
+   CMD_DECRYPTKERNEL
+   Decode a Pioneer KernelFront-encrypted kernel file and
+   write the plaintext body to disk.
+
+   Layout of a KernelFront file (e.g. S9331050.100):
+     file[0x000:0x200]  — 512-byte ASCII envelope header (not sent to drive)
+     file[0x200:0x1200] — 1024 × LE DWORD key table  (1024 keys)
+     file[0x1200:0x11200] — 65536-byte encrypted payload  (16384 dwords)
+
+   Cipher (confirmed from H8S/2600 disassembly):
+     For each DWORD pair (index i, key k = key_table[i % 1024]):
+       plaintext[i] = ROR32(ciphertext[i] ^ k,  k & 31)
+
+   The decoded body is written as-is (raw DWORD stream, LE).
+
+   Optionally patches generation marker and recomputes body checksum
+   when --patch flag is given:
+     decoded_body[0xFE]  0xFF → 0x01  (generation marker)
+     decoded_body[0x1020] adjusted so BE32 additive body sum = 0
+
+   Usage:
+     drivekit decryptkernel --file S9331050.100
+     drivekit decryptkernel --file S9331050.100 --patch
+     drivekit decryptkernel --file S9331050.100 --patch --out decoded.bin
+   ========================================================= */
+
+static DWORD ror32(DWORD v, int shift)
+{
+    shift &= 31;
+    if (shift == 0) return v;
+    return (v >> shift) | (v << (32 - shift));
+}
+
+static int cmd_decryptkernel(void)
+{
+    FILE  *fin  = NULL;
+    FILE  *fout = NULL;
+    UCHAR *raw  = NULL;
+    UCHAR *body = NULL;   /* decoded body, raw bytes */
+    long   fsize;
+    DWORD  i;
+    char   outpath[512];
+    int    do_patch = g_patch_flag;  /* set by --patch on cmdline */
+
+    /* --- input file --- */
+    if (!g_outFile[0]) {
+        fprintf(stderr, "Usage: drivekit decryptkernel --file <kernel.bin> [--patch] [--file2 out.bin]\n");
+        return 1;
+    }
+    fin = fopen(g_outFile, "rb");
+    if (!fin) { fprintf(stderr, "Cannot open %s\n", g_outFile); return 1; }
+    fseek(fin, 0, SEEK_END); fsize = ftell(fin); fseek(fin, 0, SEEK_SET);
+
+    if (fsize < 0x11200) {
+        fprintf(stderr, "File too small for KernelFront layout (need >= 0x11200 bytes, got 0x%lX)\n", (DWORD)fsize);
+        fclose(fin); return 1;
+    }
+
+    raw = (UCHAR*)malloc((DWORD)fsize);
+    if (!raw) { fclose(fin); return 1; }
+    fread(raw, 1, (DWORD)fsize, fin);
+    fclose(fin); fin = NULL;
+
+    /* --- locate key table and cipher payload --- */
+    /* Key table: file[0x200..0x1200) = 1024 LE DWORDs */
+    const UCHAR *key_bytes = raw + 0x200;
+    /* Cipher payload: file[0x1200..0x11200) = 16384 LE DWORDs = 65536 bytes */
+    const UCHAR *enc_bytes = raw + 0x1200;
+    DWORD enc_dwords = 0x10000 / 4;   /* 16384 */
+
+    body = (UCHAR*)malloc(0x10000);
+    if (!body) { free(raw); return 1; }
+
+    printf("Decoding KernelFront payload (%u dwords)...\n", enc_dwords);
+
+    for (i = 0; i < enc_dwords; i++) {
+        /* Load key dword i%1024 from key table (LE) */
+        DWORD ki = i % 1024;
+        DWORD k = (DWORD)key_bytes[ki*4 + 0]
+                | ((DWORD)key_bytes[ki*4 + 1] <<  8)
+                | ((DWORD)key_bytes[ki*4 + 2] << 16)
+                | ((DWORD)key_bytes[ki*4 + 3] << 24);
+
+        /* Load ciphertext dword (LE) */
+        DWORD ct = (DWORD)enc_bytes[i*4 + 0]
+                 | ((DWORD)enc_bytes[i*4 + 1] <<  8)
+                 | ((DWORD)enc_bytes[i*4 + 2] << 16)
+                 | ((DWORD)enc_bytes[i*4 + 3] << 24);
+
+        /* Decrypt: ROR32(ct ^ k, k & 31) */
+        DWORD pt = ror32(ct ^ k, (int)(k & 31));
+
+        /* Store plaintext LE */
+        body[i*4 + 0] = (UCHAR)(pt       );
+        body[i*4 + 1] = (UCHAR)(pt >>  8 );
+        body[i*4 + 2] = (UCHAR)(pt >> 16 );
+        body[i*4 + 3] = (UCHAR)(pt >> 24 );
+    }
+
+    printf("Decode complete.\n");
+
+    /* --- show marker --- */
+    DWORD marker_dword = (DWORD)body[0xFE*4 + 0]
+                       | ((DWORD)body[0xFE*4 + 1] <<  8)
+                       | ((DWORD)body[0xFE*4 + 2] << 16)
+                       | ((DWORD)body[0xFE*4 + 3] << 24);
+    printf("  Generation marker @ decoded[0xFE] = 0x%08X  (byte0=0x%02X)\n",
+           marker_dword, body[0xFE*4]);
+
+    /* --- show body checksum at 0x1020 --- */
+    {
+        DWORD sum = 0;
+        for (i = 0; i < enc_dwords; i++) {
+            DWORD v = (DWORD)body[i*4 + 0]
+                    | ((DWORD)body[i*4 + 1] <<  8)
+                    | ((DWORD)body[i*4 + 2] << 16)
+                    | ((DWORD)body[i*4 + 3] << 24);
+            /* BE32 additive: accumulate byte-swapped */
+            DWORD vbe = ((v & 0xFF) << 24) | (((v>>8) & 0xFF) << 16)
+                      | (((v>>16) & 0xFF) << 8) | ((v>>24) & 0xFF);
+            sum += vbe;
+        }
+        printf("  Body additive BE32 checksum = 0x%08X  (expect 0x00000000)\n", sum);
+    }
+
+    /* --- optional patch --- */
+    if (do_patch) {
+        printf("\nApplying generation marker patch...\n");
+
+        /* Read current checksum word at decoded body offset 0x1020 (dword index 0x1020/4 = 0x408) */
+        DWORD cs_idx = 0x1020 / 4;  /* = 0x408 */
+        DWORD cs_old_le = (DWORD)body[cs_idx*4 + 0]
+                        | ((DWORD)body[cs_idx*4 + 1] <<  8)
+                        | ((DWORD)body[cs_idx*4 + 2] << 16)
+                        | ((DWORD)body[cs_idx*4 + 3] << 24);
+        /* Convert to BE32 for arithmetic */
+        DWORD cs_old_be = ((cs_old_le & 0xFF) << 24) | (((cs_old_le>>8) & 0xFF) << 16)
+                        | (((cs_old_le>>16) & 0xFF) << 8) | ((cs_old_le>>24) & 0xFF);
+
+        /* Marker is at decoded body dword 0xFE */
+        DWORD mk_idx = 0xFE;
+        DWORD mk_old_le = (DWORD)body[mk_idx*4 + 0]
+                        | ((DWORD)body[mk_idx*4 + 1] <<  8)
+                        | ((DWORD)body[mk_idx*4 + 2] << 16)
+                        | ((DWORD)body[mk_idx*4 + 3] << 24);
+        DWORD mk_new_le = (mk_old_le & 0xFFFFFF00) | 0x01;  /* byte0: 0xFF→0x01 */
+
+        DWORD mk_old_be = ((mk_old_le & 0xFF) << 24) | (((mk_old_le>>8) & 0xFF) << 16)
+                        | (((mk_old_le>>16) & 0xFF) << 8) | ((mk_old_le>>24) & 0xFF);
+        DWORD mk_new_be = ((mk_new_le & 0xFF) << 24) | (((mk_new_le>>8) & 0xFF) << 16)
+                        | (((mk_new_le>>16) & 0xFF) << 8) | ((mk_new_le>>24) & 0xFF);
+
+        /* New checksum = old_cs_be - (mk_new_be - mk_old_be) to keep sum = 0 */
+        DWORD cs_new_be = cs_old_be - (mk_new_be - mk_old_be);
+        DWORD cs_new_le = ((cs_new_be & 0xFF) << 24) | (((cs_new_be>>8) & 0xFF) << 16)
+                        | (((cs_new_be>>16) & 0xFF) << 8) | ((cs_new_be>>24) & 0xFF);
+
+        printf("  Marker:   dword[0x%03X]  0x%08X → 0x%08X  (byte0: 0x%02X → 0x01)\n",
+               mk_idx, mk_old_le, mk_new_le, mk_old_le & 0xFF);
+        printf("  Checksum: dword[0x%03X]  0x%08X → 0x%08X  (BE: 0x%08X → 0x%08X)\n",
+               cs_idx, cs_old_le, cs_new_le, cs_old_be, cs_new_be);
+
+        /* Apply marker patch */
+        body[mk_idx*4 + 0] = (UCHAR)(mk_new_le       );
+        body[mk_idx*4 + 1] = (UCHAR)(mk_new_le >>  8 );
+        body[mk_idx*4 + 2] = (UCHAR)(mk_new_le >> 16 );
+        body[mk_idx*4 + 3] = (UCHAR)(mk_new_le >> 24 );
+
+        /* Apply checksum patch */
+        body[cs_idx*4 + 0] = (UCHAR)(cs_new_le       );
+        body[cs_idx*4 + 1] = (UCHAR)(cs_new_le >>  8 );
+        body[cs_idx*4 + 2] = (UCHAR)(cs_new_le >> 16 );
+        body[cs_idx*4 + 3] = (UCHAR)(cs_new_le >> 24 );
+
+        /* Verify */
+        DWORD sum = 0;
+        for (i = 0; i < enc_dwords; i++) {
+            DWORD v = (DWORD)body[i*4 + 0]
+                    | ((DWORD)body[i*4 + 1] <<  8)
+                    | ((DWORD)body[i*4 + 2] << 16)
+                    | ((DWORD)body[i*4 + 3] << 24);
+            DWORD vbe = ((v & 0xFF) << 24) | (((v>>8) & 0xFF) << 16)
+                      | (((v>>16) & 0xFF) << 8) | ((v>>24) & 0xFF);
+            sum += vbe;
+        }
+        printf("  Verify body sum after patch = 0x%08X  (%s)\n",
+               sum, sum == 0 ? "OK" : "FAIL - checksum wrong!");
+    }
+
+    /* --- output path --- */
+    if (g_outFile2[0]) {
+        strncpy(outpath, g_outFile2, sizeof(outpath)-1);
+        outpath[sizeof(outpath)-1] = '\0';
+    } else {
+        snprintf(outpath, sizeof(outpath), "%s_decoded%s.bin",
+                 g_outFile, do_patch ? "_patched" : "");
+    }
+
+    fout = fopen(outpath, "wb");
+    if (!fout) {
+        fprintf(stderr, "Cannot write %s\n", outpath);
+        free(raw); free(body); return 1;
+    }
+    fwrite(body, 1, 0x10000, fout);
+    fclose(fout);
+    printf("\nDecoded body written to: %s  (%u bytes)\n", outpath, 0x10000);
+
+    free(raw);
+    free(body);
+    return 0;
+}
+
+/* Shared execution trigger — pre-cutoff path, confirmed working.
+   Sends WRITE BUFFER mode=0x05 bufID=0xFF len=0x100 with the
+   0xA0 session token (or fallback payload) as payload.
+   Returns 0 on success. */
 static int exec_trigger(const UCHAR *fallback_payload)
 {
     UCHAR sense[SENSE_SIZE] = {0};
@@ -6259,53 +7487,20 @@ static int exec_trigger(const UCHAR *fallback_payload)
     return st;
 }
 
-/* =========================================================
-   CMD_CROSSFLASH
-   Post-cutoff Pioneer crossflash / downgrade.
-
-   Protocol reverse engineered from official Pioneer updater executables:
-
-   Step 1:  WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
-            Unlock trigger payload:
-              [0x00-0x78]  zeros / padding
-              [0x79-0x88]  model string (16 bytes, e.g. "PIONEER BDR-BDS8")
-              [0x89-0x8C]  unlock key (4 bytes little-endian)
-              [0x8D-0xFF]  zeros
-
-   Step 2:  WRITE BUFFER mode=0x07 bufID=0xF0, sequential 0x8000 chunks
-            First pass: normal firmware (0x1E0000 bytes)
-
-   Step 3:  WRITE BUFFER mode=0x07 bufID=0xFE off=0x0000 len=0x0200
-            Token: 512 random bytes
-
-   Step 4:  WRITE BUFFER mode=0x07 bufID=0xFE off=0x1200 len=<kernel_size>
-            Kernel binary (written in up to 0x8000 byte chunks)
-
-   Step 5:  WRITE BUFFER mode=0x07 bufID=0xF0, sequential 0x8000 chunks
-            Second pass: same normal firmware again
-
-   Step 6:  WRITE BUFFER mode=0x05 bufID=0xFF len=0x100
-            Final commit trigger (same payload as step 1)
-
-   Usage:
-     drivekit crossflash E --file kernel.bin --file2 normal.bin [--key 0xAA475E15] [--model "PIONEER BDR-BDS8"]
-
-   Key / model defaults by drive SAT:
-     SAT 9330  (XD08)   key=0xAA475E15  model="PIONEER BDR-BDS8"
-     SAT 9331  (XD08U)  key=0xAA475E15  model="PIONEER BDR-BDS8"
-     SAT 8B30  (XD06U)  key=0x08A98AF2  model="PIONEER BDR-XS06"
-     Universal fallback  key=0x6123789A  model="PIONEER BDR-BDS8"
-   ========================================================= */
-
 /* Write Buffer helper for crossflash - sends a single chunk */
 static int xf_write_buffer(UCHAR mode, UCHAR bufid,
                             DWORD offset, const UCHAR *buf, DWORD len,
                             const char *desc)
 {
-    UCHAR cdb[10];
+    /* BDRFlash uses 12-byte CDB for unlock (mode=0x04) and trigger (mode=0x05).
+       Confirmed from Wireshark capture: bCBWCBLength=0x0C.
+       Other modes (0x07 firmware chunks) use 10-byte CDB. */
+    UCHAR cdb[12];
     UCHAR sense[SENSE_SIZE];
     int   st = 0;
+    int   cdb_len = (mode == 0x04 || mode == 0x05) ? 12 : 10;
 
+    memset(cdb, 0, sizeof(cdb));
     cdb[0] = 0x3B;              /* WRITE BUFFER */
     cdb[1] = mode;
     cdb[2] = bufid;
@@ -6316,8 +7511,9 @@ static int xf_write_buffer(UCHAR mode, UCHAR bufid,
     cdb[7] = (UCHAR)(len    >>  8);
     cdb[8] = (UCHAR)(len         );
     cdb[9] = 0x00;
+    /* cdb[10] and cdb[11] = 0x00 (already zeroed) */
 
-    send_scsi(g_hDrive, cdb, 10, (UCHAR *)buf, len,
+    send_scsi(g_hDrive, cdb, cdb_len, (UCHAR *)buf, len,
               SCSI_IOCTL_DATA_OUT, sense, &st);
     if (st != 0) {
         fprintf(stderr, "  FAILED: %s (mode=0x%02X bufID=0x%02X off=0x%06X len=0x%06X) "
@@ -6384,14 +7580,6 @@ static int xf_send_normal_fw(const UCHAR *fw, DWORD fw_size, int pass)
     return 0;
 }
 
-/* =========================================================
-   CMD_FLASH — Smart flash dispatcher
-   Probes READ BUFFER 0xB0 to detect pre vs post-cutoff drive,
-   then calls cmd_flashfw() or cmd_crossflash() accordingly.
-
-   Usage:
-     drivekit flash E --file kernel.bin --file2 normal.bin
-   ========================================================= */
 /* =========================================================
    CMD_FLASHFW_PRECUT
    Pre-cutoff Pioneer flash protocol — exact implementation
@@ -6643,6 +7831,14 @@ static int cmd_flashfw_precut(void)
     return 0;
 }
 
+/* =========================================================
+   CMD_FLASH — Smart flash dispatcher
+   Probes READ BUFFER 0xB0 to detect pre vs post-cutoff drive,
+   then calls cmd_flashfw() or cmd_crossflash() accordingly.
+
+   Usage:
+     drivekit flash E --file kernel.bin --file2 normal.bin
+   ========================================================= */
 static int cmd_flash(void)
 {
     UCHAR b0buf[16]      = {0};
@@ -6659,7 +7855,23 @@ static int cmd_flash(void)
               SCSI_IOCTL_DATA_IN, b0sense, &b0st);
 
     if (b0st == 0 && b0buf[0] != 0xFF) {
-        is_pre_cutoff = 1;
+        /* 0xB0 returned data — but verify with INQUIRY date
+           hwdump command can leave post-cutoff drives in a state
+           where 0xB0 returns data, fooling the detection */
+        int date_confirms_pre = 1;
+        {
+            UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+            UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+            send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+            if (inqst == 0 && inq[0x25] >= 0x20) {
+                char date[9]={0}; int di;
+                for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                    date[di]=inq[0x25+di];
+                date_confirms_pre = (strcmp(date,"22/12/01") < 0);
+                printf("        FW Date   : %s\n", date);
+            }
+        }
+        is_pre_cutoff = date_confirms_pre;
         printf("        Response  : %02X %02X %02X %02X %02X %02X %02X %02X"
                " %02X %02X %02X %02X %02X %02X %02X %02X\n",
                b0buf[0],b0buf[1],b0buf[2],b0buf[3],
@@ -6689,6 +7901,44 @@ static int cmd_flash(void)
     }
 }
 
+
+/* =========================================================
+   CMD_CROSSFLASH
+   Post-cutoff Pioneer crossflash / downgrade.
+
+   Protocol reverse engineered from official Pioneer updater executables:
+
+   Step 1:  WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
+            Unlock trigger payload:
+              [0x00-0x78]  zeros / padding
+              [0x79-0x88]  model string (16 bytes, e.g. "PIONEER BDR-BDS8")
+              [0x89-0x8C]  unlock key (4 bytes little-endian)
+              [0x8D-0xFF]  zeros
+
+   Step 2:  WRITE BUFFER mode=0x07 bufID=0xF0, sequential 0x8000 chunks
+            First pass: normal firmware (0x1E0000 bytes)
+
+   Step 3:  WRITE BUFFER mode=0x07 bufID=0xFE off=0x0000 len=0x0200
+            Token: 512 random bytes
+
+   Step 4:  WRITE BUFFER mode=0x07 bufID=0xFE off=0x1200 len=<kernel_size>
+            Kernel binary (written in up to 0x8000 byte chunks)
+
+   Step 5:  WRITE BUFFER mode=0x07 bufID=0xF0, sequential 0x8000 chunks
+            Second pass: same normal firmware again
+
+   Step 6:  WRITE BUFFER mode=0x05 bufID=0xFF len=0x100
+            Final commit trigger (same payload as step 1)
+
+   Usage:
+     drivekit crossflash E --file kernel.bin --file2 normal.bin [--key 0xAA475E15] [--model "PIONEER BDR-BDS8"]
+
+   Key / model defaults by drive SAT:
+     SAT 9330  (XD08)   key=0xAA475E15  model="PIONEER BDR-BDS8"
+     SAT 9331  (XD08U)  key=0xAA475E15  model="PIONEER BDR-BDS8"
+     SAT 8B30  (XD06U)  key=0x08A98AF2  model="PIONEER BDR-XS06"
+     Universal fallback  key=0x6123789A  model="PIONEER BDR-BDS8"
+   ========================================================= */
 static int cmd_crossflash(void)
 {
     UCHAR  trigger[256];
@@ -6711,18 +7961,16 @@ static int cmd_crossflash(void)
     model_str[16] = 0;
 
     const char *model = model_str;
-    /* Extract key from auto_payload [0x10-0x13] LE, fall back to universal */
-    DWORD key_le = ((DWORD)auto_payload[0x10])        |
-                   ((DWORD)auto_payload[0x11] <<  8)  |
-                   ((DWORD)auto_payload[0x12] << 16)  |
+    /* Key: extract from auto_payload [0x10-0x13] (LE) — this is the platform+kernelID
+       specific key returned by pioneer_key_lookup() inside build_pioneer_payload_auto().
+       For SAT 9331 / ID05 this is 0x552F4FA4, NOT the universal fallback 0x6123789A.
+       Fall back to universal only if lookup returned zero.
+       Override with --key if needed. */
+    DWORD key_le = ((DWORD)auto_payload[0x10])       |
+                   ((DWORD)auto_payload[0x11] <<  8) |
+                   ((DWORD)auto_payload[0x12] << 16) |
                    ((DWORD)auto_payload[0x13] << 24);
-    if (key_le == 0) key_le = 0x6123789A; /* universal fallback */
-    /* Always use universal key for crossflash unlock trigger —
-       confirmed working on all tested drives (SAT 9330, 9331)
-       Drive-specific trigger keys are for post-cutoff execution trigger only */
-    key_le = 0x6123789A;
-
-    /* --key override */
+    if (key_le == 0) key_le = 0x6123789A; /* universal fallback only if lookup missed */
     if (g_key_override) key_le = g_key_override;
 
     /* TODO: --model override via new global g_model_str if needed */
@@ -6968,22 +8216,20 @@ static int cmd_crossflash(void)
 
     /* -------------------------------------------------------
        STEP 4: KERNEL
-       mode=0x07 bufID=0xFE starting at offset 0x1200
-       Kernel file is sent as-is (includes its own 0x1200 header)
-       so we send from offset 0 in the file to NAND offset 0x1200
-       Wait — from capture: kernel data is written to NAND at 0x1200
-       but the file ITSELF starts with the Pioneer header at 0x0000.
-       The capture showed kernel sent to bufID=0xFE at offset 0x1200
-       with the RAW kernel binary (starting with real H8S/2600 code).
-       Our file 131 has header[0x0000-0x11FF] + kernel[0x1200-end].
-       So we send file[0x1200 onwards] to NAND offset 0x1200.
+       mode=0x07 bufID=0xFE starting at NAND offset 0x000000
+       Trevor's capture: file[0x200:] is sent in 0x100-byte chunks,
+       NAND offset increments from 0x000000. The 0x160-byte Pioneer
+       ASCII envelope header (file[0x000:0x160]) is NOT sent; the
+       payload block starts at file[0x200] (the KernelFront key
+       table for SAT 9331) and continues through file[end].
+       chunk_sz=0x100 is required — larger chunks are rejected.
        ------------------------------------------------------- */
-    printf("[4/6] Kernel (mode=0x07 bufID=0xFE off=0x1200)...\n");
+    printf("[4/6] Kernel (mode=0x07 bufID=0xFE off=0x000000)...\n");
     {
-        DWORD  kdata_offset = 0x1200; /* skip Pioneer file header */
+        DWORD  kdata_offset = 0x200;  /* skip 0x200-byte Pioneer envelope header */
         const UCHAR *kdata  = kernel_data + kdata_offset;
         DWORD  kdata_size   = kernel_size - kdata_offset;
-        DWORD  chunk_sz     = 0x8000;
+        DWORD  chunk_sz     = 0x100;  /* Trevor's capture: 0x100-byte chunks only */
         DWORD  koffset;
         DWORD  chunk_num    = 0;
         DWORD  total_chunks = (kdata_size + chunk_sz - 1) / chunk_sz;
@@ -6994,7 +8240,7 @@ static int cmd_crossflash(void)
         for (koffset = 0; koffset < kdata_size; koffset += chunk_sz) {
             DWORD this_sz = kdata_size - koffset;
             if (this_sz > chunk_sz) this_sz = chunk_sz;
-            DWORD nand_offset = 0x1200 + koffset;
+            DWORD nand_offset = koffset; /* starts at 0x000000, not 0x1200 */
 
             chunk_num++;
             printf("      kernel chunk %lu/%lu nand_offset=0x%06X\r",
@@ -7029,23 +8275,27 @@ static int cmd_crossflash(void)
        ------------------------------------------------------- */
     printf("[6/6] Final commit trigger...\n");
     Sleep(500);
-    st = exec_trigger(trigger);
-    if (st != 0) {
-        printf("  Commit trigger failed (sense 04/4C/02 is normal) - drive is in kernel limbo.\n");
-        printf("  Firmware is already written to NAND. Sending recovery flash...\n\n");
-        Sleep(2000);
-
-        Sleep(2000);
-
-        /* Recovery: use exact same path as flashfw --nounlock
-           Set globals and call cmd_flashfw directly */
-        printf("[6b/6] Recovery via flashfw --nounlock...\n\n");
-        g_nounlock = 1;
-        g_force    = 1;  /* skip interactive prompts */
-        st = cmd_flashfw();
-        /* cmd_flashfw returns non-zero if TUR times out after flash,
-           but the flash itself succeeded — ignore that error */
-        st = 0;
+    /* Commit trigger: WRITE BUFFER mode=0x05 bufID=0xFF length=0x100
+       Same payload as the step-1 unlock (model string + key at [0x10]).
+       Trevor's capture shows 3B 05 FF 00 00 00 00 01 00 00 followed by
+       256 bytes of payload — identical format to the unlock trigger.
+       3B 02 41 A5 AA AA is the B0 gate, NOT the commit trigger. */
+    {
+        UCHAR ccdb[10] = {0x3B, 0x05, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00};
+        UCHAR csense[SENSE_SIZE] = {0};
+        int   cst = 0;
+        /* Re-use the same trigger payload built at the start of cmd_crossflash */
+        printf("      CDB: 3B 05 FF 00 00 00 00 01 00 00\n");
+        printf("      Payload[0x00]: %.16s  Key@[0x10]: 0x%08lX\n",
+               (char*)trigger, key_le);
+        send_scsi(g_hDrive, ccdb, 10, trigger, 0x100,
+                  SCSI_IOCTL_DATA_OUT, csense, &cst);
+        printf("      Status: %s", cst == 0 ? "GOOD" : "FAIL");
+        if (cst != 0)
+            printf(" sense=%02X/%02X/%02X",
+                   csense[2]&0x0F, csense[12], csense[13]);
+        printf("\n");
+        st = cst;
     }
     printf("\n");
 

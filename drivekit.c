@@ -8411,6 +8411,7 @@ static int cmd_crossflash(void)
     DWORD  i;
     int    target_is_postcut = 0;   /* 1 if target firmware Generated Date >= 22/12/27 */
     char   target_fw_version[8] = {0}; /* version string from target firmware header e.g. "1.06" */
+    char   target_kern_id[8]    = {0}; /* kernel ID from kernel file header e.g. "ID05" */
 
     /* Build trigger payload using same auto-detect as flashfw */
     UCHAR auto_payload[256] = {0};
@@ -8483,7 +8484,19 @@ static int cmd_crossflash(void)
                     if (c < 0x20 || c > 0x7E) break;
                     tmp[j] = (char)c;
                 }
-                if (tmp[0]) printf("    %s\n", tmp);
+                if (tmp[0]) {
+                    printf("    %s\n", tmp);
+                    /* Extract kernel ID (e.g. "ID05") from "Kernel Version : ID05" line */
+                    if (strncmp(tmp, "Kernel Version", 14) == 0 && !target_kern_id[0]) {
+                        const char *col = strchr(tmp, ':');
+                        if (col) {
+                            col += 2; /* skip ": " */
+                            int ki;
+                            for (ki = 0; ki < 7 && col[ki] >= 0x20 && col[ki] != ' '; ki++)
+                                target_kern_id[ki] = col[ki];
+                        }
+                    }
+                }
             }
         }
     }
@@ -8972,13 +8985,29 @@ static int cmd_crossflash(void)
     Sleep(500);
     {
         UCHAR commit_trigger[256];
-        DWORD commit_key = key_le; /* default: same as unlock key */
+        DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */
 
         if (g_pre_cutoff && target_is_postcut) {
-            /* Cross-era: commit key = unlock key (confirmed by BDRFlash pcapng).
+            /* pre→post cross-era: commit key = unlock key (confirmed by BDRFlash pcapng).
                The two-pass normal-FW protocol handles era; no key substitution needed. */
-            printf("      Cross-era: using unlock key=0x%08lX (confirmed by pcapng)\n",
+            printf("      Cross-era (pre→post): using unlock key=0x%08lX (confirmed by pcapng)\n",
                    commit_key);
+        } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
+            /* post→pre downgrade: commit key must be target kernel's key, not current drive's key.
+               The drive validates the commit trigger against the ERA of the kernel just written,
+               not the era it booted from. Look up by current driveID + target kernel ID. */
+            DWORD tgt_key = pioneer_key_lookup(g_driveID, target_kern_id);
+            if (tgt_key && tgt_key != key_le) {
+                printf("      Downgrade (post→pre): switching commit key from 0x%08lX to target key 0x%08lX (kernelID=%s)\n",
+                       commit_key, tgt_key, target_kern_id);
+                commit_key = tgt_key;
+            } else if (tgt_key) {
+                printf("      Downgrade (post→pre): target key 0x%08lX same as unlock key (kernelID=%s)\n",
+                       tgt_key, target_kern_id);
+            } else {
+                printf("      Downgrade (post→pre): no key found for kernelID=%s driveID=0x%04lX — using unlock key 0x%08lX\n",
+                       target_kern_id, (DWORD)g_driveID, commit_key);
+            }
         }
 
         xf_build_trigger(commit_trigger, model, commit_key);

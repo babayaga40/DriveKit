@@ -1,7 +1,17 @@
 /*
- * drivekit.c
+ * drivekit.c  —  v15
  * Combined optical drive & storage research toolkit.
  * All tools in one binary, selected via command line arguments.
+ *
+ * v15 changes (2026-10-28):
+ *   - cmd_flashfw: implement BDRFlash two-pass normal-FW protocol for
+ *     pre-cutoff → post-cutoff cross-era flash (confirmed by USBPcap):
+ *       pass1 (fwsize-0x10000) before kernel, pass2 (full) after kernel
+ *   - cmd_flashfw: remove tkey substitution at commit trigger — for pre-cutoff
+ *     drives, commit key = unlock key for BOTH same-era and cross-era.
+ *     tkey hypothesis was WRONG; root cause of 04/4C/02 was wrong pass order.
+ *   - cmd_crossflash: same commit-key fix.
+ *   - 04/4C/02 error message updated to reflect correct diagnosis.
  *
  * Compile: cl.exe drivekit.c
  * Run as Administrator.
@@ -67,6 +77,7 @@ static UCHAR   g_unlock_bufid = 0xFF;
 static int     g_force = 0;
 static DWORD   g_key_override = 0; /* 0 = use derived key */
 static int     g_patch_flag   = 0; /* --patch: apply generation marker patch */
+static int     g_enableversion = 0; /* --enableversion: bypass era mismatch guard */
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static DWORD   g_maxDumpSize = 0;  /* 0 = no limit */
 static int     g_nounlock = 0;    /* skip unlock step */
@@ -1391,17 +1402,18 @@ static const struct { WORD did; const char *str; } g_mdl_map[] = {
     { 0x8801, "PIONEER  BDR-211" },
     { 0x8A10, "PIONEER BDR-US04" },
     { 0x8B30, "PIONEER BDR-XS06" }, /* XD06U — confirmed from official updater */
-    { 0x8D30, "PIONEER BDR-BDS7 " },
-    { 0x8D31, "PIONEER BDR-BDS7 " },
-    { 0x8E20, "PIONEER BDR-BDS7 " },
-    { 0x8E21, "PIONEER BDR-BDS7 " },
+    { 0x8D30, "PIONEER BDR-BDS7" },   /* 16 chars, no trailing space — per reference table */
+    { 0x8D31, "PIONEER BDR-BDS7" },
+    { 0x8E20, "PIONEER BDR-BDS7" },
+    { 0x8E21, "PIONEER BDR-BDS7" },
     { 0x8F00, "PIONEER BDR-212T" },
     { 0x9000, "PIONEER BDR-X12T" },  /* from BDRFlash IDA */
     { 0x9001, "PIONEER BDR-X12T" },
     { 0x8F01, "PIONEER BDR-212T" },
-    { 0x9330, "PIONEER BDR-BDS8 " },
-    { 0x9331, "PIONEER BDR-BDS8 " },
-    { 0x9400, "PIONEER BDR-X13  " },
+    { 0x9330, "PIONEER BDR-BDS8" },   /* 16 chars, no trailing space — per reference table */
+    { 0x9331, "PIONEER BDR-BDS8" },
+    { 0x9400, "PIONEER BDR-213T" },   /* per reference table */
+    { 0x9401, "PIONEER BDR-213T" },   /* per reference table */
     { 0x9620, "PIONEER BDR-XS08U" },
     { 0x9621, "PIONEER BDR-XS08U" },
     { 0, NULL }
@@ -3057,41 +3069,67 @@ static const VENDOR_KEY g_vendor_keys[] = {
    Cross-referenced against BDRFlash drive table
    and sub_40F2A8 branches.                              */
 
-#if 0
-/* ARCHIVED: old hard-coded tkey research.
-   Do not use for active key selection; pioneer_keys[] is authoritative. */
-/* Trigger key table — from updater dword_5D4B38[index=0]
-   Keyed by driveID + target firmware version string
-   Add new entries as updaters are analyzed with extract_keys.py */
+/* Commit trigger key table — from Pioneer updater dword_5D4B38[index=0].
+   *** HISTORICAL / POST-CUTOFF PATH ONLY ***
+   This table is used ONLY for the post-cutoff drive commit trigger path
+   (g_unlock_mode == 0x01, i.e. drive already in kernel mode via 0xB0).
+   It is NOT used for the pre-cutoff drive commit path.
+
+   PRE-CUTOFF DRIVES (g_unlock_mode != 0x01):
+   Confirmed from USBPcap of BDRFlash (Generated Date: 24/10/09 firmware):
+   The commit key (mode=0x05 bufID=0xFF) is IDENTICAL to the unlock key
+   (g_payload[0x10..0x13]) for BOTH same-era and cross-era flashes.
+   The "tkey" hypothesis (separate key for cross-era commit) was WRONG.
+   Cross-era behavior is achieved by the two-pass normal-FW protocol, not
+   by key substitution. The entries for 8D31 below are kept for reference
+   only; they are never consulted for pre-cutoff drives.
+
+   Keyed by source driveID + target firmware version string.
+   Add new entries as more updater binaries are analyzed with extract_keys.py. */
 static const struct {
     WORD  driveID;
-    char  version[8]; /* firmware version from ASCII header e.g. "1.12" */
+    char  version[8]; /* target firmware version from ASCII header e.g. "1.06" */
     DWORD tkey;
 } g_tkey_map[] = {
-    { 0x8B30, "1.12", 0x641E47BD }, /* BDR-XD06U SAT8B30 1.12 */
-    { 0x8D30, "1.06", 0xF0116415 }, /* BDR-XD07  SAT8D30 1.06 */
-    { 0x8D31, "1.06", 0xF0116415 }, /* BDR-XD07U SAT8D31 1.06 */
-    { 0x9330, "1.02", 0x3A932579 }, /* BDR-XD08  SAT9330 1.02 */
-    { 0x9331, "1.02", 0xC4C1F37F }, /* BDR-XD08U SAT9331 1.02 */
-    { 0x9331, "1.04", 0x552F4FA4 }, /* BDR-XD08U SAT9331 1.04 */
+    { 0x8B30, "1.12", 0x641E47BD }, /* BDR-XD06U SAT8B30 → 1.12 */
+    { 0x8D30, "1.05", 0x00000000 }, /* BDR-XD07  SAT8D30 → 1.05 (pre-cutoff path: NOT USED) */
+    { 0x8D30, "1.06", 0xF0116415 }, /* BDR-XD07  SAT8D30 → 1.06 */
+    { 0x8D31, "1.05", 0x00000000 }, /* BDR-XD07U SAT8D31 → 1.05 (pre-cutoff path: NOT USED) */
+    { 0x8D31, "1.06", 0xF0116415 }, /* BDR-XD07U SAT8D31 → 1.06 */
+    { 0x9330, "1.02", 0x3A932579 }, /* BDR-XD08  SAT9330 → 1.02 */
+    { 0x9331, "1.02", 0xC4C1F37F }, /* BDR-XD08U SAT9331 → 1.02 */
+    { 0x9331, "1.04", 0x552F4FA4 }, /* BDR-XD08U SAT9331 → 1.04 */
     { 0,      "",     0x6123789A }, /* universal fallback */
 };
 
-static DWORD tkey_lookup(WORD driveID) {
-    /* Try exact driveID + version match first — version set from firmware header */
-    int i;
-    for (i = 0; g_tkey_map[i].driveID; i++)
-        if (g_tkey_map[i].driveID == driveID &&
-            g_fw_version[0] &&
-            strncmp(g_tkey_map[i].version, g_fw_version, 4) == 0)
-            return g_tkey_map[i].tkey;
-    /* Fall back to driveID only */
-    for (i = 0; g_tkey_map[i].driveID; i++)
-        if (g_tkey_map[i].driveID == driveID)
-            return g_tkey_map[i].tkey;
-    return 0x6123789A; /* universal fallback */
+/* Look up commit trigger key by source driveID + target firmware version.
+   target_version is the version string from the target firmware file header (e.g. "1.06").
+   Returns 0 if no match found at all (caller uses unlock key as fallback).
+   NOTE: never fall back to a different version of the same driveID — a wrong-version
+   tkey will fail with 04/4C/02 just like the unlock key does.  Use universal fallback
+   instead when the exact version isn't in the table. */
+static DWORD tkey_lookup(WORD driveID, const char *target_version) {
+    int i, universal = -1;
+    /* Try exact driveID + version match first (skip entries where tkey==0 = "unknown") */
+    if (target_version && target_version[0]) {
+        for (i = 0; g_tkey_map[i].driveID; i++)
+            if (g_tkey_map[i].driveID == driveID &&
+                strncmp(g_tkey_map[i].version, target_version, 4) == 0) {
+                if (g_tkey_map[i].tkey == 0)
+                    break; /* found but unknown — skip to universal */
+                return g_tkey_map[i].tkey; /* confirmed key */
+            }
+    }
+    /* Find the universal fallback entry (driveID == 0) */
+    for (i = 0; ; i++) {
+        if (g_tkey_map[i].driveID == 0) { universal = i; break; }
+    }
+    /* No confirmed match — do NOT fall back to a different version for the same driveID.
+       Use universal fallback key so caller knows to warn that the key is unconfirmed. */
+    if (universal >= 0)
+        return g_tkey_map[universal].tkey | 0x80000000UL; /* high bit = "universal/unconfirmed" */
+    return 0; /* no fallback at all */
 }
-#endif
 
 static DWORD pioneer_key(WORD driveID, UCHAR cl)
 {
@@ -3474,30 +3512,27 @@ static const PIONEER_KEY pioneer_keys[] =
     { 0x8B30, "ID69", 0x08A98AF2 },
 
     /* platform 0x8D30 */
-    { 0x8D30, "ID35", 0x486F1D43 },
-    { 0x8D30, "ID32", 0x72C07157 },
+    /* platform 0x8D30 — BDR-BDS7 (XD07 non-U) — per reference table */
     { 0x8D30, "ID05", 0xFF8A27B1 },
+    { 0x8D30, "ID32", 0x72C07157 },
+    { 0x8D30, "ID35", 0x486F1D43 },
+    { 0x8D30, "ID36", 0x6989B625 },
     { 0x8D30, "ID69", 0x53E94495 },
     { 0x8D30, "GENE", 0xDD53014A },
-    { 0x8D30, "ID36", 0x6989B625 },
-    { 0x8D30, "ID05", 0xAC32E144 },
-    { 0x8D30, "ID02", 0x69FCD693 },
-    { 0x8D30, "ID03", 0xE079EA97 },
-    { 0x8D30, "ID69", 0xE0B7435E },
-    { 0x8D30, "GENE", 0x88710AE7 },
 
-    /* platform 0x8D31 */
-    { 0x8D31, "ID35", 0x486F1D43 },
+    /* platform 0x8D31 — BDR-BDS7 (XD07U) — per reference table */
+    { 0x8D31, "ID05", 0xFF8A27B1 }, /* BDR-XD07U ID05 confirmed working (pre-cutoff flash) */
     { 0x8D31, "ID32", 0x72C07157 },
-    { 0x8D31, "ID05", 0xFF8A27B1 },
+    { 0x8D31, "ID35", 0x486F1D43 },
+    { 0x8D31, "ID36", 0x6989B625 },
     { 0x8D31, "ID69", 0x53E94495 },
     { 0x8D31, "GENE", 0xDD53014A },
-    { 0x8D31, "ID36", 0x6989B625 },
-    { 0x8D31, "ID05", 0xAC32E144 },
-    { 0x8D31, "ID02", 0x69FCD693 },
-    { 0x8D31, "ID03", 0xE079EA97 },
-    { 0x8D31, "ID69", 0xE0B7435E },
-    { 0x8D31, "GENE", 0x88710AE7 },
+
+    /* platform 0x8E20 — BDR-BDS7 variant — per reference table */
+    { 0x8E20, "GENE", 0x88710AE7 },
+
+    /* platform 0x8E21 — BDR-BDS7 variant — per reference table */
+    { 0x8E21, "ID05", 0xAC32E144 },
 
     /* platform 0x8F00 */
     { 0x8F00, "ID43", 0xEE9A5CDB },
@@ -3543,45 +3578,33 @@ static const PIONEER_KEY pioneer_keys[] =
     { 0x9001, "ID56", 0x99C48009 },
     { 0x9001, "ID43", 0xEE70D781 },
 
-    /* platform 0x9200 */
+    /* platform 0x9200 — BDR-213T — per reference table */
     { 0x9200, "ID43", 0xCCC20AB6 },
-    { 0x9200, "ID72", 0x33408F2D },
     { 0x9200, "ID56", 0x4251D62B },
     { 0x9200, "ID58", 0xAA2109FA },
-    { 0x9200, "ID35", 0x11311837 },
-    { 0x9200, "ID32", 0x334F2F0B },
-    { 0x9200, "ID05", 0x552F4FA4 },
-    { 0x9200, "ID69", 0x66F43913 },
-    { 0x9200, "GENE", 0xDD9524AC }, /* GENERAL variant -> sends AC 24 95 DD */
-    { 0x9200, "ID36", 0xAA475E15 },
+    { 0x9200, "ID72", 0x33408F2D },
 
-    /* platform 0x9201 */
+    /* platform 0x9201 — BDR-213T — per reference table */
     { 0x9201, "ID43", 0xCCC20AB6 },
-    { 0x9201, "ID72", 0x33408F2D },
     { 0x9201, "ID56", 0x4251D62B },
     { 0x9201, "ID58", 0xAA2109FA },
-    { 0x9201, "ID35", 0x11311837 },
-    { 0x9201, "ID32", 0x334F2F0B },
-    { 0x9201, "ID05", 0x552F4FA4 },
-    { 0x9201, "ID69", 0x66F43913 },
-    { 0x9201, "GENE", 0xDD9524AC }, /* GENERAL variant -> sends AC 24 95 DD */
-    { 0x9201, "ID36", 0xAA475E15 },
+    { 0x9201, "ID72", 0x33408F2D },
 
-    /* platform 0x9330 */
-    { 0x9330, "ID35", 0x11311837 },
-    { 0x9330, "ID32", 0x334F2F0B },
+    /* platform 0x9330 — BDR-BDS8 (XD08 non-U) — per reference table */
     { 0x9330, "ID05", 0x552F4FA4 },
+    { 0x9330, "ID32", 0x334F2F0B },
+    { 0x9330, "ID35", 0x11311837 },
+    { 0x9330, "ID36", 0xAA475E15 },
     { 0x9330, "ID69", 0x66F43913 },
     { 0x9330, "GENE", 0xDD9524AC },
-    { 0x9330, "ID36", 0xAA475E15 },
 
-    /* platform 0x9331 */
-    { 0x9331, "ID35", 0x11311837 },
-    { 0x9331, "ID32", 0x334F2F0B },
+    /* platform 0x9331 — BDR-BDS8 (XD08U) — per reference table */
     { 0x9331, "ID05", 0x552F4FA4 },
+    { 0x9331, "ID32", 0x334F2F0B },
+    { 0x9331, "ID35", 0x11311837 },
+    { 0x9331, "ID36", 0xAA475E15 }, /* confirmed from XD08U BDRFlash pcapng trace */
     { 0x9331, "ID69", 0x66F43913 },
     { 0x9331, "GENE", 0xDD9524AC },
-    { 0x9331, "ID36", 0xAA475E15 },
 
     /* platform 0x9400 */
     { 0x9400, "ID15", 0xBF9D3112 },
@@ -5034,7 +5057,9 @@ static void print_help(void)
     printf("                  --file fw_new.bin --file2 fw_old.bin\n");
     printf("  patchfw       Patch firmware header to spoof version for downgrade\n");
     printf("  decryptkernel Decode KernelFront cipher; --patch applies gen-marker fix\n");
-    printf("                  --file fw_ref.bin --file2 fw_target.bin\n");
+    printf("                  --file kernel.100 [--patch] [--file2 out.bin]\n");
+    printf("  encryptkernel Re-encrypt a patched decoded kernel body back to .100\n");
+    printf("                  --file decoded.bin --file2 original.100 [--file3 out.100]\n");
     printf("  autoflash     Auto-detect and flash from firmware\\ folder\n");
     printf("  resetnormal   Attempt to exit kernel/service mode\n");
     printf("  triggerkernel Trigger kernel mode via READ BUFFER 0xB0\n");
@@ -5048,6 +5073,7 @@ static void print_help(void)
     printf("  --file3 name        Second normal firmware pass (post-cutoff drives)\n");
     printf("  --bufid 0xF4        Buffer ID for rawdump (default 0xF4)\n");
     printf("  --force             Skip compatibility checks\n");
+    printf("  --enableversion     Bypass era mismatch guard (research only — expect 04/4C/02)\n");
     printf("  --nounlock          Skip unlock step\n");
     printf("  --key 0x5CF2E094    Override unlock key\n");
     printf("  --patch             Apply generation marker patch (decryptkernel)\n\n");
@@ -5371,6 +5397,24 @@ static int cmd_flashfw(void)
     DWORD  kernel_size;
     DWORD  offset;
     char   fname[256];
+    /* Target firmware (--file2) header info — parsed early so the pre-pass
+       logic knows whether this is a cross-era flash before sending the kernel. */
+    char   fw2_ver[8]    = {0}; /* version string e.g. "1.05" */
+    int    fw2_postcut   = 0;   /* 1 if Generated Date >= 22/12/27 */
+    UCHAR *fw_prepass    = NULL; /* pre-loaded normal FW for cross-era pre-pass */
+    long   fw_prepass_sz = 0;   /* size after any truncation */
+
+    /* Helper macro: handle drive busy between chunks
+       GET EVENT STATUS → REQUEST SENSE → retry
+       Defined here so all code paths in cmd_flashfw can use it. */
+    #define HANDLE_BUSY() do { \
+        UCHAR _es[8], _s2[SENSE_SIZE]; int _st2=0; \
+        UCHAR _escdb[10]={0x4A,0x01,0,0,0x5A,0,0,0,0x08,0}; \
+        send_scsi(g_hDrive,_escdb,10,_es,8,SCSI_IOCTL_DATA_IN,_s2,&_st2); \
+        UCHAR _rscdb[6]={0x03,0,0,0,0x12,0}; UCHAR _rb[18]; \
+        send_scsi(g_hDrive,_rscdb,6,_rb,18,SCSI_IOCTL_DATA_IN,_s2,&_st2); \
+        Sleep(100); \
+    } while(0)
 
     if (!g_outFile[0] && !g_outFile2[0]) {
         fprintf(stderr, "Usage: drivekit flashfw G --file kernel.bin [--file2 normal.bin]\n");
@@ -5485,6 +5529,116 @@ static int cmd_flashfw(void)
         }
     }
 
+    /* Probe READ BUFFER 0xB0 to detect pre-cutoff drive.
+       Pre-cutoff: 0xB0 readable → g_pre_cutoff = 1
+       Post-cutoff: 0xB0 returns sense 05/24/00 → g_pre_cutoff stays 0
+       This flag controls tkey selection at the commit trigger step. */
+    if (!g_pre_cutoff) {
+        UCHAR b0buf[4] = {0};
+        UCHAR b0sense[SENSE_SIZE] = {0};
+        int   b0st = rb_data(0xB0, 0, b0buf, 4, b0sense);
+        if (b0st == 0 || (b0sense[2] & 0x0F) == 0) {
+            g_pre_cutoff = 1;
+            printf("  Drive era: PRE-CUTOFF (0xB0 readable)\n");
+        } else {
+            printf("  Drive era: POST-CUTOFF (0xB0 not readable)\n");
+        }
+    }
+
+    /* Early-load normal FW (--file2) to detect cross-era and build pre-pass.
+       For pre-cutoff drive → post-cutoff FW, BDRFlash protocol requires:
+         [2a] normal FW pass 1  (0x000000 .. fwsize-0x10000)  bufID=0xF0
+         [2b] kernel            (bufID=0xFE)
+         [2c] normal FW pass 2  (0x000000 .. fwsize full)     bufID=0xF0
+       The commit key is the SAME unlock key — no tkey substitution needed.
+       Confirmed from USBPcap of BDRFlash (Generated Date: 24/10/09 firmware). */
+    if (g_outFile2[0]) {
+        FILE *fp_pre;
+        long  fp_pre_sz;
+        fp_pre = fopen(g_outFile2, "rb");
+        if (!fp_pre) { fprintf(stderr, "Cannot open %s\n", g_outFile2); return 1; }
+        fseek(fp_pre, 0, SEEK_END);
+        fp_pre_sz = ftell(fp_pre);
+        fseek(fp_pre, 0, SEEK_SET);
+        fw_prepass = (UCHAR*)malloc(fp_pre_sz);
+        if (!fw_prepass) { fclose(fp_pre); return 1; }
+        fread(fw_prepass, 1, fp_pre_sz, fp_pre);
+        fclose(fp_pre);
+
+        /* Parse version + date from header */
+        {
+            int k;
+            DWORD scan = (fp_pre_sz < 0x300) ? (DWORD)fp_pre_sz : 0x300;
+            if ((DWORD)fp_pre_sz > 0x90 + 8) {
+                for (k = 0; k < 7 && fw_prepass[0x90+k] >= 0x20 && fw_prepass[0x90+k] < 0x7F; k++)
+                    fw2_ver[k] = (char)fw_prepass[0x90+k];
+                fw2_ver[k] = 0;
+            }
+            UCHAR *gd = (UCHAR*)memmem_win(fw_prepass, scan, "Generated Date", 14);
+            if (gd) {
+                UCHAR *col = (UCHAR*)memchr(gd, ':', 32);
+                if (col) {
+                    char fw_date[12] = {0};
+                    col += 2;
+                    for (k = 0; k < 10 && col[k] >= 0x20 && col[k] != 0x0D; k++)
+                        fw_date[k] = col[k];
+                    for (k = 9; k >= 0 && fw_date[k] == ' '; k--) fw_date[k] = 0;
+                    fw2_postcut = (strcmp(fw_date, "22/12/27") >= 0);
+                    printf("  Target FW: version=%s  Date=%s → %s\n",
+                           fw2_ver[0] ? fw2_ver : "?",
+                           fw_date,
+                           fw2_postcut ? "POST-CUTOFF" : "PRE-CUTOFF");
+                }
+            }
+        }
+
+        /* Apply pre-cutoff NAND boundary truncation */
+        fw_prepass_sz = fp_pre_sz;
+        if (fw_prepass_sz > 0x1E0000) {
+            printf("  Pre-cutoff: FW truncated to 0x1E0000 (NAND boundary)\n");
+            fw_prepass_sz = 0x1E0000;
+        }
+    }
+
+    /* Cross-era pre-pass: send normal FW pass 1 BEFORE the kernel.
+       Only for pre-cutoff drive + post-cutoff target FW + kernel file provided. */
+    if (g_pre_cutoff && fw2_postcut && g_outFile[0] && fw_prepass) {
+        DWORD pass1_sz = (fw_prepass_sz > 0x10000) ? (DWORD)(fw_prepass_sz - 0x10000) : (DWORD)fw_prepass_sz;
+        DWORD fw_off   = 0;
+        UCHAR cdb[10];
+        printf("[2a/3] Cross-era pre-pass: normal FW pass 1 (0x%lX bytes)...\n", pass1_sz);
+        while (fw_off < pass1_sz) {
+            DWORD n = pass1_sz - fw_off;
+            if (n > 0x8000) n = 0x8000;
+            memset(cdb, 0, sizeof(cdb));
+            cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
+            cdb[3]=(UCHAR)(fw_off>>16);
+            cdb[4]=(UCHAR)(fw_off>>8);
+            cdb[5]=(UCHAR)(fw_off);
+            cdb[6]=(UCHAR)(n>>16);
+            cdb[7]=(UCHAR)(n>>8);
+            cdb[8]=(UCHAR)(n);
+            send_scsi(g_hDrive, cdb, 10, fw_prepass + fw_off, n,
+                      SCSI_IOCTL_DATA_OUT, sense, &st);
+            if (st != 0) {
+                HANDLE_BUSY();
+                send_scsi(g_hDrive, cdb, 10, fw_prepass + fw_off, n,
+                          SCSI_IOCTL_DATA_OUT, sense, &st);
+                if (st != 0) {
+                    printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
+                           fw_off, sense[2]&0x0F, sense[12]);
+                    free(fw_prepass); return 1;
+                }
+            }
+            fw_off += n;
+            printf("\r  %lu / %lu bytes", fw_off, pass1_sz);
+            fflush(stdout);
+            Sleep(50);
+        }
+        printf("\n  Done. (pass 2 of normal FW will follow after kernel)\n\n");
+        HANDLE_BUSY();
+    }
+
     if (g_outFile[0]) { /* kernel flash - skip if --file2 only */
     printf("  File : %s\n", fname);
 
@@ -5501,10 +5655,27 @@ static int cmd_flashfw(void)
     kernel_size = (DWORD)filesize;
     printf("  Size : 0x%lX bytes (full file including header)\n", kernel_size);
 
-    if (memmem_win(data, 0x200, "SAT 8801", 8))
-        printf("  HW   : SAT 8801 confirmed\n");
-    else
-        printf("  WARN : SAT 8801 not found in header\n");
+    {
+        /* Extract hardware version from header for display (e.g. "SAT 8D31", "SAT 8801") */
+        UCHAR *hw_line = memmem_win(data, 0x200, "Hardware Version", 16);
+        char hw_str[16] = {0};
+        if (hw_line) {
+            UCHAR *col = (UCHAR*)memchr(hw_line, ':', 32);
+            if (col) {
+                col += 2;
+                int k;
+                for (k = 0; k < 15 && col[k] >= 0x20 && col[k] != 0x0D; k++)
+                    hw_str[k] = col[k];
+                /* Trim trailing spaces */
+                for (k = 14; k >= 0 && hw_str[k] == ' '; k--)
+                    hw_str[k] = 0;
+            }
+        }
+        if (hw_str[0])
+            printf("  HW   : %s confirmed\n", hw_str);
+        else
+            printf("  WARN : Hardware Version not found in header\n");
+    }
     if (memmem_win(data, 0x200, "Kernel", 6))
         printf("  Type : Kernel confirmed\n");
 
@@ -5567,7 +5738,7 @@ static int cmd_flashfw(void)
         UCHAR sense2[SENSE_SIZE];
         int   st2 = 0;
         WORD  driveID = 0;
-        char  driveHW[12] = {0};
+        char  driveHW[16] = {0};
         char  fileHW[12]  = {0};
         int   i, j;
 
@@ -5576,7 +5747,7 @@ static int cmd_flashfw(void)
                   SCSI_IOCTL_DATA_IN, sense2, &st2);
 
         if (st2 == 0) {
-            /* Drive ID from platform string e.g. "SAT 8801" */
+            /* Drive ID from platform string e.g. "SAT 8D31", "SAT 8801" */
             char platform[16] = {0};
             /* Copy only printable characters from 0xF1 offset 0x10,
                same technique as print_drive_info to ensure proper
@@ -5587,7 +5758,7 @@ static int cmd_flashfw(void)
                     platform[k] = rb[0x10+k];
                 platform[k] = 0;  /* explicit null terminator */
             }
-            memcpy(driveHW, platform, sizeof(driveHW)-1);
+            memcpy(driveHW, platform, sizeof(driveHW)-1); /* driveHW[16], copies up to 15 chars */
             {
                 /* Find 4 consecutive hex digits */
                 const char *p = platform;
@@ -5829,7 +6000,21 @@ static int cmd_flashfw(void)
                 }
                 } /* end else (!g_pre_cutoff) */
             } else {
-                printf("  GOOD\n\n");
+                printf("  GOOD\n");
+                /* Read 0xF1 after unlock to confirm service mode entry */
+                {
+                    UCHAR f1post[0x30] = {0};
+                    UCHAR f1psense[SENSE_SIZE] = {0};
+                    if (rb_data(0xF1, 0, f1post, 0x30, f1psense) == 0) {
+                        printf("  [DBG] 0xF1 after unlock: %02X %02X %02X %02X (platform: %.12s)\n",
+                               f1post[0], f1post[1], f1post[2], f1post[3],
+                               (f1post[0x10] >= 0x20) ? (char*)&f1post[0x10] : "?");
+                    } else {
+                        printf("  [DBG] 0xF1 after unlock: FAIL key=%02X ASC=%02X\n",
+                               f1psense[2]&0x0F, f1psense[12]);
+                    }
+                }
+                printf("\n");
             }
             Sleep(500);
             memset(es, 0, sizeof(es));
@@ -5838,17 +6023,6 @@ static int cmd_flashfw(void)
         }
         Sleep(100);
     }
-
-    /* Helper macro: handle drive busy between chunks
-       GET EVENT STATUS → REQUEST SENSE → retry         */
-    #define HANDLE_BUSY() do { \
-        UCHAR _es[8], _s2[SENSE_SIZE]; int _st2=0; \
-        UCHAR _escdb[10]={0x4A,0x01,0,0,0x5A,0,0,0,0x08,0}; \
-        send_scsi(g_hDrive,_escdb,10,_es,8,SCSI_IOCTL_DATA_IN,_s2,&_st2); \
-        UCHAR _rscdb[6]={0x03,0,0,0,0x12,0}; UCHAR _rb[18]; \
-        send_scsi(g_hDrive,_rscdb,6,_rb,18,SCSI_IOCTL_DATA_IN,_s2,&_st2); \
-        Sleep(100); \
-    } while(0)
 
     /* Step 2: Send complete kernel .153 file (including 0x200 header)
        Wireshark confirmed: autoflasher sends full file from offset 0  */
@@ -5951,7 +6125,11 @@ static int cmd_flashfw(void)
             if (st != 0) {
                 /* Try single transfer as fallback (XD08 needs this) */
                 DWORD total = (DWORD)filesize;
-                printf("\n  Chunk failed at 0x%lX - trying single transfer...\n", offset);
+                printf("\n  Chunk failed at 0x%lX: sense key=%02X ASC=%02X ASCQ=%02X\n",
+                       offset, sense[2]&0x0F, sense[12], sense[13]);
+                printf("  Trying single transfer...\n");
+                HANDLE_BUSY();
+                Sleep(200);
                 memset(cdb,0,sizeof(cdb));
                 cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE; /* always 0xFE for kernel */
                 cdb[6]=(UCHAR)(total>>16);
@@ -5981,77 +6159,67 @@ static int cmd_flashfw(void)
 
     } /* end kernel section - g_outFile */
 
-    /* Immediately send firmware if --file2 provided */
-    if (g_outFile2[0]) {
-        FILE  *fp2;
-        UCHAR *fw;
-        long   fwsize;
+    /* Send normal firmware (--file2).
+       For cross-era pre-cutoff: this is pass 2 (pass 1 was already sent above).
+       For all other cases: this is the only normal FW send. */
+    if (g_outFile2[0] && fw_prepass) {
+        /* Re-use pre-loaded buffer — no re-read needed */
+        UCHAR *fw      = fw_prepass;
+        long   fwsize  = fw_prepass_sz;   /* already truncated to 0x1E0000 if needed */
         DWORD  fwoffset = 0;
 
-        printf("[2c/3] Sending firmware (%s)...\n  [DBG] g_unlock_mode=0x%02X bufID=0x%02X\n", 
-               g_outFile2, g_unlock_mode, g_unlock_mode==0x01?0x00:0xF0);
-        fp2 = fopen(g_outFile2, "rb");
-        if (!fp2) {
-            fprintf(stderr, "Cannot open %s\n", g_outFile2);
-            return 1;
-        }
-        fseek(fp2, 0, SEEK_END);
-        fwsize = ftell(fp2);
-        fseek(fp2, 0, SEEK_SET);
-        fw = (UCHAR*)malloc(fwsize);
-        if (!fw) { fclose(fp2); return 1; }
-        fread(fw, 1, fwsize, fp2);
-        fclose(fp2);
+        if (g_pre_cutoff && fw2_postcut && g_outFile[0])
+            printf("[2c/3] Normal FW pass 2 (%s, 0x%lX bytes)...\n", g_outFile2, (DWORD)fwsize);
+        else
+            printf("[2c/3] Sending firmware (%s)...\n  [DBG] g_unlock_mode=0x%02X bufID=0x%02X\n",
+                   g_outFile2, g_unlock_mode, g_unlock_mode==0x01?0x00:0xF0);
 
         if (memmem_win(fw, 0x200, "Normal", 6))
             printf("  Type : Normal confirmed\n");
         else
             printf("  WARN : Not a Normal firmware file\n");
 
-        /* Send complete .153 file including header, 0x8000 chunks */
-        {
-            /* Post-cutoff: normal firmware uses bufID=0xF0 offset=0x0000
-               Same as pre-cutoff! Token was already sent to bufID=0xFE */
-            if (g_unlock_mode == 0x01) {
-                printf("  Sending normal firmware (bufID=0xF0 offset=0x0000 len=0x%lX)...\n", (DWORD)fwsize);
-                UCHAR cdb[10];
-                DWORD fw_off = 0;
-                while (fw_off < (DWORD)fwsize) {
-                    DWORD n = (DWORD)fwsize - fw_off;
-                    if (n > 0x8000) n = 0x8000;
-                    memset(cdb, 0, sizeof(cdb));
-                    cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
-                    cdb[3]=(UCHAR)(fw_off>>16);
-                    cdb[4]=(UCHAR)(fw_off>>8);
-                    cdb[5]=(UCHAR)(fw_off);
-                    cdb[6]=(UCHAR)(n>>16);
-                    cdb[7]=(UCHAR)(n>>8);
-                    cdb[8]=(UCHAR)(n);
+        /* Send complete firmware in 0x8000 chunks, bufID=0xF0 */
+        if (g_unlock_mode == 0x01) {
+            /* Post-cutoff service mode path */
+            UCHAR cdb[10];
+            DWORD fw_off = 0;
+            printf("  Sending normal firmware (bufID=0xF0 offset=0x0000 len=0x%lX)...\n", (DWORD)fwsize);
+            while (fw_off < (DWORD)fwsize) {
+                DWORD n = (DWORD)fwsize - fw_off;
+                if (n > 0x8000) n = 0x8000;
+                memset(cdb, 0, sizeof(cdb));
+                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
+                cdb[3]=(UCHAR)(fw_off>>16);
+                cdb[4]=(UCHAR)(fw_off>>8);
+                cdb[5]=(UCHAR)(fw_off);
+                cdb[6]=(UCHAR)(n>>16);
+                cdb[7]=(UCHAR)(n>>8);
+                cdb[8]=(UCHAR)(n);
+                send_scsi(g_hDrive, cdb, 10, fw + fw_off, n,
+                          SCSI_IOCTL_DATA_OUT, sense, &st);
+                if (st != 0) {
+                    HANDLE_BUSY();
                     send_scsi(g_hDrive, cdb, 10, fw + fw_off, n,
                               SCSI_IOCTL_DATA_OUT, sense, &st);
                     if (st != 0) {
-                        HANDLE_BUSY();
-                        send_scsi(g_hDrive, cdb, 10, fw + fw_off, n,
-                                  SCSI_IOCTL_DATA_OUT, sense, &st);
-                        if (st != 0) {
-                            printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
-                                   fw_off, sense[2]&0x0F, sense[12]);
-                            free(fw); return 1;
-                        }
+                        printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
+                               fw_off, sense[2]&0x0F, sense[12]);
+                        free(fw_prepass); fw_prepass = NULL; return 1;
                     }
-                    fw_off += n;
-                    printf("\r  %lu / %lu bytes", fw_off, (DWORD)fwsize);
-                    fflush(stdout);
-                    Sleep(50);
                 }
-                printf("\n");
-                fwoffset = (DWORD)fwsize;
-            } else {
+                fw_off += n;
+                printf("\r  %lu / %lu bytes", fw_off, (DWORD)fwsize);
+                fflush(stdout);
+                Sleep(50);
+            }
+            printf("\n");
+            fwoffset = (DWORD)fwsize;
+        } else {
             while (fwoffset < (DWORD)fwsize) {
                 UCHAR cdb[10];
                 DWORD n = (DWORD)fwsize - fwoffset;
                 if (n > 0x8000) n = 0x8000;
-
                 memset(cdb, 0, sizeof(cdb));
                 cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
                 cdb[3]=(UCHAR)(fwoffset>>16);
@@ -6060,7 +6228,6 @@ static int cmd_flashfw(void)
                 cdb[6]=(UCHAR)(n>>16);
                 cdb[7]=(UCHAR)(n>>8);
                 cdb[8]=(UCHAR)(n);
-
                 send_scsi(g_hDrive, cdb, 10, fw + fwoffset, n,
                           SCSI_IOCTL_DATA_OUT, sense, &st);
                 if (st != 0) {
@@ -6070,7 +6237,7 @@ static int cmd_flashfw(void)
                     if (st != 0) {
                         printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
                                fwoffset, sense[2]&0x0F, sense[12]);
-                        free(fw); return 1;
+                        free(fw_prepass); fw_prepass = NULL; return 1;
                     }
                 }
                 fwoffset += n;
@@ -6079,15 +6246,14 @@ static int cmd_flashfw(void)
                 Sleep(50);
             }
             printf("\n");
-            } /* end else (pre-cutoff) */
-            printf("  Done.\n\n");
         }
+        printf("  Done.\n\n");
 
         /* GET EVENT STATUS + REQUEST SENSE after last firmware chunk */
         HANDLE_BUSY();
 
-        free(fw);
-    } else {
+        free(fw_prepass); fw_prepass = NULL;
+    } else if (!g_outFile2[0]) {
         printf("  TIP: Use --file2 S8801601.153 to send firmware\n\n");
     }
 
@@ -6150,6 +6316,16 @@ static int cmd_flashfw(void)
         HANDLE_BUSY();
         free(fw3);
     }
+
+    /* Allow drive time to finish processing last firmware chunk
+       before issuing the commit trigger.  A drive in bad state
+       from previous failed attempts returns 04/4C (HARDWARE ERROR /
+       LOGICAL UNIT FAILED SELF-CONFIGURATION) if triggered too soon.
+       If you see 04/4C: power-cycle the drive (unplug USB power for
+       10+ seconds) and retry from scratch — the drive flash controller
+       latches an error flag that only clears on hard power reset. */
+    HANDLE_BUSY();
+    Sleep(500);
 
     /* Execution trigger
        Confirmed from Wireshark capture [564]: mode=5 bufID=0xFF len=0x100
@@ -6230,18 +6406,48 @@ static int cmd_flashfw(void)
             }
             trigger_done:;
         } else {
-            /* Pre-cutoff: standard trigger with bufID=0xFF and session token */
+            /* Pre-cutoff drive: commit trigger (mode=0x05 bufID=0xFF).
+               Confirmed from USBPcap of BDRFlash (Generated Date: 24/10/09):
+               For BOTH same-era (pre→pre) AND cross-era (pre→post), the commit
+               key is IDENTICAL to the unlock key (g_payload[0x10..0x13]).
+               The era difference is handled by the two-pass normal-FW protocol
+               (pass1 before kernel, pass2 after), NOT by key substitution.
+               The old "tkey" hypothesis was WRONG — tkey logic removed. */
             UCHAR cdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
-            UCHAR *trig_payload = g_has_token ? g_a0token : g_payload;
-            if (g_has_token)
-                printf("  Using 0xA0 session token for trigger\n");
+            UCHAR trig_payload[0x100];
+            memcpy(trig_payload, g_payload, 0x100);
+            DWORD commit_key = ((DWORD)g_payload[0x10]      ) |
+                               ((DWORD)g_payload[0x11] <<  8) |
+                               ((DWORD)g_payload[0x12] << 16) |
+                               ((DWORD)g_payload[0x13] << 24); /* = unlock key */
+
+            if (g_pre_cutoff && fw2_postcut) {
+                printf("  Cross-era commit: using unlock key=0x%08lX (confirmed by pcapng)\n",
+                       commit_key);
+            }
+
+            printf("  Trigger payload: %.16s key=%02X%02X%02X%02X\n",
+                   (char*)trig_payload,
+                   trig_payload[0x13], trig_payload[0x12],
+                   trig_payload[0x11], trig_payload[0x10]);
             send_scsi(g_hDrive, cdb, 12, trig_payload, 0x100,
                       SCSI_IOCTL_DATA_OUT, sense2, &st2);
         }
         printf("  Status: %s", st2==0?"GOOD":"FAIL");
-        if (st2 != 0)
-            printf(" (key=%02X ASC=%02X)",
-                   sense2[2]&0x0F, sense2[12]);
+        if (st2 != 0) {
+            printf(" (key=%02X ASC=%02X ASCQ=%02X)",
+                   sense2[2]&0x0F, sense2[12], sense2[13]);
+            if (sense2[12] == 0x4C) {
+                printf("\n  NOTE: 04/4C = HARDWARE ERROR / LOGICAL UNIT FAILED SELF-CONFIGURATION\n");
+                printf("  The drive accepted the trigger but its internal flash commit failed.\n");
+                printf("  Possible causes:\n");
+                printf("    1. WRONG FLASH SEQUENCE (ASCQ=02): cross-era (pre→post) flash REQUIRES\n");
+                printf("       two-pass normal FW protocol: pass1 before kernel, pass2 after.\n");
+                printf("       Check that --file2 was specified and drivekit version is >= v15.\n");
+                printf("    2. STALE DRIVE STATE (ASCQ=00 or 02): from previous failed attempts.\n");
+                printf("       >>> POWER CYCLE: unplug USB power 10+ seconds, then retry. <<<\n");
+            }
+        }
         printf("\n\n");
     }
     Sleep(2000);
@@ -6423,8 +6629,11 @@ static int cmd_flashfw(void)
             send_scsi(g_hDrive, cdb, 10, rb, 0x30,
                       SCSI_IOCTL_DATA_IN, sense2, &st2);
             if (st2 == 0) {
-                int is_kernel = (memcmp(rb+0x14,"        ",8)!=0 &&
-                                 memcmp(rb+0x14,"0000    ",8)!=0);
+                /* 0xF1 offset 0x00: serial/model string (normal) or blank (kernel)
+                   Normal mode:  rb[0] is a printable ASCII char (e.g. 'S' in "SAT 8D31...")
+                   Kernel mode:  rb[0] is 0x00 or non-printable
+                   Platform at 0x10, kernel version at 0x18 */
+                int is_kernel = (rb[0] < 0x20);
                 printf("  Mode     : %s\n",
                        is_kernel ? "KERNEL MODE (unexpected!)"
                                  : "NORMAL MODE - flash successful!");
@@ -6512,6 +6721,8 @@ int main(int argc, char *argv[])
             g_key_override = (DWORD)strtoul(argv[++i], NULL, 16);
         } else if (strcmp(argv[i], "--patch") == 0) {
             g_patch_flag = 1;
+        } else if (strcmp(argv[i], "--enableversion") == 0) {
+            g_enableversion = 1;
         } else if (strcmp(argv[i], "--nounlock") == 0) {
             g_nounlock = 1;
         } else if (strcmp(argv[i], "--postcutoff") == 0) {
@@ -6590,7 +6801,11 @@ int main(int argc, char *argv[])
         printf("  - KernelFront cipher reverse engineered (heisenberg)\n");
         printf("    H8S/2600 kernel payload XOR/rotate cipher fully decoded\n");
         printf("    decode(v,k) = ROR32(v^k, k&31) using 1024-entry LE key table\n");
-        printf("    Enables direct kernel inspection, patching and re-encryption\n\n");
+        printf("    Enables direct kernel inspection, patching and re-encryption\n");
+        printf("  - Kernel patch locations for downgrade (MattJackson)\n");
+        printf("    Identified which bytes in the decrypted kernel must be\n");
+        printf("    patched to allow downgrade below version lock\n");
+        printf("    Note: full patch set may not yet be fully implemented\n\n");
 
         printf("  HARDWARE\n");
         printf("  --------\n");
@@ -6624,14 +6839,18 @@ int main(int argc, char *argv[])
         printf("  heisenberg      KernelFront cipher decryption and analysis\n");
         printf("                  Development support and testing throughout\n");
         printf("                  Wireshark capture analysis for SAT 9331\n");
-        printf("                  Huge thanks - this tool would not exist without you\n\n");
+        printf("                  Huge thanks - this tool would not exist without you\n");
+        printf("  MattJackson     Decrypted the kernel file and identified the\n");
+        printf("                  patch locations required for successful downgrade\n");
+        printf("                  below version lock. Shared code openly and has\n");
+        printf("                  been invaluable helping everyone with problems.\n\n");
 
         printf("  BDRFlash special thanks:\n");
         printf("  Pat LaVarre, >NIL<, Agent Smith, Liggy, Mike Chen,\n");
         printf("  ala42, czary2mary, jadburner, cvs, alexx12345, seku,\n");
         printf("  Leman39, wujooj, jurireal, alphaville0527, SnowFox,\n");
         printf("  Kirby, haysey70, Majestic12, elflorek, floppydumper,\n");
-        printf("  redwine, cryptojoe3737, TeddyRaspin, BillyCar11,\n");
+        printf("  redwine, cryptojoe3737, TeddyRaspin,\n");
         printf("  asmcom, payalnik23, aliter404\n\n");
 
         printf("  Tools: Wireshark+USBPcap, IDA Pro, x64dbg, pypcode,\n");
@@ -6697,6 +6916,7 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "xordiff")       == 0) return cmd_xordiff();
     if (strcmp(cmd, "patchfw")       == 0) return cmd_patchfw();
     if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
+    if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
 
     if (open_drive(drv)) return 1;
 
@@ -6732,6 +6952,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "flashinfo")  == 0) ret = cmd_flashinfo();
     else if (strcmp(cmd, "patchfw")        == 0) ret = cmd_patchfw();
     else if (strcmp(cmd, "decryptkernel")  == 0) ret = cmd_decryptkernel();
+    else if (strcmp(cmd, "encryptkernel")  == 0) ret = cmd_encryptkernel();
     else if (strcmp(cmd, "kernellimbo") == 0) {
         /* Enter kernel limbo on post-cutoff drives
            Unlocks drive, sends current firmware, fires XS06 trigger
@@ -6862,6 +7083,7 @@ int main(int argc, char *argv[])
         ret = 1;
     }
 
+    #undef HANDLE_BUSY
     CloseHandle(g_hDrive);
     return ret;
 }
@@ -7275,6 +7497,93 @@ static int cmd_patchfw(void)
      drivekit decryptkernel --file S9331050.100 --patch --out decoded.bin
    ========================================================= */
 
+/* -------------------------------------------------------
+   scan_kernel_body() — inspect a decrypted 64 KiB KernelFront body.
+
+   Fills *out_marker  with the generation marker byte at body offset 0xFE.
+   Fills *out_uhd     with 1 if the UHD-capability signature is present,
+                      0 otherwise.
+
+   The 24-byte UHD signature (SIG0 from Pioneer's body analyser) is present
+   in every UHD-capable H8S/2600 kernel body and in no other.
+   ------------------------------------------------------- */
+static const UCHAR KF_UHD_SIG[24] = {
+    0x5E, 0x40, 0x83, 0xB8, 0x7A, 0x00, 0x41, 0x00,
+    0x03, 0x89, 0x01, 0x00, 0x6F, 0xE0, 0x00, 0xC4,
+    0x01, 0x00, 0x69, 0xE3, 0x5E, 0x40, 0x87, 0xD0,
+};
+
+static void scan_kernel_body(const UCHAR *body, DWORD body_len,
+                              UCHAR *out_marker, int *out_uhd)
+{
+    *out_marker = 0xFF;
+    *out_uhd    = 0;
+
+    if (body_len < 0x10000)
+        return;
+
+    *out_marker = body[0xFE];
+
+    if (body_len >= 24) {
+        DWORD i;
+        for (i = 0; i <= body_len - 24; i++) {
+            if (memcmp(body + i, KF_UHD_SIG, 24) == 0) {
+                *out_uhd = 1;
+                break;
+            }
+        }
+    }
+}
+
+/* Decrypt a KernelFront payload into a caller-supplied 0x10000-byte buffer.
+   key_bytes points to file[0x200], enc_bytes to file[0x1200].
+   Returns 1 on success, 0 on failure (enc_dwords must be 0x10000/4 = 16384). */
+static int kf_decrypt_body(const UCHAR *key_bytes, const UCHAR *enc_bytes,
+                            UCHAR *plain_out)
+{
+    DWORD di;
+    DWORD enc_dwords = 0x10000 / 4;
+    for (di = 0; di < enc_dwords; di++) {
+        DWORD ki = di % 1024;
+        DWORD k  = (DWORD)key_bytes[ki*4    ]        |
+                   ((DWORD)key_bytes[ki*4 + 1] <<  8) |
+                   ((DWORD)key_bytes[ki*4 + 2] << 16) |
+                   ((DWORD)key_bytes[ki*4 + 3] << 24);
+        DWORD ct = (DWORD)enc_bytes[di*4    ]        |
+                   ((DWORD)enc_bytes[di*4 + 1] <<  8) |
+                   ((DWORD)enc_bytes[di*4 + 2] << 16) |
+                   ((DWORD)enc_bytes[di*4 + 3] << 24);
+        DWORD pt = ror32(ct ^ k, (int)(k & 31));
+        plain_out[di*4    ] = (UCHAR)(pt      );
+        plain_out[di*4 + 1] = (UCHAR)(pt >>  8);
+        plain_out[di*4 + 2] = (UCHAR)(pt >> 16);
+        plain_out[di*4 + 3] = (UCHAR)(pt >> 24);
+    }
+    return 1;
+}
+
+/* Print a one-line kernel capability summary (used before and after flash). */
+static void print_kernel_caps(const UCHAR *kf_file, DWORD kf_size, const char *label)
+{
+    UCHAR marker = 0xFF;
+    int   uhd    = 0;
+
+    if (kf_size >= 0x11200) {
+        UCHAR *plain = (UCHAR*)malloc(0x10000);
+        if (plain) {
+            kf_decrypt_body(kf_file + 0x200, kf_file + 0x1200, plain);
+            scan_kernel_body(plain, 0x10000, &marker, &uhd);
+            free(plain);
+        }
+    }
+
+    printf("  %s  Gen: %s (0x%02X)  UHD: %s\n",
+           label,
+           (marker == 0x01) ? "New" : (marker == 0x00 ? "Old" : "Old"),
+           marker,
+           uhd ? "Yes" : "No");
+}
+
 static DWORD ror32(DWORD v, int shift)
 {
     shift &= 31;
@@ -7461,6 +7770,143 @@ static int cmd_decryptkernel(void)
     return 0;
 }
 
+/* =========================================================
+   CMD_ENCRYPTKERNEL
+   Re-encrypt a decoded (plaintext) Pioneer kernel body back
+   into a KernelFront-encrypted .100 file ready to flash.
+
+   The header and key table are taken unchanged from the
+   original .100 file (--file2).  Only the payload region
+   file[0x1200:0x11200] is replaced with the re-encrypted body.
+
+   Encryption is the exact inverse of decryption:
+     ciphertext[i] = ROL32(plaintext[i], k & 31) ^ k
+   where k = keytable[i % 1024]  (same LE key table).
+
+   Usage:
+     drivekit encryptkernel --file decoded_patched.bin --file2 S9331050.100
+   Output:
+     S9331050_reenc.100   (or --file3 to override)
+   ========================================================= */
+
+static DWORD rol32(DWORD v, int shift)
+{
+    shift &= 31;
+    if (shift == 0) return v;
+    return (v << shift) | (v >> (32 - shift));
+}
+
+static int cmd_encryptkernel(void)
+{
+    FILE  *fplain = NULL;   /* decoded body (--file)          */
+    FILE  *forig  = NULL;   /* original .100 template (--file2) */
+    FILE  *fout   = NULL;
+    UCHAR *plain  = NULL;
+    UCHAR *orig   = NULL;
+    long   orig_size;
+    DWORD  i;
+    char   outpath[512];
+
+    /* --- check args --- */
+    if (!g_outFile[0] || !g_outFile2[0]) {
+        fprintf(stderr,
+            "Usage: drivekit encryptkernel --file decoded.bin --file2 original.100 [--file3 out.100]\n");
+        return 1;
+    }
+
+    /* --- read decoded body --- */
+    fplain = fopen(g_outFile, "rb");
+    if (!fplain) { fprintf(stderr, "Cannot open %s\n", g_outFile); return 1; }
+    fseek(fplain, 0, SEEK_END);
+    {
+        long psz = ftell(fplain);
+        if (psz < 0x10000) {
+            fprintf(stderr, "Decoded body too small (need 0x10000 bytes, got 0x%lX)\n", psz);
+            fclose(fplain); return 1;
+        }
+    }
+    fseek(fplain, 0, SEEK_SET);
+    plain = (UCHAR*)malloc(0x10000);
+    if (!plain) { fclose(fplain); return 1; }
+    fread(plain, 1, 0x10000, fplain);
+    fclose(fplain); fplain = NULL;
+
+    /* --- read original .100 (header + key table + old payload) --- */
+    forig = fopen(g_outFile2, "rb");
+    if (!forig) { fprintf(stderr, "Cannot open %s\n", g_outFile2); free(plain); return 1; }
+    fseek(forig, 0, SEEK_END); orig_size = ftell(forig); fseek(forig, 0, SEEK_SET);
+    if (orig_size < 0x11200) {
+        fprintf(stderr, "Original file too small for KernelFront layout (need >= 0x11200, got 0x%lX)\n",
+                (DWORD)orig_size);
+        fclose(forig); free(plain); return 1;
+    }
+    orig = (UCHAR*)malloc((DWORD)orig_size);
+    if (!orig) { fclose(forig); free(plain); return 1; }
+    fread(orig, 1, (DWORD)orig_size, forig);
+    fclose(forig); forig = NULL;
+
+    /* --- key table from original: file[0x200..0x1200) --- */
+    const UCHAR *key_bytes = orig + 0x200;
+    DWORD enc_dwords = 0x10000 / 4;   /* 16384 */
+
+    printf("Re-encrypting KernelFront payload (%u dwords)...\n", enc_dwords);
+
+    /* --- encrypt body in-place into orig[0x1200..0x11200) --- */
+    for (i = 0; i < enc_dwords; i++) {
+        DWORD ki = i % 1024;
+        DWORD k = (DWORD)key_bytes[ki*4 + 0]
+                | ((DWORD)key_bytes[ki*4 + 1] <<  8)
+                | ((DWORD)key_bytes[ki*4 + 2] << 16)
+                | ((DWORD)key_bytes[ki*4 + 3] << 24);
+
+        /* Load plaintext dword (LE) */
+        DWORD pt = (DWORD)plain[i*4 + 0]
+                 | ((DWORD)plain[i*4 + 1] <<  8)
+                 | ((DWORD)plain[i*4 + 2] << 16)
+                 | ((DWORD)plain[i*4 + 3] << 24);
+
+        /* Encrypt: ROL32(pt, k & 31) ^ k  (inverse of ROR32(ct^k, k&31)) */
+        DWORD ct = rol32(pt, (int)(k & 31)) ^ k;
+
+        /* Store ciphertext LE back into orig payload region */
+        orig[0x1200 + i*4 + 0] = (UCHAR)(ct       );
+        orig[0x1200 + i*4 + 1] = (UCHAR)(ct >>  8 );
+        orig[0x1200 + i*4 + 2] = (UCHAR)(ct >> 16 );
+        orig[0x1200 + i*4 + 3] = (UCHAR)(ct >> 24 );
+    }
+
+    printf("Encryption complete. Header and key table preserved unchanged.\n");
+
+    /* --- output path --- */
+    if (g_outFile3[0]) {
+        strncpy(outpath, g_outFile3, sizeof(outpath)-1);
+        outpath[sizeof(outpath)-1] = '\0';
+    } else {
+        /* derive from original filename: strip extension, append _reenc.100 */
+        strncpy(outpath, g_outFile2, sizeof(outpath)-1);
+        outpath[sizeof(outpath)-1] = '\0';
+        {
+            char *dot = strrchr(outpath, '.');
+            if (dot) *dot = '\0';
+        }
+        strncat(outpath, "_reenc.100", sizeof(outpath) - strlen(outpath) - 1);
+    }
+
+    fout = fopen(outpath, "wb");
+    if (!fout) {
+        fprintf(stderr, "Cannot write %s\n", outpath);
+        free(orig); free(plain); return 1;
+    }
+    fwrite(orig, 1, (DWORD)orig_size, fout);
+    fclose(fout);
+    printf("\nRe-encrypted file written to: %s  (%lu bytes)\n", outpath, (unsigned long)orig_size);
+    printf("Ready to flash with: drivekit crossflash <drive> --file %s --file2 <normal.100>\n", outpath);
+
+    free(orig);
+    free(plain);
+    return 0;
+}
+
 /* Shared execution trigger — pre-cutoff path, confirmed working.
    Sends WRITE BUFFER mode=0x05 bufID=0xFF len=0x100 with the
    0xA0 session token (or fallback payload) as payload.
@@ -7644,6 +8090,12 @@ static int cmd_flashfw_precut(void)
         fread(fwdata, 1, fwsize, fp);
         fclose(fp);
         printf("  Normal : %s (%ld bytes)\n", g_outFile2, fwsize);
+        /* Pre-cutoff drives reject ECC/OOB trailer with 05/24/00 at 0x1E0000. */
+        if (fwsize > 0x1E0000) {
+            printf("  Pre-cutoff: truncating fw to 0x1E0000 (dropping 0x%lX ECC bytes)\n",
+                   fwsize - 0x1E0000);
+            fwsize = 0x1E0000;
+        }
     }
 
     /* Build payload — for pre-cutoff drives 0xA0 returns capability data
@@ -7672,7 +8124,12 @@ static int cmd_flashfw_precut(void)
             }
         }
     }
-    printf("  Payload: %.16s + key\n\n", (char*)g_payload);
+    /* Use whatever key pioneer_key_lookup() selected — same key for unlock AND trigger.
+       The blueprint says trigger payload = same as unlock payload.
+       Only override if --key was passed explicitly on the command line. */
+    printf("  Payload: %.16s + key %08lX\n\n", (char*)g_payload,
+           ((DWORD)g_payload[0x10]) | ((DWORD)g_payload[0x11]<<8) |
+           ((DWORD)g_payload[0x12]<<16) | ((DWORD)g_payload[0x13]<<24));
 
     /* Warning and confirmation */
     {
@@ -7741,7 +8198,7 @@ static int cmd_flashfw_precut(void)
         DWORD n = (DWORD)ksize - offset;
         if (n > 0x8000) n = 0x8000;
         cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
-        cdb[3]=(UCHAR)(offset>>16); cdb[4]=(UCHAR)(offset>>8); cdb[5]=(UCHAR)(offset);
+        cdb[3]=0; cdb[4]=0; cdb[5]=0; /* pre-cutoff: drive advances offset internally */
         cdb[6]=(UCHAR)(n>>16);      cdb[7]=(UCHAR)(n>>8);      cdb[8]=(UCHAR)(n);
         send_scsi(g_hDrive, cdb, 10, kdata+offset, n, SCSI_IOCTL_DATA_OUT, sense, &st);
         if (st != 0) {
@@ -7770,7 +8227,7 @@ static int cmd_flashfw_precut(void)
             DWORD n = (DWORD)fwsize - offset;
             if (n > 0x8000) n = 0x8000;
             cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xF0;
-            cdb[3]=(UCHAR)(offset>>16); cdb[4]=(UCHAR)(offset>>8); cdb[5]=(UCHAR)(offset);
+            cdb[3]=0; cdb[4]=0; cdb[5]=0; /* pre-cutoff: drive advances offset internally */
             cdb[6]=(UCHAR)(n>>16);      cdb[7]=(UCHAR)(n>>8);      cdb[8]=(UCHAR)(n);
             send_scsi(g_hDrive, cdb, 10, fwdata+offset, n, SCSI_IOCTL_DATA_OUT, sense, &st);
             if (st != 0) {
@@ -7952,6 +8409,8 @@ static int cmd_crossflash(void)
     FILE  *fp;
     int    st = 0;
     DWORD  i;
+    int    target_is_postcut = 0;   /* 1 if target firmware Generated Date >= 22/12/27 */
+    char   target_fw_version[8] = {0}; /* version string from target firmware header e.g. "1.06" */
 
     /* Build trigger payload using same auto-detect as flashfw */
     UCHAR auto_payload[256] = {0};
@@ -8029,6 +8488,142 @@ static int cmd_crossflash(void)
         }
     }
 
+    /* Pre-flash capability snapshot */
+    print_kernel_caps(kernel_data, kernel_size, "Before:");
+
+    /* -------------------------------------------------------
+       KernelFront auto-detect, patch and re-encrypt (in-place)
+
+       A KernelFront file has:
+         file[0x000:0x200]   — ASCII envelope header
+         file[0x200:0x1200]  — 1024 LE DWORD key table
+         file[0x1200:0x11200]— 65536-byte encrypted payload
+
+       Detection heuristic: if the file is >= 0x11200 bytes AND
+       the 512-byte envelope header contains only printable ASCII
+       (Pioneer always writes readable strings there), AND the
+       first dword of the payload region (file[0x1200]) XOR'd with
+       the first key (file[0x200]) and ROR'd produces a value whose
+       high byte is in 0x00..0x7F (plausible H8S opcode range) —
+       then KernelFront is present.
+
+       When detected:
+         1. Decrypt payload in a temp buffer
+         2. If --patch: flip generation marker 0xFF→0x01, recompute checksum
+         3. Re-encrypt back into kernel_data[0x1200..0x11200]
+         kernel_data is then used as-is for the NAND write.
+       ------------------------------------------------------- */
+    {
+        int kf_detected = 0;
+
+        if (kernel_size >= 0x11200) {
+            /* Check envelope header is printable ASCII (allow CR/LF/NUL — Pioneer
+               headers are CRLF-terminated text with embedded nulls for padding) */
+            DWORD pi; int printable = 1;
+            for (pi = 0; pi < 0x100; pi++) {
+                UCHAR c = kernel_data[pi];
+                if (c == 0x00 || c == 0x0D || c == 0x0A) continue; /* NUL, CR, LF */
+                if (c < 0x20 || c > 0x7E) { printable = 0; break; }
+            }
+            if (!printable) {
+                printf("  KernelFront: header not ASCII (byte 0x%02X at +0x%02X) — raw kernel\n",
+                       kernel_data[pi], pi);
+            } else {
+                /* Test-decrypt first dword to confirm key table is valid */
+                DWORD k0 = (DWORD)kernel_data[0x200]        |
+                           ((DWORD)kernel_data[0x201] <<  8) |
+                           ((DWORD)kernel_data[0x202] << 16) |
+                           ((DWORD)kernel_data[0x203] << 24);
+                DWORD c0 = (DWORD)kernel_data[0x1200]        |
+                           ((DWORD)kernel_data[0x1201] <<  8) |
+                           ((DWORD)kernel_data[0x1202] << 16) |
+                           ((DWORD)kernel_data[0x1203] << 24);
+                DWORD p0 = ror32(c0 ^ k0, (int)(k0 & 31));
+                /* H8S/2600 instructions: high byte typically 0x00-0x7F */
+                printf("  KernelFront: header ASCII OK, test-decrypt p0=0x%08X (high=0x%02X)\n",
+                       p0, p0 >> 24);
+                if ((p0 >> 24) <= 0x7F)
+                    kf_detected = 1;
+            }
+        }
+
+        if (kf_detected) {
+            printf("  KernelFront: detected — decrypting in-place");
+            if (g_patch_flag) printf(" + patching generation marker");
+            printf("...\n");
+
+            const UCHAR *key_bytes = kernel_data + 0x200;
+            UCHAR *enc_bytes       = kernel_data + 0x1200;
+            DWORD  enc_dwords      = 0x10000 / 4;  /* 16384 */
+            UCHAR *plain           = (UCHAR*)malloc(0x10000);
+            if (!plain) { free(kernel_data); return 1; }
+
+            /* Decrypt via shared helper */
+            DWORD di;
+            kf_decrypt_body(key_bytes, enc_bytes, plain);
+
+            /* Patch generation marker at body byte 0xFE (runtime addr 0x4000FE).
+               Valid old-gen values: 0xFF or 0x00.  New-gen value: 0x01.
+               Checksum compensation mirrors the source exactly:
+                 marker_delta = (0x01 - marker) * 0x100   (wrapping u32)
+                 compensation = -marker_delta              (wrapping u32)
+               Add compensation to the existing BE32 word at body offset 0x1020.
+               Only two locations in the body change; the additive BE32 sum
+               over the full 64 KiB body remains zero. */
+            if (g_patch_flag) {
+                UCHAR marker = plain[0xFE];
+                if (marker == 0x01) {
+                    printf("  KernelFront: generation marker already 0x01 — no patch needed\n");
+                } else if (marker == 0xFF || marker == 0x00) {
+                    plain[0xFE] = 0x01;
+                    printf("  KernelFront: generation marker patched 0x%02X -> 0x01\n", marker);
+
+                    /* Delta-adjust the checksum word at body offset 0x1020 */
+                    {
+                        DWORD marker_delta = ((DWORD)0x01 - (DWORD)marker) * (DWORD)0x100;
+                        DWORD compensation = (DWORD)(-(int)marker_delta);
+                        DWORD old_word = ((DWORD)plain[0x1020] << 24) |
+                                         ((DWORD)plain[0x1021] << 16) |
+                                         ((DWORD)plain[0x1022] <<  8) |
+                                          (DWORD)plain[0x1023];
+                        DWORD new_word = old_word + compensation;
+                        plain[0x1020] = (UCHAR)(new_word >> 24);
+                        plain[0x1021] = (UCHAR)(new_word >> 16);
+                        plain[0x1022] = (UCHAR)(new_word >>  8);
+                        plain[0x1023] = (UCHAR)(new_word      );
+                        printf("  KernelFront: checksum word 0x%08X -> 0x%08X\n",
+                               old_word, new_word);
+                    }
+                } else {
+                    printf("  KernelFront: unknown generation marker 0x%02X — skipping patch\n",
+                           marker);
+                }
+            }
+
+            /* Re-encrypt back into kernel_data payload region */
+            for (di = 0; di < enc_dwords; di++) {
+                DWORD ki = di % 1024;
+                DWORD k  = (DWORD)key_bytes[ki*4    ]        |
+                           ((DWORD)key_bytes[ki*4 + 1] <<  8) |
+                           ((DWORD)key_bytes[ki*4 + 2] << 16) |
+                           ((DWORD)key_bytes[ki*4 + 3] << 24);
+                DWORD pt = (DWORD)plain[di*4    ]        |
+                           ((DWORD)plain[di*4 + 1] <<  8) |
+                           ((DWORD)plain[di*4 + 2] << 16) |
+                           ((DWORD)plain[di*4 + 3] << 24);
+                DWORD ct = rol32(pt, (int)(k & 31)) ^ k;
+                enc_bytes[di*4    ] = (UCHAR)(ct      );
+                enc_bytes[di*4 + 1] = (UCHAR)(ct >>  8);
+                enc_bytes[di*4 + 2] = (UCHAR)(ct >> 16);
+                enc_bytes[di*4 + 3] = (UCHAR)(ct >> 24);
+            }
+            free(plain);
+            printf("  KernelFront: re-encrypted OK\n\n");
+        } else {
+            printf("  KernelFront: not detected — kernel sent as-is\n\n");
+        }
+    }
+
     /* Load normal firmware file */
     fp = fopen(g_outFile2, "rb");
     if (!fp) {
@@ -8037,12 +8632,7 @@ static int cmd_crossflash(void)
         return 1;
     }
     fseek(fp, 0, SEEK_END);
-    {
-        /* Send the FULL file including ECC/OOB trailer — confirmed from Pioneer updater analysis:
-           first pass writes 0x1E6800 (full file), not just 0x1E0000 (NAND image).
-           Truncating to 0x1E0000 causes commit trigger to fail with 04/4C/02. */
-        normal_size = (DWORD)ftell(fp);
-    }
+    normal_size = (DWORD)ftell(fp);
     fseek(fp, 0, SEEK_SET);
     normal_data = (UCHAR*)malloc(normal_size);
     if (!normal_data) { fclose(fp); free(kernel_data); return 1; }
@@ -8050,7 +8640,106 @@ static int cmd_crossflash(void)
     fclose(fp);
     printf("  Normal  : %s (%lu bytes = 0x%06X)\n",
            g_outFile2, normal_size, normal_size);
+
+    /* Parse target firmware version and Generated Date from normal_data header.
+       Pioneer .153 header layout (binary, fixed offsets):
+         0x90: firmware version string  e.g. "1.06"
+         0xB0: hardware/platform string e.g. "SAT 8D31"
+       "Generated Date" is in the human-readable text block near offset 0x00-0x200.
+       Version and date are both used to select the correct commit trigger key. */
+    {
+        UCHAR *p = normal_data;
+        DWORD  scan = (normal_size < 0x300) ? normal_size : 0x300;
+        int k;
+
+        /* Version at fixed offset 0x90 */
+        if (normal_size > 0x90 + 8) {
+            for (k = 0; k < 7 && p[0x90+k] >= 0x20 && p[0x90+k] < 0x7F; k++)
+                target_fw_version[k] = (char)p[0x90+k];
+            target_fw_version[k] = 0;
+        }
+
+        /* Generated Date: text-search in header block */
+        UCHAR *gd = (UCHAR*)memmem_win(p, scan, "Generated Date", 14);
+        if (gd) {
+            UCHAR *col = (UCHAR*)memchr(gd, ':', 32);
+            if (col) {
+                char fw_date[12] = {0};
+                col += 2;
+                for (k = 0; k < 10 && col[k] >= 0x20 && col[k] != 0x0D; k++)
+                    fw_date[k] = col[k];
+                for (k = 9; k >= 0 && fw_date[k] == ' '; k--) fw_date[k] = 0;
+                target_is_postcut = (strcmp(fw_date, "22/12/27") >= 0);
+                printf("  Target FW   : version=%s  Generated Date=%s → %s\n",
+                       target_fw_version[0] ? target_fw_version : "?",
+                       fw_date,
+                       target_is_postcut ? "POST-CUTOFF" : "PRE-CUTOFF");
+            }
+        }
+    }
     printf("\n");
+
+    /* -------------------------------------------------------
+       DETECT PRE-CUTOFF: attempt READ BUFFER 0xB0.
+       Pre-cutoff drives respond with data; post-cutoff drives
+       return check condition. Pre-cutoff drives reject the 0x6600-byte
+       ECC/OOB trailer (bytes past 0x1E0000) with 05/24/00 — truncate to
+       0x1E0000 for them.  Post-cutoff drives accept the full 0x1E6600 file.
+       ------------------------------------------------------- */
+    {
+        UCHAR b0_probe[16] = {0};
+        UCHAR b0_sense[SENSE_SIZE] = {0};
+        UCHAR b0_cdb[10] = {0x3C,0x02,0xB0,0x00,0x00,0x00,0x00,0x00,0x10,0x00};
+        int   b0_st = 0;
+        int   is_precut = 0;
+        send_scsi(g_hDrive, b0_cdb, 10, b0_probe, 0x10,
+                  SCSI_IOCTL_DATA_IN, b0_sense, &b0_st);
+        if (b0_st == 0 && b0_probe[0] != 0xFF) {
+            UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+            UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+            send_scsi(g_hDrive, inqcdb, 6, inq, 64,
+                      SCSI_IOCTL_DATA_IN, inqs, &inqst);
+            if (inqst == 0 && inq[0x25] >= 0x20) {
+                char date[9]={0}; int di;
+                for (di=0; di<8 && inq[0x25+di]>=0x20 && inq[0x25+di]<=0x7E; di++)
+                    date[di] = inq[0x25+di];
+                is_precut = (strcmp(date,"22/12/01") < 0);
+                printf("  Drive detection: FW date %s → %s\n", date,
+                       is_precut ? "PRE-CUTOFF" : "POST-CUTOFF (B0 open, date late)");
+            } else {
+                is_precut = 1;
+                printf("  Drive detection: PRE-CUTOFF (READ BUFFER 0xB0 accessible)\n");
+            }
+        } else {
+            printf("  Drive detection: POST-CUTOFF (READ BUFFER 0xB0 not accessible)\n");
+        }
+        if (is_precut) {
+            g_pre_cutoff = 1;
+            if (normal_size > 0x1E0000) {
+                printf("  Pre-cutoff: truncating normal fw to 0x1E0000 (NAND boundary)\n");
+                printf("  Pre-cutoff drives reject ECC/OOB trailer (0x%06X bytes dropped)\n",
+                       normal_size - 0x1E0000);
+                normal_size = 0x1E0000;
+            } else {
+                printf("  Normal fw already <= NAND boundary — no truncation needed\n");
+            }
+        } else {
+            printf("  Sending full firmware file including ECC/OOB trailer\n");
+        }
+        printf("\n");
+    }
+
+    /* Cross-era notice: pre-cutoff drive + post-cutoff target firmware.
+       Confirmed from USBPcap of BDRFlash (Generated Date: 24/10/09):
+       The commit key (mode=0x05) is IDENTICAL to the unlock key — no tkey needed.
+       The two-pass normal-FW protocol (pass1 before kernel, pass2 after) handles
+       the era difference.  No user action needed. */
+    if (g_pre_cutoff && target_is_postcut) {
+        printf("  Cross-era flash: PRE-CUTOFF drive → POST-CUTOFF firmware\n");
+        printf("  Commit trigger uses unlock key=0x%08lX (confirmed by pcapng)\n", key_le);
+        printf("  (BDRFlash confirmed: this combination works)\n");
+        printf("\n");
+    }
 
     /* Sanity checks on file headers */
     if (kernel_size < 0x1200) {
@@ -8269,35 +8958,68 @@ static int cmd_crossflash(void)
     /* -------------------------------------------------------
        STEP 6: FINAL COMMIT TRIGGER
        mode=0x05 bufID=0xFF len=0x100
-       Same payload as step 1 (model + key)
+       For same-era flash:  payload = same model+key as step-1 unlock
+       For cross-era flash: payload uses target-era key from tkey_map[]
+         (BDRFlash uses dword_5D4B38[index=0] — the commit key table —
+          which is keyed by target firmware version, not source drive era)
+       IMPORTANT: mode=0x05 requires a 12-byte CDB — confirmed from
+       Wireshark capture of Pioneer BDRFlash (bCBWCBLength=0x0C).
+       10-byte CDB for mode=0x05 causes 04/4C rejection.
        Wait 500ms after second firmware pass before committing —
        drive needs time to finish NAND write before accepting trigger.
        ------------------------------------------------------- */
     printf("[6/6] Final commit trigger...\n");
     Sleep(500);
-    /* Commit trigger: WRITE BUFFER mode=0x05 bufID=0xFF length=0x100
-       Same payload as the step-1 unlock (model string + key at [0x10]).
-       Trevor's capture shows 3B 05 FF 00 00 00 00 01 00 00 followed by
-       256 bytes of payload — identical format to the unlock trigger.
-       3B 02 41 A5 AA AA is the B0 gate, NOT the commit trigger. */
     {
-        UCHAR ccdb[10] = {0x3B, 0x05, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00};
-        UCHAR csense[SENSE_SIZE] = {0};
-        int   cst = 0;
-        /* Re-use the same trigger payload built at the start of cmd_crossflash */
-        printf("      CDB: 3B 05 FF 00 00 00 00 01 00 00\n");
+        UCHAR commit_trigger[256];
+        DWORD commit_key = key_le; /* default: same as unlock key */
+
+        if (g_pre_cutoff && target_is_postcut) {
+            /* Cross-era: commit key = unlock key (confirmed by BDRFlash pcapng).
+               The two-pass normal-FW protocol handles era; no key substitution needed. */
+            printf("      Cross-era: using unlock key=0x%08lX (confirmed by pcapng)\n",
+                   commit_key);
+        }
+
+        xf_build_trigger(commit_trigger, model, commit_key);
+        printf("      CDB: 3B 05 FF 00 00 00 00 00 01 00 00 00  (12-byte)\n");
         printf("      Payload[0x00]: %.16s  Key@[0x10]: 0x%08lX\n",
-               (char*)trigger, key_le);
-        send_scsi(g_hDrive, ccdb, 10, trigger, 0x100,
-                  SCSI_IOCTL_DATA_OUT, csense, &cst);
-        printf("      Status: %s", cst == 0 ? "GOOD" : "FAIL");
-        if (cst != 0)
-            printf(" sense=%02X/%02X/%02X",
-                   csense[2]&0x0F, csense[12], csense[13]);
+               (char*)commit_trigger, commit_key);
+        st = xf_write_buffer(0x05, 0xFF, 0x000000, commit_trigger, 0x100, "commit_trigger");
+        printf("      Status: %s\n", st == 0 ? "GOOD" : "FAIL");
         printf("\n");
-        st = cst;
     }
-    printf("\n");
+
+    /* Post-flash capability summary */
+    {
+        UCHAR after_marker = 0xFF;
+        int   after_uhd    = 0;
+        UCHAR before_marker = 0xFF;
+        int   before_uhd    = 0;
+
+        if (kernel_size >= 0x11200) {
+            UCHAR *plain = (UCHAR*)malloc(0x10000);
+            if (plain) {
+                /* Scan what we actually sent (already patched + re-encrypted
+                   in kernel_data if --patch was used) */
+                kf_decrypt_body(kernel_data + 0x200, kernel_data + 0x1200, plain);
+                scan_kernel_body(plain, 0x10000, &after_marker, &after_uhd);
+                free(plain);
+            }
+        }
+
+        printf("  After:   Gen: %s (0x%02X)  UHD: %s\n",
+               (after_marker == 0x01) ? "New" : "Old",
+               after_marker,
+               after_uhd ? "Yes" : "No");
+        printf("\n");
+
+        if (after_uhd)
+            printf("  → Drive is now UHD compatible.\n");
+        else
+            printf("  → Drive does not have UHD capability in this firmware.\n");
+        printf("\n");
+    }
 
     printf("=== CROSSFLASH COMPLETE ===\n\n");
     printf("  Drive is now rebooting with new firmware.\n");

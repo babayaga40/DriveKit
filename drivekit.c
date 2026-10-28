@@ -77,6 +77,7 @@ static UCHAR   g_unlock_bufid = 0xFF;
 static int     g_force = 0;
 static DWORD   g_key_override = 0; /* 0 = use derived key */
 static int     g_patch_flag   = 0; /* --patch: apply generation marker patch */
+static int     g_fakedate     = 0; /* --fakedate: patch Generated Date to 22/12/27 in FW buffers */
 static int     g_enableversion = 0; /* --enableversion: bypass era mismatch guard */
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static DWORD   g_maxDumpSize = 0;  /* 0 = no limit */
@@ -149,6 +150,20 @@ static void *memmem_win(const void *hay, size_t hlen,
         if (memcmp(h + i, n, nlen) == 0)
             return (void*)(h + i);
     return NULL;
+}
+
+/* Patch "Generated Date : YY/MM/DD" in a firmware buffer in-memory.
+   Searches first 0x400 bytes. Returns 1 if patched, 0 if not found. */
+static int patch_generated_date(UCHAR *buf, DWORD buf_sz, const char *fake_date)
+{
+    UCHAR *p = (UCHAR*)memmem_win(buf, buf_sz < 0x400 ? buf_sz : 0x400,
+                                  "Generated Date", 14);
+    if (!p) return 0;
+    UCHAR *col = (UCHAR*)memchr(p, ':', 32);
+    if (!col) return 0;
+    col += 2; /* skip ": " */
+    memcpy(col, fake_date, 8); /* overwrite YY/MM/DD */
+    return 1;
 }
 
 /* =========================================================
@@ -5565,6 +5580,14 @@ static int cmd_flashfw(void)
         fread(fw_prepass, 1, fp_pre_sz, fp_pre);
         fclose(fp_pre);
 
+        /* --fakedate: patch Generated Date to 22/12/27 before era detection */
+        if (g_fakedate) {
+            if (patch_generated_date(fw_prepass, (DWORD)fp_pre_sz, "22/12/27"))
+                printf("  --fakedate: patched normal FW Generated Date → 22/12/27\n");
+            else
+                printf("  --fakedate: WARNING: Generated Date not found in normal FW header\n");
+        }
+
         /* Parse version + date from header */
         {
             int k;
@@ -5654,6 +5677,14 @@ static int cmd_flashfw(void)
 
     kernel_size = (DWORD)filesize;
     printf("  Size : 0x%lX bytes (full file including header)\n", kernel_size);
+
+    /* --fakedate: patch kernel Generated Date in-memory */
+    if (g_fakedate) {
+        if (patch_generated_date(data, kernel_size, "22/12/27"))
+            printf("  --fakedate: patched kernel Generated Date → 22/12/27\n");
+        else
+            printf("  --fakedate: WARNING: Generated Date not found in kernel header\n");
+    }
 
     {
         /* Extract hardware version from header for display (e.g. "SAT 8D31", "SAT 8801") */
@@ -6721,6 +6752,8 @@ int main(int argc, char *argv[])
             g_key_override = (DWORD)strtoul(argv[++i], NULL, 16);
         } else if (strcmp(argv[i], "--patch") == 0) {
             g_patch_flag = 1;
+        } else if (strcmp(argv[i], "--fakedate") == 0) {
+            g_fakedate = 1;
         } else if (strcmp(argv[i], "--enableversion") == 0) {
             g_enableversion = 1;
         } else if (strcmp(argv[i], "--nounlock") == 0) {

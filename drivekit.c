@@ -8994,23 +8994,41 @@ static int cmd_crossflash(void)
                    commit_key);
         } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
             /* post→pre downgrade: commit key must be target kernel's key, not current drive's key.
-               The drive validates the commit trigger against the ERA of the kernel just written,
-               not the era it booted from. Look up by current driveID + target kernel ID. */
+               Also switch model string to the pre-cutoff model (e.g. "PIONEER BDR-XD07U")
+               rather than the post-cutoff BDS7 model string. */
             DWORD tgt_key = pioneer_key_lookup(g_driveID, target_kern_id);
             if (tgt_key && tgt_key != key_le) {
-                printf("      Downgrade (post→pre): switching commit key from 0x%08lX to target key 0x%08lX (kernelID=%s)\n",
+                printf("      Downgrade (post→pre): switching commit key 0x%08lX → 0x%08lX (kernelID=%s)\n",
                        commit_key, tgt_key, target_kern_id);
                 commit_key = tgt_key;
             } else if (tgt_key) {
                 printf("      Downgrade (post→pre): target key 0x%08lX same as unlock key (kernelID=%s)\n",
                        tgt_key, target_kern_id);
             } else {
-                printf("      Downgrade (post→pre): no key found for kernelID=%s driveID=0x%04lX — using unlock key 0x%08lX\n",
+                printf("      Downgrade (post→pre): no key for kernelID=%s driveID=0x%04lX — using unlock key 0x%08lX\n",
                        target_kern_id, (DWORD)g_driveID, commit_key);
+            }
+            /* Also use pre-cutoff model string from g_pioneer_drives[] */
+            {
+                const PIONEER_DRIVE *drv = pioneer_lookup(g_driveID);
+                if (drv && drv->model && drv->model[0]) {
+                    memset(commit_trigger, 0, 256);
+                    memset(commit_trigger, 0x20, 16);
+                    strncpy((char*)commit_trigger, drv->model, 16);
+                    printf("      Downgrade (post→pre): using pre-cutoff model '%.16s'\n",
+                           (char*)commit_trigger);
+                    /* fill key then skip xf_build_trigger */
+                    commit_trigger[0x10] = (UCHAR)(commit_key      );
+                    commit_trigger[0x11] = (UCHAR)(commit_key >>  8);
+                    commit_trigger[0x12] = (UCHAR)(commit_key >> 16);
+                    commit_trigger[0x13] = (UCHAR)(commit_key >> 24);
+                    goto commit_built;
+                }
             }
         }
 
         xf_build_trigger(commit_trigger, model, commit_key);
+        commit_built:;
         printf("      CDB: 3B 05 FF 00 00 00 00 00 01 00 00 00  (12-byte)\n");
         printf("      Payload[0x00]: %.16s  Key@[0x10]: 0x%08lX\n",
                (char*)commit_trigger, commit_key);

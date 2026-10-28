@@ -5686,6 +5686,61 @@ static int cmd_flashfw(void)
             printf("  --fakedate: WARNING: Generated Date not found in kernel header\n");
     }
 
+    /* --patch: KernelFront generation marker patch (same logic as cmd_crossflash).
+       Detects KernelFront envelope, decrypts payload, patches 0xFF->0x01,
+       recomputes checksum, re-encrypts back into data[]. */
+    if (g_patch_flag && kernel_size >= 0x11200) {
+        int kf_ok = 0;
+        DWORD pi; int printable = 1;
+        for (pi = 0; pi < 0x100; pi++) {
+            UCHAR c = data[pi];
+            if (c == 0x00 || c == 0x0D || c == 0x0A) continue;
+            if (c < 0x20 || c > 0x7E) { printable = 0; break; }
+        }
+        if (printable) {
+            DWORD k0 = (DWORD)data[0x200] | ((DWORD)data[0x201]<<8) |
+                       ((DWORD)data[0x202]<<16) | ((DWORD)data[0x203]<<24);
+            DWORD c0 = (DWORD)data[0x1200] | ((DWORD)data[0x1201]<<8) |
+                       ((DWORD)data[0x1202]<<16) | ((DWORD)data[0x1203]<<24);
+            DWORD p0 = ror32(c0 ^ k0, (int)(k0 & 31));
+            if ((p0 >> 24) <= 0x7F) kf_ok = 1;
+        }
+        if (kf_ok) {
+            printf("  KernelFront: detected — decrypting + patching generation marker...\n");
+            UCHAR *plain = (UCHAR*)malloc(0x10000);
+            if (plain) {
+                kf_decrypt_body(data + 0x200, data + 0x1200, plain);
+                UCHAR marker = plain[0xFE];
+                if (marker == 0xFF) {
+                    /* compute delta: marker byte is at plain[0xFE], which is in
+                       the dword at plain[0xFC..0xFF]. Adjust checksum at plain[0x1020]. */
+                    DWORD old_dw = (DWORD)plain[0xFC] | ((DWORD)plain[0xFD]<<8) |
+                                   ((DWORD)plain[0xFE]<<16) | ((DWORD)plain[0xFF]<<24);
+                    plain[0xFE] = 0x01;
+                    DWORD new_dw = (DWORD)plain[0xFC] | ((DWORD)plain[0xFD]<<8) |
+                                   ((DWORD)plain[0xFE]<<16) | ((DWORD)plain[0xFF]<<24);
+                    DWORD old_cs = (DWORD)plain[0x1020] | ((DWORD)plain[0x1021]<<8) |
+                                   ((DWORD)plain[0x1022]<<16) | ((DWORD)plain[0x1023]<<24);
+                    DWORD new_cs = old_cs - old_dw + new_dw;
+                    plain[0x1020]=(UCHAR)(new_cs);      plain[0x1021]=(UCHAR)(new_cs>>8);
+                    plain[0x1022]=(UCHAR)(new_cs>>16);  plain[0x1023]=(UCHAR)(new_cs>>24);
+                    printf("  KernelFront: generation marker patched 0xFF -> 0x01\n");
+                    printf("  KernelFront: checksum 0x%08lX -> 0x%08lX\n", old_cs, new_cs);
+                } else if (marker == 0x01) {
+                    printf("  KernelFront: generation marker already 0x01 — no patch needed\n");
+                } else {
+                    printf("  KernelFront: unknown marker 0x%02X — skipping patch\n", marker);
+                }
+                /* Re-encrypt back into data[] */
+                kf_decrypt_body(data + 0x200, plain, data + 0x1200);
+                printf("  KernelFront: re-encrypted OK\n");
+                free(plain);
+            }
+        } else {
+            printf("  KernelFront: not detected (header not ASCII or decrypt check failed)\n");
+        }
+    }
+
     {
         /* Extract hardware version from header for display (e.g. "SAT 8D31", "SAT 8801") */
         UCHAR *hw_line = memmem_win(data, 0x200, "Hardware Version", 16);

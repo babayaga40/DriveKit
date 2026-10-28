@@ -6142,7 +6142,9 @@ static int cmd_flashfw(void)
        Required for both upgrade (pre→post) and downgrade (post→pre via --patch).
        Drive must be in service mode (unlocked) before accepting WRITE BUFFER 0xF0. */
     if (two_pass_needed && g_outFile[0] && fw_prepass) {
-        DWORD pass1_sz = (fw_prepass_sz > 0x10000) ? (DWORD)(fw_prepass_sz - 0x10000) : (DWORD)fw_prepass_sz;
+        /* Pass 1 sends the FULL firmware (matching cmd_crossflash xf_send_normal_fw).
+           Earlier versions subtracted 0x10000 here — that was wrong and caused 04/4C/02. */
+        DWORD pass1_sz = (DWORD)fw_prepass_sz;
         DWORD fw_off   = 0;
         UCHAR p1cdb[10];
         printf("[2a/3] Cross-era pre-pass: normal FW pass 1 (0x%lX bytes)...\n", pass1_sz);

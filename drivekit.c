@@ -5557,6 +5557,10 @@ static int cmd_flashfw(void)
             printf("  Drive era: PRE-CUTOFF (0xB0 readable)\n");
         } else {
             printf("  Drive era: POST-CUTOFF (0xB0 not readable)\n");
+            if (g_fakedate) {
+                g_pre_cutoff = 1;
+                printf("  --fakedate: forcing pre-cutoff mode for two-pass protocol\n");
+            }
         }
     }
 

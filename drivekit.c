@@ -5418,6 +5418,11 @@ static int cmd_flashfw(void)
     int    fw2_postcut   = 0;   /* 1 if Generated Date >= 22/12/27 */
     UCHAR *fw_prepass    = NULL; /* pre-loaded normal FW for cross-era pre-pass */
     long   fw_prepass_sz = 0;   /* size after any truncation */
+    /* two_pass_needed: set after era detection; covers both:
+       - pre-cutoff drive  → post-cutoff FW  (upgrade)
+       - post-cutoff drive → pre-cutoff FW   (downgrade, --patch) */
+    int    two_pass_needed = 0;
+    WORD   fw_kernel_id    = 0; /* platform ID parsed from kernel file header (e.g. 0x8D31) */
 
     /* Helper macro: handle drive busy between chunks
        GET EVENT STATUS → REQUEST SENSE → retry
@@ -5627,9 +5632,17 @@ static int cmd_flashfw(void)
         }
     }
 
-    /* Cross-era pre-pass: send normal FW pass 1 BEFORE the kernel.
-       Only for pre-cutoff drive + post-cutoff target FW + kernel file provided. */
-    if (g_pre_cutoff && fw2_postcut && g_outFile[0] && fw_prepass) {
+    /* Determine if two-pass protocol is needed:
+       - pre-cutoff drive  + post-cutoff target FW  (upgrade)
+       - post-cutoff drive + pre-cutoff  target FW  (downgrade via --patch) */
+    two_pass_needed = ((g_pre_cutoff && fw2_postcut) ||
+                       (!g_pre_cutoff && !fw2_postcut && g_patch_flag));
+    if (two_pass_needed)
+        printf("  Two-pass protocol: ENABLED (%s)\n\n",
+               g_pre_cutoff ? "pre→post upgrade" : "post→pre downgrade");
+
+    /* Cross-era pre-pass moved to AFTER unlock — see below. */
+    if (0 && two_pass_needed && g_outFile[0] && fw_prepass) {
         DWORD pass1_sz = (fw_prepass_sz > 0x10000) ? (DWORD)(fw_prepass_sz - 0x10000) : (DWORD)fw_prepass_sz;
         DWORD fw_off   = 0;
         UCHAR cdb[10];
@@ -5715,21 +5728,31 @@ static int cmd_flashfw(void)
             if (plain) {
                 kf_decrypt_body(data + 0x200, data + 0x1200, plain);
                 UCHAR marker = plain[0xFE];
-                if (marker == 0xFF) {
-                    /* compute delta: marker byte is at plain[0xFE], which is in
-                       the dword at plain[0xFC..0xFF]. Adjust checksum at plain[0x1020]. */
-                    DWORD old_dw = (DWORD)plain[0xFC] | ((DWORD)plain[0xFD]<<8) |
-                                   ((DWORD)plain[0xFE]<<16) | ((DWORD)plain[0xFF]<<24);
+                if (marker == 0xFF || marker == 0x00) {
                     plain[0xFE] = 0x01;
-                    DWORD new_dw = (DWORD)plain[0xFC] | ((DWORD)plain[0xFD]<<8) |
-                                   ((DWORD)plain[0xFE]<<16) | ((DWORD)plain[0xFF]<<24);
-                    DWORD old_cs = (DWORD)plain[0x1020] | ((DWORD)plain[0x1021]<<8) |
-                                   ((DWORD)plain[0x1022]<<16) | ((DWORD)plain[0x1023]<<24);
-                    DWORD new_cs = old_cs - old_dw + new_dw;
-                    plain[0x1020]=(UCHAR)(new_cs);      plain[0x1021]=(UCHAR)(new_cs>>8);
-                    plain[0x1022]=(UCHAR)(new_cs>>16);  plain[0x1023]=(UCHAR)(new_cs>>24);
-                    printf("  KernelFront: generation marker patched 0xFF -> 0x01\n");
-                    printf("  KernelFront: checksum 0x%08lX -> 0x%08lX\n", old_cs, new_cs);
+                    printf("  KernelFront: generation marker patched 0x%02X -> 0x01\n", marker);
+                    /* Checksum at body offset 0x1020 is BIG-ENDIAN.
+                       marker_delta = (0x01 - old_marker) * 0x100  (wrapping u32)
+                       compensation = -(marker_delta)               (wrapping u32)
+                       new_word = old_word + compensation
+                       For marker=0xFF: delta=(0x01-0xFF)*0x100 = (-0xFE)*0x100 = 0xFFFF0200 (wrapping)
+                                        compensation = -0xFFFF0200 = 0x0000FE00
+                       So checksum increases by 0x0000FE00. */
+                    {
+                        DWORD marker_delta = ((DWORD)0x01 - (DWORD)marker) * (DWORD)0x100;
+                        DWORD compensation = (DWORD)(-(int)marker_delta);
+                        DWORD old_cs = ((DWORD)plain[0x1020] << 24) |
+                                       ((DWORD)plain[0x1021] << 16) |
+                                       ((DWORD)plain[0x1022] <<  8) |
+                                        (DWORD)plain[0x1023];
+                        DWORD new_cs = old_cs + compensation;
+                        plain[0x1020] = (UCHAR)(new_cs >> 24);
+                        plain[0x1021] = (UCHAR)(new_cs >> 16);
+                        plain[0x1022] = (UCHAR)(new_cs >>  8);
+                        plain[0x1023] = (UCHAR)(new_cs      );
+                        printf("  KernelFront: checksum 0x%08lX -> 0x%08lX (BE, compensation=0x%08lX)\n",
+                               old_cs, new_cs, compensation);
+                    }
                 } else if (marker == 0x01) {
                     printf("  KernelFront: generation marker already 0x01 — no patch needed\n");
                 } else {
@@ -5911,6 +5934,7 @@ static int cmd_flashfw(void)
             while (*p && (*p < '0' || *p > '9')) p++;
             if (*p) fileID = (WORD)strtol(p, NULL, 16);
         }
+        fw_kernel_id = fileID; /* save for commit trigger lookup */
 
         /* Check drive ID group compatibility */
         int group_ok = (driveID == fileID); /* exact match always OK */
@@ -6033,7 +6057,7 @@ static int cmd_flashfw(void)
             if (st != 0) {
                 /* Try post-cutoff mode=0x01 bufID=0x00 sweep
                    Skip for pre-cutoff drives — they don't need this unlock */
-                if (g_pre_cutoff) {
+                if (g_pre_cutoff && !g_fakedate) {
                     printf("  Pre-cutoff drive — skipping post-cutoff mode sweep.\n");
                     printf("  Proceeding without unlock (0xB0 accessible).\n\n");
                     st = 0; /* treat as OK, proceed without unlock */
@@ -6112,6 +6136,46 @@ static int cmd_flashfw(void)
                       SCSI_IOCTL_DATA_IN, sense, &st);
         }
         Sleep(100);
+    }
+
+    /* Cross-era pre-pass: normal FW pass 1, sent AFTER unlock.
+       Required for both upgrade (pre→post) and downgrade (post→pre via --patch).
+       Drive must be in service mode (unlocked) before accepting WRITE BUFFER 0xF0. */
+    if (two_pass_needed && g_outFile[0] && fw_prepass) {
+        DWORD pass1_sz = (fw_prepass_sz > 0x10000) ? (DWORD)(fw_prepass_sz - 0x10000) : (DWORD)fw_prepass_sz;
+        DWORD fw_off   = 0;
+        UCHAR p1cdb[10];
+        printf("[2a/3] Cross-era pre-pass: normal FW pass 1 (0x%lX bytes)...\n", pass1_sz);
+        while (fw_off < pass1_sz) {
+            DWORD n = pass1_sz - fw_off;
+            if (n > 0x8000) n = 0x8000;
+            memset(p1cdb, 0, sizeof(p1cdb));
+            p1cdb[0]=0x3B; p1cdb[1]=0x07; p1cdb[2]=0xF0;
+            p1cdb[3]=(UCHAR)(fw_off>>16);
+            p1cdb[4]=(UCHAR)(fw_off>>8);
+            p1cdb[5]=(UCHAR)(fw_off);
+            p1cdb[6]=(UCHAR)(n>>16);
+            p1cdb[7]=(UCHAR)(n>>8);
+            p1cdb[8]=(UCHAR)(n);
+            send_scsi(g_hDrive, p1cdb, 10, fw_prepass + fw_off, n,
+                      SCSI_IOCTL_DATA_OUT, sense, &st);
+            if (st != 0) {
+                HANDLE_BUSY();
+                send_scsi(g_hDrive, p1cdb, 10, fw_prepass + fw_off, n,
+                          SCSI_IOCTL_DATA_OUT, sense, &st);
+                if (st != 0) {
+                    printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X ASCQ=%02X\n",
+                           fw_off, sense[2]&0x0F, sense[12], sense[13]);
+                    free(data); free(fw_prepass); return 1;
+                }
+            }
+            fw_off += n;
+            printf("\r  %lu / %lu bytes", fw_off, pass1_sz);
+            fflush(stdout);
+            Sleep(50);
+        }
+        printf("\n  Done. (pass 2 of normal FW will follow after kernel)\n\n");
+        HANDLE_BUSY();
     }
 
     /* Step 2: Send complete kernel .153 file (including 0x200 header)
@@ -6199,50 +6263,54 @@ static int cmd_flashfw(void)
                 free(data); return 1;
             }
         } else {
-        while (offset < (DWORD)filesize) {
-            DWORD n = (DWORD)filesize - offset;
-            if (n > 0x8000) n = 0x8000;
+        /* Send kernel as single transfer first (avoids mid-stream 04/4C/01 on XD07U).
+           If that fails, fall back to chunked. */
+        {
+            DWORD total = (DWORD)filesize;
+            printf("  Sending as single transfer (bufID=0xFE offset=0 len=0x%lX)...\n", total);
             memset(cdb, 0, sizeof(cdb));
             cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
-            cdb[3]=(UCHAR)(offset>>16);
-            cdb[4]=(UCHAR)(offset>>8);
-            cdb[5]=(UCHAR)(offset);
-            cdb[6]=(UCHAR)(n>>16);
-            cdb[7]=(UCHAR)(n>>8);
-            cdb[8]=(UCHAR)(n);
-            send_scsi(g_hDrive, cdb, 10, data + offset, n,
+            cdb[6]=(UCHAR)(total>>16);
+            cdb[7]=(UCHAR)(total>>8);
+            cdb[8]=(UCHAR)(total);
+            send_scsi(g_hDrive, cdb, 10, data, total,
                       SCSI_IOCTL_DATA_OUT, sense, &st);
-            if (st != 0) {
-                /* Try single transfer as fallback (XD08 needs this) */
-                DWORD total = (DWORD)filesize;
-                printf("\n  Chunk failed at 0x%lX: sense key=%02X ASC=%02X ASCQ=%02X\n",
-                       offset, sense[2]&0x0F, sense[12], sense[13]);
-                printf("  Trying single transfer...\n");
+            if (st == 0 || (sense[2]&0x0F) == 0) {
+                printf("  %lu / %lu bytes - OK\n", total, total);
+                offset = total;
+            } else {
+                printf("  Single transfer FAILED (key=%02X ASC=%02X ASCQ=%02X) — trying chunked\n",
+                       sense[2]&0x0F, sense[12], sense[13]);
                 HANDLE_BUSY();
                 Sleep(200);
-                memset(cdb,0,sizeof(cdb));
-                cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE; /* always 0xFE for kernel */
-                cdb[6]=(UCHAR)(total>>16);
-                cdb[7]=(UCHAR)(total>>8);
-                cdb[8]=(UCHAR)(total);
-                send_scsi(g_hDrive, cdb, 10, data, total,
-                          SCSI_IOCTL_DATA_OUT, sense, &st);
-                if (st == 0) {
-                    printf("  %ld / %ld bytes - OK (single transfer)\n", total, total);
-                    offset = total;
-                    break;
+                /* Chunked fallback */
+                while (offset < total) {
+                    DWORD n = total - offset;
+                    if (n > 0x8000) n = 0x8000;
+                    memset(cdb, 0, sizeof(cdb));
+                    cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
+                    cdb[3]=(UCHAR)(offset>>16);
+                    cdb[4]=(UCHAR)(offset>>8);
+                    cdb[5]=(UCHAR)(offset);
+                    cdb[6]=(UCHAR)(n>>16);
+                    cdb[7]=(UCHAR)(n>>8);
+                    cdb[8]=(UCHAR)(n);
+                    send_scsi(g_hDrive, cdb, 10, data + offset, n,
+                              SCSI_IOCTL_DATA_OUT, sense, &st);
+                    if (st != 0) {
+                        printf("\n  Chunk FAILED at 0x%lX: key=%02X ASC=%02X ASCQ=%02X\n",
+                               offset, sense[2]&0x0F, sense[12], sense[13]);
+                        free(data); return 1;
+                    }
+                    offset += n;
+                    printf("\r  %lu / %lu bytes", offset, total);
+                    fflush(stdout);
+                    Sleep(50);
                 }
-                printf("\n  FAILED at 0x%lX: key=%02X ASC=%02X\n",
-                       offset, sense[2]&0x0F, sense[12]);
-                free(data); return 1;
+                printf("\n");
             }
-            offset += n;
-            printf("\r  %lu / %lu bytes", offset, (DWORD)filesize);
-            fflush(stdout);
-            Sleep(50);
         }
-        printf("\n");
-        } /* end else (pre-cutoff chunked) */
+        } /* end else (pre-cutoff single/chunked) */
     }
     printf("  Done.\n\n");
     free(data);
@@ -6258,7 +6326,7 @@ static int cmd_flashfw(void)
         long   fwsize  = fw_prepass_sz;   /* already truncated to 0x1E0000 if needed */
         DWORD  fwoffset = 0;
 
-        if (g_pre_cutoff && fw2_postcut && g_outFile[0])
+        if (two_pass_needed && g_outFile[0])
             printf("[2c/3] Normal FW pass 2 (%s, 0x%lX bytes)...\n", g_outFile2, (DWORD)fwsize);
         else
             printf("[2c/3] Sending firmware (%s)...\n  [DBG] g_unlock_mode=0x%02X bufID=0x%02X\n",
@@ -6496,13 +6564,11 @@ static int cmd_flashfw(void)
             }
             trigger_done:;
         } else {
-            /* Pre-cutoff drive: commit trigger (mode=0x05 bufID=0xFF).
-               Confirmed from USBPcap of BDRFlash (Generated Date: 24/10/09):
-               For BOTH same-era (pre→pre) AND cross-era (pre→post), the commit
-               key is IDENTICAL to the unlock key (g_payload[0x10..0x13]).
-               The era difference is handled by the two-pass normal-FW protocol
-               (pass1 before kernel, pass2 after), NOT by key substitution.
-               The old "tkey" hypothesis was WRONG — tkey logic removed. */
+            /* Pre-cutoff drive OR post-cutoff drive with mode=0x04 unlock:
+               commit trigger (mode=0x05 bufID=0xFF).
+               For pre→pre and pre→post: key = unlock key (g_payload[0x10..0x13]).
+               For post→pre downgrade (--patch, post-cutoff drive, pre-cutoff target FW):
+               commit key = pre-cutoff target key; model = pre-cutoff model string. */
             UCHAR cdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
             UCHAR trig_payload[0x100];
             memcpy(trig_payload, g_payload, 0x100);
@@ -6511,9 +6577,44 @@ static int cmd_flashfw(void)
                                ((DWORD)g_payload[0x12] << 16) |
                                ((DWORD)g_payload[0x13] << 24); /* = unlock key */
 
-            if (g_pre_cutoff && fw2_postcut) {
-                printf("  Cross-era commit: using unlock key=0x%08lX (confirmed by pcapng)\n",
-                       commit_key);
+            if (two_pass_needed) {
+                printf("  Cross-era commit: using unlock key=0x%08lX\n", commit_key);
+            }
+
+            /* Post→pre downgrade: switch commit payload to pre-cutoff model + key */
+            if (!g_pre_cutoff && !fw2_postcut && g_patch_flag) {
+                /* For post→pre downgrade, target kernel ID is always "ID05"
+                   (pre-cutoff SAT 8D30/8D31 firmware). g_kernelID holds the
+                   drive's current (post-cutoff) kernel ID "ID35" — not what we want. */
+                /* Use kernel file's platform ID (fw_kernel_id=0x8D31 for XD07U)
+                   not the drive's hardware ID (g_driveID=0x8D30 for XD07).
+                   The commit model/key must match the target firmware, not the drive HW. */
+                printf("  [DBG] fw_kernel_id=0x%04X g_driveID=0x%04X\n", fw_kernel_id, g_driveID);
+                /* If fw_kernel_id wasn't parsed (0) or matches g_driveID, try 0x8D31
+                   explicitly for XD07/XD07U family (0x8D30 drive can run 8D31 FW) */
+                WORD lookup_id = fw_kernel_id ? fw_kernel_id : g_driveID;
+                if (lookup_id == g_driveID && (g_driveID == 0x8D30 || g_driveID == 0x8D31))
+                    lookup_id = 0x8D31; /* XD07U — always use XD07U model for commit */
+                DWORD pre_key = pioneer_key_lookup(lookup_id, "ID05");
+                if (!pre_key && lookup_id != 0x8D31)
+                    pre_key = pioneer_key_lookup(0x8D31, "ID05"); /* fallback */
+                const PIONEER_DRIVE *drv = pioneer_lookup(lookup_id);
+                if (!drv) drv = pioneer_lookup(0x8D31); /* fallback */
+                if (pre_key && drv && drv->model && drv->model[0]) {
+                    printf("  Downgrade commit: switching payload to pre-cutoff model/key\n");
+                    printf("    Model : %.16s\n", drv->model);
+                    printf("    Key   : 0x%08lX\n", pre_key);
+                    memset(trig_payload, 0, 0x100);
+                    memset(trig_payload, 0x20, 16);
+                    strncpy((char*)trig_payload, drv->model, 16);
+                    trig_payload[0x10] = (UCHAR)(pre_key & 0xFF);
+                    trig_payload[0x11] = (UCHAR)((pre_key >> 8) & 0xFF);
+                    trig_payload[0x12] = (UCHAR)((pre_key >> 16) & 0xFF);
+                    trig_payload[0x13] = (UCHAR)((pre_key >> 24) & 0xFF);
+                    commit_key = pre_key;
+                } else {
+                    printf("  Downgrade commit: WARNING — could not look up pre-cutoff key, using unlock key\n");
+                }
             }
 
             printf("  Trigger payload: %.16s key=%02X%02X%02X%02X\n",

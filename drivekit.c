@@ -2623,21 +2623,24 @@ static const PIONEER_DRIVE g_pioneer_drives[] = {
     { "PIONEER  DVR-K19",  0x0080, CAP_DVD },
     { "PIONEER  DVR-K20",  0x0085, CAP_DVD },
 
-    /* BD era - early */
+    /* BD era - early (model_family strings per UnlockKeys.hpp reference) */
     { "PIONEER  BDR-101",  0x1000, CAP_BD  },
     { "PIONEER  BDR-102",  0x1003, CAP_BD  },
     { "PIONEER  BDR-204",  0x1005, CAP_BD  },
     { "PIONEER BDR-TD01",  0x1007, CAP_BD  },
     { "PIONEER BDR-TD02",  0x1010, CAP_BD  },
     { "PIONEER BDR-TD02",  0x1011, CAP_BD  },
+    { "PIONEER BDR-TD02",  0x1013, CAP_BD  },
     { "PIONEER  BDR-205",  0x1014, CAP_BD  },
     { "PIONEER BDR-TD03",  0x1027, CAP_BD  },
     { "PIONEER BDR-TD03",  0x1028, CAP_BD  },
     { "PIONEER  BDR-206",  0x1030, CAP_BD  },
+    { "PIONEER  BDR-206",  0x1031, CAP_BD  },
     { "PIONEER  BDR-206",  0x1032, CAP_BD  },
     { "PIONEER  BDR-206",  0x1034, CAP_BD  },
     { "PIONEER BDR-TD04",  0x1040, CAP_BD  },
     { "PIONEER BDR-TD04",  0x1041, CAP_BD  },
+    { "PIONEER BDR-TD04",  0x1046, CAP_BD  },
     { "PIONEER BDR-US01",  0x1050, CAP_BD  },
     { "PIONEER BDR-US01",  0x1051, CAP_BD  },
 
@@ -2645,14 +2648,19 @@ static const PIONEER_DRIVE g_pioneer_drives[] = {
     { "PIONEER BDR-XD04",  0x8130, CAP_LD  },
     { "PIONEER  BDR-207",  0x8000, CAP_LD  },
     { "PIONEER BDR-TD05",  0x8211, CAP_LD  },
-    { "PIONEER  BDR-XD0",  0x8221, CAP_LD  },
-    { "PIONEER  BDR-XD0",  0x8231, CAP_LD  },
+    { "PIONEER BDR-XD05",  0x8221, CAP_LD  },
+    { "PIONEER BDR-XD05",  0x8231, CAP_LD  },
+    { "PIONEER BDR-XD05",  0x8232, CAP_LD  },
+    { "PIONEER BDR-TD05",  0x8291, CAP_LD  },
     { "PIONEER BDR-US02",  0x8410, CAP_LD  },
     { "PIONEER BDR-US02",  0x8420, CAP_LD  },
     { "PIONEER BDR-US02",  0x8490, CAP_LD  },
     { "PIONEER  BDR-208",  0x8301, CAP_LD  },
-    { "PIONEER BDR-US03",  0x8520, CAP_LD  },
     { "PIONEER BDR-US03",  0x8510, CAP_LD  },
+    { "PIONEER BDR-US03",  0x8511, CAP_LD  },
+    { "PIONEER BDR-US03",  0x8520, CAP_LD  },
+    { "PIONEER BDR-US03",  0x8590, CAP_LD  },
+    { "PIONEER BDR-US03",  0x8591, CAP_LD  },
     { "PIONEER  BDR-209",  0x8600, CAP_LD  },
     { "PIONEER  BDR-209",  0x8601, CAP_LD  },
     { "PIONEER  BDR-209",  0x8680, CAP_LD  },
@@ -2662,47 +2670,25 @@ static const PIONEER_DRIVE g_pioneer_drives[] = {
     { "PIONEER  BDR-211",  0x8800, CAP_LD  }, /* BDR-211M */
     { "PIONEER  BDR-211",  0x8801, CAP_LD  }, /* BDR-211M */
     { "PIONEER BDR-US04",  0x8A10, CAP_LD  },
+    /* BDS7 family — model_family from UnlockKeys.hpp reference */
+    { "PIONEER BDR-BDS7",  0x8D30, CAP_LD  },
+    { "PIONEER BDR-BDS7",  0x8D31, CAP_LD  },
     { "PIONEER BDR-BDS7",  0x8E20, CAP_LD  },
     { "PIONEER BDR-BDS7",  0x8E21, CAP_LD  },
-    { "PIONEER BDR-X12T",  0x9000, CAP_LD  },
-    { "PIONEER BDR-X12T",  0x9001, CAP_LD  },
+    /* 212T / X12T / 213T family */
     { "PIONEER BDR-212T",  0x8F00, CAP_LD  },
     { "PIONEER BDR-212T",  0x8F01, CAP_LD  },
-    { "PIONEER BDR-BDS8",  0x9330, CAP_LD  },
-    { "PIONEER BDR-BDS8",  0x9331, CAP_LD  },
+    { "PIONEER BDR-X12T",  0x9000, CAP_LD  },
+    { "PIONEER BDR-X12T",  0x9001, CAP_LD  },
     { "PIONEER BDR-213T",  0x9200, CAP_LD  },
     { "PIONEER BDR-213T",  0x9201, CAP_LD  },
-    /* Additional models from LibreDrive firmware list */
-    { "PIONEER BDR-TD05",  0x8211, CAP_LD  },
-    { "PIONEER BDR-XS05",  0x8221, CAP_LD  },
-    { "PIONEER  BDR-XD0",  0x8231, CAP_LD  },
-    { "PIONEER  BDR-XD0",  0x8232, CAP_LD  },
-    { "PIONEER BDR-208",   0x8301, CAP_LD  },
-    { "PIONEER BDR-UD02",  0x8410, CAP_LD  },
-    { "PIONEER BDC-UD02",  0x8490, CAP_LD  },
-    { "PIONEER BDR-XU02",  0x8420, CAP_LD  },
-    { "PIONEER BDR-UD03",  0x8510, CAP_LD  },
-    { "PIONEER BDR-UD03",  0x8511, CAP_LD  },
-    { "PIONEER BDR-XU03",  0x8520, CAP_LD  },
-    { "PIONEER BDR-XS06",  0x8721, CAP_LD  },
-    { "PIONEER BDR-XS06",  0x8722, CAP_LD  },
-    { "PIONEER BDR-UD04",  0x8A10, CAP_LD  },
-    { "PIONEER BDR-XS06", 0x8B30, CAP_LD  },
-    { "PIONEER BDR-XD07",  0x8D30, CAP_LD  },
-    { "PIONEER BDR-XD07U", 0x8D31, CAP_LD  },
-    { "PIONEER BDR-XS07",  0x8E20, CAP_LD  },
-    { "PIONEER BDR-XS07U", 0x8E21, CAP_LD  },
-    { "PIONEER BDR-212",   0x8F00, CAP_LD  },
-    { "PIONEER BDR-212",   0x8F01, CAP_LD  },
-    { "PIONEER BDR-X12",   0x9000, CAP_LD  },
-    { "PIONEER BDR-X12U",  0x9001, CAP_LD  },
-    { "PIONEER BDR-213",   0x9200, CAP_LD  },
-    { "PIONEER BDR-213",   0x9201, CAP_LD  },
-    { "PIONEER BDR-XD08",  0x9330, CAP_LD  },
-    { "PIONEER BDR-XD08U", 0x9331, CAP_LD  },
-    { "PIONEER BDR-X13",   0x9400, CAP_LD  },
-    { "PIONEER BDR-X13U",  0x9401, CAP_LD  },
-    { "PIONEER BDR-XS08U", 0x9621, CAP_LD  },  /* from LibreDrive list */
+    { "PIONEER BDR-213T",  0x9400, CAP_LD  },
+    { "PIONEER BDR-213T",  0x9401, CAP_LD  },
+    /* BDS8 family */
+    { "PIONEER BDR-BDS8",  0x9330, CAP_LD  },
+    { "PIONEER BDR-BDS8",  0x9331, CAP_LD  },
+    { "PIONEER BDR-BDS8",  0x9620, CAP_LD  },
+    { "PIONEER BDR-BDS8",  0x9621, CAP_LD  },
     { NULL, 0, 0 }
 };
 
@@ -3505,18 +3491,17 @@ static const PIONEER_KEY pioneer_keys[] =
     { 0x8800, "ID79", 0x6123789A },
 
     /* platform 0x8801 */
-    { 0x8801, "ID86", 0xD02A0432 },
+    { 0x8801, "GENE", 0xF2125032 },
+    { 0x8801, "ID36", 0xAA6C0AF0 },
     { 0x8801, "ID43", 0xDF302B98 },
+    { 0x8801, "ID58", 0xA4926CD1 },
     { 0x8801, "ID60", 0x5CF2E094 },
     { 0x8801, "ID72", 0x91957AFA },
-    { 0x8801, "ID36", 0xAA6C0AF0 },
+    { 0x8801, "ID75", 0xF6B55F31 },  /* from UnlockKeys.hpp reference */
     { 0x8801, "ID76", 0x4636CE34 },
-    { 0x8801, "ID88", 0x6123789A },
+    { 0x8801, "ID86", 0xD02A0432 },
     { 0x8801, "ID87", 0xE083950B },
-    { 0x8801, "ID58", 0xA4926CD1 },
     { 0x8801, "ID89", 0xC6752984 },
-    { 0x8801, "GENE", 0xF2125032 },
-    { 0x8801, "ID79", 0x6123789A },
 
     /* platform 0x8A10 */
     { 0x8A10, "ID19", 0x25ED9753 },
@@ -9189,8 +9174,9 @@ static int cmd_crossflash(void)
                    commit_key);
         } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
             /* post→pre downgrade: commit key must be target kernel's key, not current drive's key.
-               Also switch model string to the pre-cutoff model (e.g. "PIONEER BDR-XD07U")
-               rather than the post-cutoff BDS7 model string. */
+               The model string stays "PIONEER BDR-BDS7" — this is the hardware platform family
+               used for ALL unlock/commit triggers regardless of firmware era (per UnlockKeys.hpp).
+               Only the key changes between eras. */
             DWORD tgt_key = pioneer_key_lookup(g_driveID, target_kern_id);
             if (tgt_key && tgt_key != key_le) {
                 printf("      Downgrade (post→pre): switching commit key 0x%08lX → 0x%08lX (kernelID=%s)\n",
@@ -9203,15 +9189,17 @@ static int cmd_crossflash(void)
                 printf("      Downgrade (post→pre): no key for kernelID=%s driveID=0x%04lX — using unlock key 0x%08lX\n",
                        target_kern_id, (DWORD)g_driveID, commit_key);
             }
-            /* Also use pre-cutoff model string from g_pioneer_drives[] */
+            /* Build commit trigger using platform family model from g_pioneer_drives[].
+               For BDS7 family (0x8D30/0x8D31), this is "PIONEER BDR-BDS7" — the hardware
+               platform family string used for all triggers regardless of firmware era. */
             {
                 const PIONEER_DRIVE *drv = pioneer_lookup(g_driveID);
                 if (drv && drv->model && drv->model[0]) {
                     memset(commit_trigger, 0, 256);
                     memset(commit_trigger, 0x20, 16);
                     strncpy((char*)commit_trigger, drv->model, 16);
-                    printf("      Downgrade (post→pre): using pre-cutoff model '%.16s'\n",
-                           (char*)commit_trigger);
+                    printf("      Downgrade (post→pre): model='%.16s' key=0x%08lX\n",
+                           (char*)commit_trigger, commit_key);
                     /* fill key then skip xf_build_trigger */
                     commit_trigger[0x10] = (UCHAR)(commit_key      );
                     commit_trigger[0x11] = (UCHAR)(commit_key >>  8);

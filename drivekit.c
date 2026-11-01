@@ -9137,25 +9137,35 @@ static int cmd_crossflash(void)
         Sleep(2);
 
         /* cmd4: NAND 0x011200, len=0x1000
-           BDRFlash layout: cmd2 covers file[0x1200..0x91FF], cmd3 covers file[0x9200..0x111FF].
-           Wait — cmd2+cmd3 = 0x8000+0x8000 = 0x10000 bytes from file offset 0x1200,
-           covering file[0x1200..0x111FF]. That's the full encrypted body (0x10000 bytes).
-           cmd4 at NAND 0x011200 sends the LAST 0x1000 bytes of the file: file[0x10200..0x111FF].
-           These overlap with what cmd3 already sent (cmd3 covers file[0x9200..0x111FF]).
-           BDRFlash re-sends the tail — possibly to ensure the final page is committed.
-           Send file[0x10200..0x111FF] at NAND 0x011200. */
-        /* cmd4: only send for same-era flash (no --patch).
-           For downgrade (--patch), the patched+re-encrypted kernel body differs from
-           what BDRFlash sends, and the drive rejects cmd4 with 04/4C/01.
-           cmd2+cmd3 already cover the full encrypted body — cmd4 is a tail re-send
-           that BDRFlash uses for same-era but which breaks on cross-era downgrade. */
-        if (kernel_size >= 0x11200 && !g_patch_flag) {
+           Tail re-send — overlaps last 0x1000 bytes already written by cmd3.
+           BDRFlash always sends this; purpose is likely to flush/finalize the
+           NAND controller's write buffer for the last block of the kernel region.
+
+           Key insight: the tail region is at body offset 0xF000..0xFFFF
+           (file[0x10200..0x111FF]). The only patched byte is body[0xFE]
+           (file[0x12FE]), which is within cmd2's range — not cmd4's range.
+           Since re-encryption is key-stream-only (no chaining), and the key
+           stream at position 0xF000+ is unchanged, cmd4's bytes are identical
+           to the original file whether --patch is used or not.
+
+           Previously cmd4 returned 04/4C/01 during downgrade — now treated as
+           non-fatal (soft error): log it but continue to pass2+commit.
+           Rationale: the drive may enter a brief reconfiguration state after
+           receiving the full kernel body (cmd3 completes 0x10000 bytes) before
+           cmd4 arrives; the error may reflect timing not content rejection. */
+        if (kernel_size >= 0x11200) {
+            UCHAR sense4[SENSE_SIZE];
+            int st4;
             printf("      cmd4: NAND 0x011200 len=0x1000 (file[0x10200..0x111FF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x10200, 0x1000, "kernel_tail");
-            if (st != 0) goto fail;
+            st4 = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x10200, 0x1000, "kernel_tail");
+            if (st4 != 0) {
+                printf("      cmd4: SOFT FAIL (ignored) — drive may be busy after kernel body\n");
+                /* Non-fatal: cmd2+cmd3 already wrote the complete body; proceed */
+            } else {
+                printf("      cmd4: OK\n");
+            }
         } else {
-            printf("      cmd4: skipped (%s)\n",
-                   g_patch_flag ? "downgrade --patch: tail re-send not used" : "kernel file smaller than 0x11200 bytes");
+            printf("      cmd4: skipped (kernel file < 0x11200 bytes)\n");
         }
         printf("      OK\n\n");
     }

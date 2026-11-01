@@ -8884,6 +8884,14 @@ static int cmd_crossflash(void)
        return check condition. Pre-cutoff drives reject the 0x6600-byte
        ECC/OOB trailer (bytes past 0x1E0000) with 05/24/00 — truncate to
        0x1E0000 for them.  Post-cutoff drives accept the full 0x1E6600 file.
+
+       SPECIAL CASE — drive in kernel mode (--nounlock):
+       In kernel mode, READ BUFFER 0xB0 is always accessible regardless of
+       the drive's actual era — the kernel exposes it unconditionally.
+       Using 0xB0 probe result here would misclassify a post-cutoff drive
+       stuck in kernel mode as pre-cutoff, causing the normal FW to be
+       truncated and the flash to fail.  When --nounlock is set, infer era
+       from the TARGET firmware date instead (same logic, reliable source).
        ------------------------------------------------------- */
     {
         UCHAR b0_probe[16] = {0};
@@ -8891,6 +8899,13 @@ static int cmd_crossflash(void)
         UCHAR b0_cdb[10] = {0x3C,0x02,0xB0,0x00,0x00,0x00,0x00,0x00,0x10,0x00};
         int   b0_st = 0;
         int   is_precut = 0;
+        if (g_nounlock) {
+            /* Drive is in kernel mode — 0xB0 is always open here, can't use it.
+               Classify from the target firmware date (from normal fw header). */
+            is_precut = !target_is_postcut;
+            printf("  Drive detection: --nounlock (kernel mode) → inferring era from target FW date\n");
+            printf("  Target FW date → %s\n", is_precut ? "PRE-CUTOFF" : "POST-CUTOFF");
+        } else {
         send_scsi(g_hDrive, b0_cdb, 10, b0_probe, 0x10,
                   SCSI_IOCTL_DATA_IN, b0_sense, &b0_st);
         if (b0_st == 0 && b0_probe[0] != 0xFF) {
@@ -8912,6 +8927,7 @@ static int cmd_crossflash(void)
         } else {
             printf("  Drive detection: POST-CUTOFF (READ BUFFER 0xB0 not accessible)\n");
         }
+        } /* end !g_nounlock */
         if (is_precut) {
             g_pre_cutoff = 1;
             if (normal_size > 0x1E0000) {

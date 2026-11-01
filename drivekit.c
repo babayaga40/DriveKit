@@ -5619,9 +5619,11 @@ static int cmd_flashfw(void)
 
     /* Determine if two-pass protocol is needed:
        - pre-cutoff drive  + post-cutoff target FW  (upgrade)
-       - post-cutoff drive + pre-cutoff  target FW  (downgrade via --patch) */
-    two_pass_needed = ((g_pre_cutoff && fw2_postcut) ||
-                       (!g_pre_cutoff && !fw2_postcut && g_patch_flag));
+       - post-cutoff drive + --patch downgrade: target file has post-cutoff date
+         (the patch changes the generation marker, not the date field) */
+    two_pass_needed = (g_pre_cutoff && fw2_postcut);
+    /* post→pre downgrade (--patch) does NOT need two-pass — confirmed by working
+       third-party flasher that sends only kernel + normal in a single pass. */
     if (two_pass_needed)
         printf("  Two-pass protocol: ENABLED (%s)\n\n",
                g_pre_cutoff ? "pre→post upgrade" : "post→pre downgrade");
@@ -6120,7 +6122,28 @@ static int cmd_flashfw(void)
             send_scsi(g_hDrive, escdb, 10, es, 8,
                       SCSI_IOCTL_DATA_IN, sense, &st);
         }
-        Sleep(100);
+        Sleep(1000); /* ENTRY_SETTLE: 1 second after unlock per reference session.rs */
+    }
+
+    /* Inquiry(0x60) after unlock — matches reference session.rs CDB sequence:
+       calls[0]=enter_update, calls[1]=inquiry(0x60), calls[2..]=transfers.
+       Reads revision to confirm service mode entry; may advance drive state machine. */
+    {
+        UCHAR inq[96] = {0};
+        UCHAR inqcdb[6] = {0x12, 0, 0, 0, 0x60, 0}; /* inquiry(0x60) per cdb_tests.rs */
+        UCHAR inqsense[SENSE_SIZE] = {0};
+        int   inqst = 0;
+        printf("[1b/3] Inquiry(0x60) — confirm service mode...\n");
+        send_scsi(g_hDrive, inqcdb, 6, inq, 0x60,
+                  SCSI_IOCTL_DATA_IN, inqsense, &inqst);
+        if (inqst == 0) {
+            char fw[5] = {0};
+            memcpy(fw, inq+32, 4);
+            printf("  Revision: %.4s\n\n", fw);
+        } else {
+            printf("  WARNING: inquiry failed (key=%02X ASC=%02X) — continuing\n\n",
+                   inqsense[2]&0x0F, inqsense[12]);
+        }
     }
 
     /* Cross-era pre-pass: normal FW pass 1, sent AFTER unlock.
@@ -6250,8 +6273,9 @@ static int cmd_flashfw(void)
                 free(data); return 1;
             }
         } else {
-        /* Send kernel as single transfer first (avoids mid-stream 04/4C/01 on XD07U).
-           If that fails, fall back to chunked. */
+        /* Send kernel as single transfer (offset=0, full file).
+           Post-cutoff drives reject explicit offsets > 0 for bufID=0xFE with 05/24/00 —
+           the drive auto-advances its internal kernel buffer pointer. */
         {
             DWORD total = (DWORD)filesize;
             printf("  Sending as single transfer (bufID=0xFE offset=0 len=0x%lX)...\n", total);
@@ -6266,43 +6290,24 @@ static int cmd_flashfw(void)
                 printf("  %lu / %lu bytes - OK\n", total, total);
                 offset = total;
             } else {
-                printf("  Single transfer FAILED (key=%02X ASC=%02X ASCQ=%02X) — trying chunked\n",
+                printf("  FAILED: key=%02X ASC=%02X ASCQ=%02X\n",
                        sense[2]&0x0F, sense[12], sense[13]);
-                HANDLE_BUSY();
-                Sleep(200);
-                /* Chunked fallback */
-                while (offset < total) {
-                    DWORD n = total - offset;
-                    if (n > 0x8000) n = 0x8000;
-                    memset(cdb, 0, sizeof(cdb));
-                    cdb[0]=0x3B; cdb[1]=0x07; cdb[2]=0xFE;
-                    cdb[3]=(UCHAR)(offset>>16);
-                    cdb[4]=(UCHAR)(offset>>8);
-                    cdb[5]=(UCHAR)(offset);
-                    cdb[6]=(UCHAR)(n>>16);
-                    cdb[7]=(UCHAR)(n>>8);
-                    cdb[8]=(UCHAR)(n);
-                    send_scsi(g_hDrive, cdb, 10, data + offset, n,
-                              SCSI_IOCTL_DATA_OUT, sense, &st);
-                    if (st != 0) {
-                        printf("\n  Chunk FAILED at 0x%lX: key=%02X ASC=%02X ASCQ=%02X\n",
-                               offset, sense[2]&0x0F, sense[12], sense[13]);
-                        free(data); return 1;
-                    }
-                    offset += n;
-                    printf("\r  %lu / %lu bytes", offset, total);
-                    fflush(stdout);
-                    Sleep(50);
-                }
-                printf("\n");
+                free(data); return 1;
             }
         }
-        } /* end else (pre-cutoff single/chunked) */
+        } /* end else (single transfer kernel send) */
     }
     printf("  Done.\n\n");
     free(data);
 
     } /* end kernel section - g_outFile */
+
+    /* KERNEL_SETTLE: 2 second wait after kernel transfer before sending normal FW.
+       From reference session.rs: KERNEL_SETTLE = Duration::from_secs(2) */
+    if (g_outFile[0]) {
+        printf("  Waiting 2s after kernel (KERNEL_SETTLE)...\n");
+        Sleep(2000);
+    }
 
     /* Send normal firmware (--file2).
        For cross-era pre-cutoff: this is pass 2 (pass 1 was already sent above).
@@ -6535,10 +6540,10 @@ static int cmd_flashfw(void)
                 tpayload[0x11] = (UCHAR)((tkey>>8) & 0xFF);
                 tpayload[0x12] = (UCHAR)((tkey>>16) & 0xFF);
                 tpayload[0x13] = (UCHAR)((tkey>>24) & 0xFF);
-                UCHAR tcdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
+                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
                 UCHAR tsense[SENSE_SIZE] = {0};
                 printf("  Trigger: mode=5 bufID=0xFF len=0x100 key=0x%08X\n", tkey);
-                send_scsi(g_hDrive, tcdb, 12, tpayload, 0x100,
+                send_scsi(g_hDrive, tcdb, 10, tpayload, 0x100,
                           SCSI_IOCTL_DATA_OUT, tsense, &st2);
                 printf("  Trigger: %s",
                        (st2==0||(tsense[2]&0xF)==0)?"GOOD":"FAIL");
@@ -6556,7 +6561,7 @@ static int cmd_flashfw(void)
                For pre→pre and pre→post: key = unlock key (g_payload[0x10..0x13]).
                For post→pre downgrade (--patch, post-cutoff drive, pre-cutoff target FW):
                commit key = pre-cutoff target key; model = pre-cutoff model string. */
-            UCHAR cdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
+            UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
             UCHAR trig_payload[0x100];
             memcpy(trig_payload, g_payload, 0x100);
             DWORD commit_key = ((DWORD)g_payload[0x10]      ) |
@@ -6568,8 +6573,10 @@ static int cmd_flashfw(void)
                 printf("  Cross-era commit: using unlock key=0x%08lX\n", commit_key);
             }
 
-            /* Post→pre downgrade: switch commit payload to pre-cutoff model + key */
-            if (!g_pre_cutoff && !fw2_postcut && g_patch_flag) {
+            /* Post→pre downgrade: commit uses the UNLOCK key (post-cutoff drive's key),
+               NOT the target firmware's pre-cutoff key. The drive validates the commit
+               against the key used to unlock it — switching to ID05 here causes 04/4C/02. */
+            if (0 && !g_pre_cutoff && !fw2_postcut && g_patch_flag) {
                 /* For post→pre downgrade, target kernel ID is always "ID05"
                    (pre-cutoff SAT 8D30/8D31 firmware). g_kernelID holds the
                    drive's current (post-cutoff) kernel ID "ID35" — not what we want. */
@@ -6608,7 +6615,7 @@ static int cmd_flashfw(void)
                    (char*)trig_payload,
                    trig_payload[0x13], trig_payload[0x12],
                    trig_payload[0x11], trig_payload[0x10]);
-            send_scsi(g_hDrive, cdb, 12, trig_payload, 0x100,
+            send_scsi(g_hDrive, cdb, 10, trig_payload, 0x100,
                       SCSI_IOCTL_DATA_OUT, sense2, &st2);
         }
         printf("  Status: %s", st2==0?"GOOD":"FAIL");

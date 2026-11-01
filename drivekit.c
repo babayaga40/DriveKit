@@ -9082,13 +9082,24 @@ static int cmd_crossflash(void)
     Sleep(500);
 
     /* -------------------------------------------------------
-       STEP 3: TOKEN
-       mode=0x07 bufID=0xFE off=0x0000 len=0x200
-       Random 512 bytes — we use a fixed pseudo-random block,
-       the drive doesn't verify content, only presence.
+       STEP 3: TOKEN  (= BDRFlash's first FE write)
+       mode=0x07 bufID=0xFE off=0x000000 len=0x200
+
+       BDRFlash USBPcap confirmed: the FIRST and ONLY write to FE
+       offset 0x000000 is 512 bytes of opaque/random-looking data
+       (observed: DD CA E3 28 3F 8C 1D 30 8D 01 78 E3 2D 8B 37 7B…).
+       BDRFlash does NOT send a separate kernel header write — the
+       token at 0x0000 is the only write to that NAND region.
+       The kernel header already resident in NAND from the previous
+       flash is left untouched; only the body (0x1200+) is updated.
+
+       DriveKit previously sent TWO writes to offset 0x0000:
+         1. pseudo-random token (0x200 bytes)
+         2. kernel ASCII header (0x200 bytes, overwriting the token)
+       This second write does not exist in BDRFlash's protocol and
+       was likely causing the 04/4C/02 commit failure.
        ------------------------------------------------------- */
-    printf("[3/6] Token (mode=0x07 bufID=0xFE len=0x200)...\n");
-    /* Generate pseudo-random token using simple LFSR */
+    printf("[3/6] Token (mode=0x07 bufID=0xFE off=0x000000 len=0x200)...\n");
     {
         DWORD seed = GetTickCount() ^ 0xDEADBEEF;
         for (i = 0; i < 0x200; i++) {
@@ -9098,74 +9109,53 @@ static int cmd_crossflash(void)
             token[i] = (UCHAR)(seed & 0xFF);
         }
     }
-    st = xf_write_buffer(0x07, 0xFE, 0x0000, token, 0x200, "token");
+    st = xf_write_buffer(0x07, 0xFE, 0x000000, token, 0x200, "token");
     if (st != 0) goto fail;
     printf("      OK\n\n");
     Sleep(100);
 
     /* -------------------------------------------------------
-       STEP 4: KERNEL
-       mode=0x07 bufID=0xFE starting at NAND offset 0x000000
-       Trevor's capture: file[0x200:] is sent in 0x100-byte chunks,
-       NAND offset increments from 0x000000. The 0x160-byte Pioneer
-       BDRFlash USBPcap analysis shows exact kernel NAND layout:
-         cmd1: NAND 0x000000 len=0x0200  (Pioneer ASCII header, file[0x000..0x1FF])
-         cmd2: NAND 0x001200 len=0x8000  (encrypted body start, file[0x1200..0x91FF])
-         cmd3: NAND 0x009200 len=0x8000  (file[0x9200..0x111FF])
-         cmd4: NAND 0x011200 len=0x1000  (file[0x11200..0x121FF])
-       Key table region 0x0200–0x11FF is NOT sent — it lives permanently in NAND.
-       BDRFlash uses large chunks (0x8000) not 0x100-byte chunks.
+       STEP 4: KERNEL BODY
+       mode=0x07 bufID=0xFE — three writes, matching BDRFlash exactly:
+         cmd1: NAND 0x001200 len=0x8000  (file[0x1200..0x91FF])
+         cmd2: NAND 0x009200 len=0x8000  (file[0x9200..0x111FF])
+         cmd3: NAND 0x011200 len=0x1000  (file[0x10200..0x111FF], tail re-send)
+       Header region (NAND 0x0000–0x01FF): written by token step above (left as-is).
+       Key table region (NAND 0x0200–0x11FF): NOT sent — lives permanently in NAND.
+       Body is 0x10000 bytes; cmd1+cmd2 cover it completely; cmd3 re-sends the tail.
        ------------------------------------------------------- */
-    printf("[4/6] Kernel (mode=0x07 bufID=0xFE)...\n");
+    printf("[4/6] Kernel body (mode=0x07 bufID=0xFE)...\n");
     {
-        /* cmd1: header at NAND 0x000000, len=0x200 */
-        printf("      cmd1: NAND 0x000000 len=0x0200 (header)\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data, 0x0200, "kernel_hdr");
-        if (st != 0) goto fail;
-        Sleep(2);
-
-        /* cmd2: encrypted body at NAND 0x001200, file offset 0x1200, len=0x8000 */
-        printf("      cmd2: NAND 0x001200 len=0x8000\n");
+        /* cmd1: encrypted body chunk 1, NAND 0x001200, file[0x1200..0x91FF] */
+        printf("      cmd1: NAND 0x001200 len=0x8000 (file[0x1200..0x91FF])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
         if (st != 0) goto fail;
         Sleep(2);
 
-        /* cmd3: NAND 0x009200, file offset 0x9200, len=0x8000 */
-        printf("      cmd3: NAND 0x009200 len=0x8000\n");
+        /* cmd2: encrypted body chunk 2, NAND 0x009200, file[0x9200..0x111FF] */
+        printf("      cmd2: NAND 0x009200 len=0x8000 (file[0x9200..0x111FF])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
         if (st != 0) goto fail;
         Sleep(2);
 
-        /* cmd4: NAND 0x011200, len=0x1000
-           Tail re-send — overlaps last 0x1000 bytes already written by cmd3.
-           BDRFlash always sends this; purpose is likely to flush/finalize the
-           NAND controller's write buffer for the last block of the kernel region.
-
-           Key insight: the tail region is at body offset 0xF000..0xFFFF
-           (file[0x10200..0x111FF]). The only patched byte is body[0xFE]
-           (file[0x12FE]), which is within cmd2's range — not cmd4's range.
-           Since re-encryption is key-stream-only (no chaining), and the key
-           stream at position 0xF000+ is unchanged, cmd4's bytes are identical
-           to the original file whether --patch is used or not.
-
-           Previously cmd4 returned 04/4C/01 during downgrade — now treated as
-           non-fatal (soft error): log it but continue to pass2+commit.
-           Rationale: the drive may enter a brief reconfiguration state after
-           receiving the full kernel body (cmd3 completes 0x10000 bytes) before
-           cmd4 arrives; the error may reflect timing not content rejection. */
+        /* cmd3: tail re-send, NAND 0x011200, file[0x10200..0x111FF]
+           Overlaps with last 0x1000 bytes of cmd2. BDRFlash always sends this —
+           likely flushes/finalises the NAND write buffer for the last block.
+           The tail bytes are unaffected by --patch (patched byte is at file[0x12FE],
+           inside cmd1's range), so this data is identical to BDRFlash's payload. */
         if (kernel_size >= 0x11200) {
-            UCHAR sense4[SENSE_SIZE];
-            int st4;
-            printf("      cmd4: NAND 0x011200 len=0x1000 (file[0x10200..0x111FF])\n");
-            st4 = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x10200, 0x1000, "kernel_tail");
-            if (st4 != 0) {
-                printf("      cmd4: SOFT FAIL (ignored) — drive may be busy after kernel body\n");
-                /* Non-fatal: cmd2+cmd3 already wrote the complete body; proceed */
+            int st3;
+            printf("      cmd3: NAND 0x011200 len=0x1000 (file[0x10200..0x111FF], tail flush)\n");
+            st3 = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x10200, 0x1000, "kernel_tail");
+            if (st3 != 0) {
+                printf("      cmd3: SOFT FAIL (ignored) — sense=%02X/%02X/%02X\n",
+                       /* sense bytes already printed by xf_write_buffer */
+                       0,0,0);
             } else {
-                printf("      cmd4: OK\n");
+                printf("      cmd3: OK\n");
             }
         } else {
-            printf("      cmd4: skipped (kernel file < 0x11200 bytes)\n");
+            printf("      cmd3: skipped (kernel file < 0x11200 bytes)\n");
         }
         printf("      OK\n\n");
     }

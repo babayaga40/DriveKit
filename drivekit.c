@@ -7840,12 +7840,9 @@ static int cmd_decryptkernel(void)
     printf("Decode complete.\n");
 
     /* --- show marker --- */
-    DWORD marker_dword = (DWORD)body[0xFE*4 + 0]
-                       | ((DWORD)body[0xFE*4 + 1] <<  8)
-                       | ((DWORD)body[0xFE*4 + 2] << 16)
-                       | ((DWORD)body[0xFE*4 + 3] << 24);
-    printf("  Generation marker @ decoded[0xFE] = 0x%08X  (byte0=0x%02X)\n",
-           marker_dword, body[0xFE*4]);
+    /* Generation marker is at BYTE offset 0xFE in the decoded body */
+    UCHAR marker_byte = body[0xFE];
+    printf("  Generation marker @ decoded[0xFE] = 0x%02X\n", marker_byte);
 
     /* --- show body checksum at 0x1020 --- */
     {
@@ -8169,21 +8166,26 @@ static void xf_build_trigger(UCHAR *payload, const char *model, DWORD key_le)
     payload[0x13] = (UCHAR)(key_le >> 24);
 }
 
-/* Send normal firmware in 0x8000 byte chunks */
+/* Send normal firmware in 0x8000 byte chunks.
+   BDRFlash USBPcap analysis (XD07 1.05 → XD07U 1.06 crossflash) confirms:
+   Pass 1: fw_size - 0x10000 bytes (truncated)
+   Pass 2: fw_size bytes (full)
+   The 0x10000-byte difference is the ECC/OOB trailer region written last. */
 static int xf_send_normal_fw(const UCHAR *fw, DWORD fw_size, int pass)
 {
     DWORD   offset;
     DWORD   chunk_sz = 0x8000;
-    DWORD   total_chunks = (fw_size + chunk_sz - 1) / chunk_sz;
+    DWORD   send_size = (pass == 1 && fw_size > 0x10000) ? fw_size - 0x10000 : fw_size;
+    DWORD   total_chunks = (send_size + chunk_sz - 1) / chunk_sz;
     DWORD   chunk_num = 0;
     int     st;
     char    desc[64];
 
     printf("    Sending normal firmware pass %d (%lu bytes in %lu chunks)...\n",
-           pass, fw_size, total_chunks);
+           pass, send_size, total_chunks);
 
-    for (offset = 0; offset < fw_size; offset += chunk_sz) {
-        DWORD this_sz = fw_size - offset;
+    for (offset = 0; offset < send_size; offset += chunk_sz) {
+        DWORD this_sz = send_size - offset;
         if (this_sz > chunk_sz) this_sz = chunk_sz;
 
         chunk_num++;
@@ -9106,40 +9108,56 @@ static int cmd_crossflash(void)
        mode=0x07 bufID=0xFE starting at NAND offset 0x000000
        Trevor's capture: file[0x200:] is sent in 0x100-byte chunks,
        NAND offset increments from 0x000000. The 0x160-byte Pioneer
-       ASCII envelope header (file[0x000:0x160]) is NOT sent; the
-       payload block starts at file[0x200] (the KernelFront key
-       table for SAT 9331) and continues through file[end].
-       chunk_sz=0x100 is required — larger chunks are rejected.
+       BDRFlash USBPcap analysis shows exact kernel NAND layout:
+         cmd1: NAND 0x000000 len=0x0200  (Pioneer ASCII header, file[0x000..0x1FF])
+         cmd2: NAND 0x001200 len=0x8000  (encrypted body start, file[0x1200..0x91FF])
+         cmd3: NAND 0x009200 len=0x8000  (file[0x9200..0x111FF])
+         cmd4: NAND 0x011200 len=0x1000  (file[0x11200..0x121FF])
+       Key table region 0x0200–0x11FF is NOT sent — it lives permanently in NAND.
+       BDRFlash uses large chunks (0x8000) not 0x100-byte chunks.
        ------------------------------------------------------- */
-    printf("[4/6] Kernel (mode=0x07 bufID=0xFE off=0x000000)...\n");
+    printf("[4/6] Kernel (mode=0x07 bufID=0xFE)...\n");
     {
-        DWORD  kdata_offset = 0x200;  /* skip 0x200-byte Pioneer envelope header */
-        const UCHAR *kdata  = kernel_data + kdata_offset;
-        DWORD  kdata_size   = kernel_size - kdata_offset;
-        DWORD  chunk_sz     = 0x100;  /* Trevor's capture: 0x100-byte chunks only */
-        DWORD  koffset;
-        DWORD  chunk_num    = 0;
-        DWORD  total_chunks = (kdata_size + chunk_sz - 1) / chunk_sz;
+        /* cmd1: header at NAND 0x000000, len=0x200 */
+        printf("      cmd1: NAND 0x000000 len=0x0200 (header)\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data, 0x0200, "kernel_hdr");
+        if (st != 0) goto fail;
+        Sleep(2);
 
-        printf("      Kernel payload: %lu bytes in %lu chunks\n",
-               kdata_size, total_chunks);
+        /* cmd2: encrypted body at NAND 0x001200, file offset 0x1200, len=0x8000 */
+        printf("      cmd2: NAND 0x001200 len=0x8000\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
+        if (st != 0) goto fail;
+        Sleep(2);
 
-        for (koffset = 0; koffset < kdata_size; koffset += chunk_sz) {
-            DWORD this_sz = kdata_size - koffset;
-            if (this_sz > chunk_sz) this_sz = chunk_sz;
-            DWORD nand_offset = koffset; /* starts at 0x000000, not 0x1200 */
+        /* cmd3: NAND 0x009200, file offset 0x9200, len=0x8000 */
+        printf("      cmd3: NAND 0x009200 len=0x8000\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
+        if (st != 0) goto fail;
+        Sleep(2);
 
-            chunk_num++;
-            printf("      kernel chunk %lu/%lu nand_offset=0x%06X\r",
-                   chunk_num, total_chunks, nand_offset);
-            fflush(stdout);
-
-            st = xf_write_buffer(0x07, 0xFE, nand_offset,
-                                 kdata + koffset, this_sz, "kernel");
-            if (st != 0) { printf("\n"); goto fail; }
-            Sleep(2);
+        /* cmd4: NAND 0x011200, len=0x1000
+           BDRFlash layout: cmd2 covers file[0x1200..0x91FF], cmd3 covers file[0x9200..0x111FF].
+           Wait — cmd2+cmd3 = 0x8000+0x8000 = 0x10000 bytes from file offset 0x1200,
+           covering file[0x1200..0x111FF]. That's the full encrypted body (0x10000 bytes).
+           cmd4 at NAND 0x011200 sends the LAST 0x1000 bytes of the file: file[0x10200..0x111FF].
+           These overlap with what cmd3 already sent (cmd3 covers file[0x9200..0x111FF]).
+           BDRFlash re-sends the tail — possibly to ensure the final page is committed.
+           Send file[0x10200..0x111FF] at NAND 0x011200. */
+        /* cmd4: only send for same-era flash (no --patch).
+           For downgrade (--patch), the patched+re-encrypted kernel body differs from
+           what BDRFlash sends, and the drive rejects cmd4 with 04/4C/01.
+           cmd2+cmd3 already cover the full encrypted body — cmd4 is a tail re-send
+           that BDRFlash uses for same-era but which breaks on cross-era downgrade. */
+        if (kernel_size >= 0x11200 && !g_patch_flag) {
+            printf("      cmd4: NAND 0x011200 len=0x1000 (file[0x10200..0x111FF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x10200, 0x1000, "kernel_tail");
+            if (st != 0) goto fail;
+        } else {
+            printf("      cmd4: skipped (%s)\n",
+                   g_patch_flag ? "downgrade --patch: tail re-send not used" : "kernel file smaller than 0x11200 bytes");
         }
-        printf("\n      OK\n\n");
+        printf("      OK\n\n");
     }
     Sleep(200);
 
@@ -9167,7 +9185,7 @@ static int cmd_crossflash(void)
        drive needs time to finish NAND write before accepting trigger.
        ------------------------------------------------------- */
     printf("[6/6] Final commit trigger...\n");
-    Sleep(500);
+    Sleep(1000); /* Give drive extra time to finish NAND writes (was 500ms) */
     {
         UCHAR commit_trigger[256];
         DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */
@@ -9178,25 +9196,21 @@ static int cmd_crossflash(void)
             printf("      Cross-era (pre→post): using unlock key=0x%08lX (confirmed by pcapng)\n",
                    commit_key);
         } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
-            /* post→pre downgrade: commit key must be target kernel's key, not current drive's key.
-               The model string stays "PIONEER BDR-BDS7" — this is the hardware platform family
-               used for ALL unlock/commit triggers regardless of firmware era (per UnlockKeys.hpp).
-               Only the key changes between eras. */
+            /* post→pre downgrade: try TARGET era key for commit.
+               Hypothesis: drive finalizes with the key matching the newly-written
+               firmware, not the key used to unlock (which was the current era's key).
+               If this also fails 04/4C/02, we'll need to try unlock key instead. */
             DWORD tgt_key = pioneer_key_lookup(g_driveID, target_kern_id);
-            if (tgt_key && tgt_key != key_le) {
-                printf("      Downgrade (post→pre): switching commit key 0x%08lX → 0x%08lX (kernelID=%s)\n",
-                       commit_key, tgt_key, target_kern_id);
+            if (tgt_key) {
                 commit_key = tgt_key;
-            } else if (tgt_key) {
-                printf("      Downgrade (post→pre): target key 0x%08lX same as unlock key (kernelID=%s)\n",
-                       tgt_key, target_kern_id);
+                printf("      Downgrade (post→pre): using TARGET kernel key=0x%08lX (kernelID=%s)\n",
+                       commit_key, target_kern_id);
             } else {
-                printf("      Downgrade (post→pre): no key for kernelID=%s driveID=0x%04lX — using unlock key 0x%08lX\n",
+                printf("      Downgrade (post→pre): no key for kernelID=%s driveID=0x%04lX — falling back to unlock key 0x%08lX\n",
                        target_kern_id, (DWORD)g_driveID, commit_key);
             }
             /* Build commit trigger using platform family model from g_pioneer_drives[].
-               For BDS7 family (0x8D30/0x8D31), this is "PIONEER BDR-BDS7" — the hardware
-               platform family string used for all triggers regardless of firmware era. */
+               For BDS7 family (0x8D30/0x8D31), this is "PIONEER BDR-BDS7". */
             {
                 const PIONEER_DRIVE *drv = pioneer_lookup(g_driveID);
                 if (drv && drv->model && drv->model[0]) {
@@ -9205,7 +9219,6 @@ static int cmd_crossflash(void)
                     strncpy((char*)commit_trigger, drv->model, 16);
                     printf("      Downgrade (post→pre): model='%.16s' key=0x%08lX\n",
                            (char*)commit_trigger, commit_key);
-                    /* fill key then skip xf_build_trigger */
                     commit_trigger[0x10] = (UCHAR)(commit_key      );
                     commit_trigger[0x11] = (UCHAR)(commit_key >>  8);
                     commit_trigger[0x12] = (UCHAR)(commit_key >> 16);
@@ -9217,9 +9230,11 @@ static int cmd_crossflash(void)
 
         xf_build_trigger(commit_trigger, model, commit_key);
         commit_built:;
-        printf("      CDB: 3B 05 FF 00 00 00 00 00 01 00 00 00  (12-byte)\n");
+        printf("      CDB: 3B 05 FF 00 00 00 00 01 00 00 00 00  (12-byte)\n");
         printf("      Payload[0x00]: %.16s  Key@[0x10]: 0x%08lX\n",
                (char*)commit_trigger, commit_key);
+        printf("      Payload hex[0x00..0x1F]: ");
+        { int _pi; for (_pi=0;_pi<0x20;_pi++) printf("%02X ",commit_trigger[_pi]); printf("\n"); }
         st = xf_write_buffer(0x05, 0xFF, 0x000000, commit_trigger, 0x100, "commit_trigger");
         printf("      Status: %s\n", st == 0 ? "GOOD" : "FAIL");
         printf("\n");

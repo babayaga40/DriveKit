@@ -6125,25 +6125,18 @@ static int cmd_flashfw(void)
         Sleep(1000); /* ENTRY_SETTLE: 1 second after unlock per reference session.rs */
     }
 
-    /* Inquiry(0x60) after unlock — matches reference session.rs CDB sequence:
-       calls[0]=enter_update, calls[1]=inquiry(0x60), calls[2..]=transfers.
-       Reads revision to confirm service mode entry; may advance drive state machine. */
-    {
+    /* Inquiry(0x60) after unlock — present in reference session.rs CDB sequence
+       but confirmed to BREAK the flash on Pioneer BDR-BDS7 (post-cutoff, SAT 8D30/8D31).
+       Drive returns revision "0000" in service mode and the subsequent commit fails
+       with 04/4C/02. Disabled — the drive does not need this to advance its state machine.
+       Left here as documentation; do NOT re-enable without testing post→post first. */
+    if (0) {
         UCHAR inq[96] = {0};
-        UCHAR inqcdb[6] = {0x12, 0, 0, 0, 0x60, 0}; /* inquiry(0x60) per cdb_tests.rs */
+        UCHAR inqcdb[6] = {0x12, 0, 0, 0, 0x60, 0};
         UCHAR inqsense[SENSE_SIZE] = {0};
         int   inqst = 0;
-        printf("[1b/3] Inquiry(0x60) — confirm service mode...\n");
         send_scsi(g_hDrive, inqcdb, 6, inq, 0x60,
                   SCSI_IOCTL_DATA_IN, inqsense, &inqst);
-        if (inqst == 0) {
-            char fw[5] = {0};
-            memcpy(fw, inq+32, 4);
-            printf("  Revision: %.4s\n\n", fw);
-        } else {
-            printf("  WARNING: inquiry failed (key=%02X ASC=%02X) — continuing\n\n",
-                   inqsense[2]&0x0F, inqsense[12]);
-        }
     }
 
     /* Cross-era pre-pass: normal FW pass 1, sent AFTER unlock.

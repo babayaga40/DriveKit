@@ -9082,34 +9082,30 @@ static int cmd_crossflash(void)
     Sleep(500);
 
     /* -------------------------------------------------------
-       STEP 3: TOKEN  (= BDRFlash's first FE write)
+       STEP 3: KERNEL HEADER + TOKEN  (= BDRFlash's first FE write)
        mode=0x07 bufID=0xFE off=0x000000 len=0x200
 
-       BDRFlash USBPcap confirmed: the FIRST and ONLY write to FE
-       offset 0x000000 is 512 bytes of opaque/random-looking data
-       (observed: DD CA E3 28 3F 8C 1D 30 8D 01 78 E3 2D 8B 37 7B…).
-       BDRFlash does NOT send a separate kernel header write — the
-       token at 0x0000 is the only write to that NAND region.
-       The kernel header already resident in NAND from the previous
-       flash is left untouched; only the body (0x1200+) is updated.
+       BDRFlash's first FE write sends 512 opaque bytes at offset 0.
+       For a same-version flash this region already holds the correct
+       header — BDRFlash may just be resending it unchanged (it looks
+       random because it's encrypted/proprietary).
 
-       DriveKit previously sent TWO writes to offset 0x0000:
-         1. pseudo-random token (0x200 bytes)
-         2. kernel ASCII header (0x200 bytes, overwriting the token)
-       This second write does not exist in BDRFlash's protocol and
-       was likely causing the 04/4C/02 commit failure.
+       For a VERSION-CHANGE (downgrade/crossflash), the NAND header
+       at 0x0000 belongs to the OLD firmware.  The body we are about
+       to write belongs to the TARGET firmware.  If the drive validates
+       header/body consistency on commit-boot, a mismatched header
+       would cause 04/4C/02.
+
+       Strategy: send the TARGET kernel's header (kernel_data[0..0x1FF])
+       as the "token" payload.  This is the same 0x200 bytes, same
+       offset, same NAND position — we're just sending the right header
+       instead of random data.  For same-era reflash the header would
+       be identical to what's already in NAND anyway.
        ------------------------------------------------------- */
-    printf("[3/6] Token (mode=0x07 bufID=0xFE off=0x000000 len=0x200)...\n");
-    {
-        DWORD seed = GetTickCount() ^ 0xDEADBEEF;
-        for (i = 0; i < 0x200; i++) {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            token[i] = (UCHAR)(seed & 0xFF);
-        }
-    }
-    st = xf_write_buffer(0x07, 0xFE, 0x000000, token, 0x200, "token");
+    printf("[3/6] Kernel header (FE off=0x000000 len=0x200, target kernel header)...\n");
+    /* Use the target kernel's ASCII header as the token payload */
+    memcpy(token, kernel_data, 0x200);
+    st = xf_write_buffer(0x07, 0xFE, 0x000000, token, 0x200, "kernel_hdr_token");
     if (st != 0) goto fail;
     printf("      OK\n\n");
     Sleep(100);

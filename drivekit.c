@@ -8625,10 +8625,11 @@ static int cmd_crossflash(void)
     if (!g_outFile[0] || !g_outFile2[0]) {
         fprintf(stderr,
             "Usage: drivekit crossflash E --file kernel.bin --file2 normal.bin\n"
-            "                             [--key 0xAA475E15]\n\n"
-            "  --file   = kernel binary (e.g. 131)\n"
-            "  --file2  = normal firmware binary (e.g. 132)\n"
-            "  --key    = unlock key override (default 0xAA475E15 for XD08/XD08U)\n\n");
+            "                             [--key 0xAA475E15] [--nounlock]\n\n"
+            "  --file     = kernel binary (e.g. 131)\n"
+            "  --file2    = normal firmware binary (e.g. 132)\n"
+            "  --key      = unlock key override (default 0xAA475E15 for XD08/XD08U)\n"
+            "  --nounlock = skip unlock step (drive already in kernel mode)\n\n");
         return 1;
     }
 
@@ -9052,6 +9053,9 @@ static int cmd_crossflash(void)
        mode=0x04 bufID=0xFF len=0x100
        Payload: model string at [0x79] + key at [0x89]
        ------------------------------------------------------- */
+    if (g_nounlock) {
+        printf("[1/6] Unlock trigger SKIPPED (--nounlock — drive already in kernel mode)\n\n");
+    } else {
     printf("[1/6] Unlock trigger (mode=0x04 bufID=0xFF)...\n");
     xf_build_trigger(trigger, model, key_le);
     printf("      payload[0x00]='%.16s' key@[0x10]=0x%08X\n", model, key_le);
@@ -9063,6 +9067,7 @@ static int cmd_crossflash(void)
     }
     printf("      OK\n\n");
     Sleep(200);
+    } /* end !g_nounlock */
 
     /* -------------------------------------------------------
        STEP 2: FIRST FIRMWARE PASS

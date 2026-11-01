@@ -82,6 +82,7 @@ static int     g_enableversion = 0; /* --enableversion: bypass era mismatch guar
 static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static DWORD   g_maxDumpSize = 0;  /* 0 = no limit */
 static int     g_nounlock = 0;    /* skip unlock step */
+static int     g_e5eng   = 0;    /* --e5: send WRITE BUFFER 0xE5 engineering mode enable before unlock */
 static int     g_pre_cutoff = 0; /* set by cmd_flash when 0xB0 readable */
 static WORD    g_driveID = 0;     /* detected drive ID for trigger key selection */
 static char    g_kernelID[5] = {0}; /* kernel ID string from 0xF1 response (e.g. "9331") */
@@ -6903,6 +6904,8 @@ int main(int argc, char *argv[])
             g_fakedate = 1;
         } else if (strcmp(argv[i], "--enableversion") == 0) {
             g_enableversion = 1;
+        } else if (strcmp(argv[i], "--e5") == 0) {
+            g_e5eng = 1;
         } else if (strcmp(argv[i], "--nounlock") == 0) {
             g_nounlock = 1;
         } else if (strcmp(argv[i], "--postcutoff") == 0) {
@@ -9049,6 +9052,31 @@ static int cmd_crossflash(void)
         }
     }
     printf("\n");
+
+    /* -------------------------------------------------------
+       PRE-STEP E5: ENGINEERING MODE ENABLE (optional, --e5)
+       WRITE BUFFER mode=0x04 bufID=0xE5 len=2 payload=0x01
+       From MrPenguin's H8S/2600 disassembly of XD08U:
+         Sets flag @0xA0CE7E = 1, enabling "engineering mode"
+         which may bypass the firmware version downgrade check.
+       Send BEFORE unlock. Non-fatal if rejected (older firmware
+       may not implement this; failure means guard stays active).
+       ------------------------------------------------------- */
+    if (g_e5eng) {
+        UCHAR e5cdb[10] = {0x3B, 0x04, 0xE5, 0, 0, 0, 0, 0x00, 0x02, 0};
+        UCHAR e5payload[2] = {0x01, 0x00};
+        UCHAR e5sense[SENSE_SIZE] = {0};
+        int e5st = 0;
+        printf("[E5] Engineering mode enable (WRITE BUFFER 0xE5 len=2 payload=0x01)...\n");
+        send_scsi(g_hDrive, e5cdb, 10, e5payload, 2, SCSI_IOCTL_DATA_OUT, e5sense, &e5st);
+        if (e5st == 0 || (e5sense[2] & 0x0F) == 0) {
+            printf("      OK — engineering mode enabled (version check may be bypassed)\n\n");
+        } else {
+            printf("      SOFT FAIL sense=%02X/%02X/%02X — drive may not support 0xE5; continuing\n\n",
+                   e5sense[2]&0x0F, e5sense[12], e5sense[13]);
+        }
+        Sleep(50);
+    }
 
     /* -------------------------------------------------------
        STEP 1: UNLOCK TRIGGER

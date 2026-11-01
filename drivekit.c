@@ -6533,10 +6533,10 @@ static int cmd_flashfw(void)
                 tpayload[0x11] = (UCHAR)((tkey>>8) & 0xFF);
                 tpayload[0x12] = (UCHAR)((tkey>>16) & 0xFF);
                 tpayload[0x13] = (UCHAR)((tkey>>24) & 0xFF);
-                UCHAR tcdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+                UCHAR tcdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
                 UCHAR tsense[SENSE_SIZE] = {0};
                 printf("  Trigger: mode=5 bufID=0xFF len=0x100 key=0x%08X\n", tkey);
-                send_scsi(g_hDrive, tcdb, 10, tpayload, 0x100,
+                send_scsi(g_hDrive, tcdb, 12, tpayload, 0x100,
                           SCSI_IOCTL_DATA_OUT, tsense, &st2);
                 printf("  Trigger: %s",
                        (st2==0||(tsense[2]&0xF)==0)?"GOOD":"FAIL");
@@ -6554,7 +6554,7 @@ static int cmd_flashfw(void)
                For pre→pre and pre→post: key = unlock key (g_payload[0x10..0x13]).
                For post→pre downgrade (--patch, post-cutoff drive, pre-cutoff target FW):
                commit key = pre-cutoff target key; model = pre-cutoff model string. */
-            UCHAR cdb[10] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0};
+            UCHAR cdb[12] = {0x3B,0x05,0xFF,0,0,0,0,0x01,0x00,0,0,0};
             UCHAR trig_payload[0x100];
             memcpy(trig_payload, g_payload, 0x100);
             DWORD commit_key = ((DWORD)g_payload[0x10]      ) |
@@ -6608,7 +6608,7 @@ static int cmd_flashfw(void)
                    (char*)trig_payload,
                    trig_payload[0x13], trig_payload[0x12],
                    trig_payload[0x11], trig_payload[0x10]);
-            send_scsi(g_hDrive, cdb, 10, trig_payload, 0x100,
+            send_scsi(g_hDrive, cdb, 12, trig_payload, 0x100,
                       SCSI_IOCTL_DATA_OUT, sense2, &st2);
         }
         printf("  Status: %s", st2==0?"GOOD":"FAIL");

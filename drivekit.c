@@ -9586,39 +9586,27 @@ static int cmd_crossflash(void)
         }
         Sleep(200);
 
-        /* [3] Kernel — NAND-mapped 4-transfer layout (upgrade era)
-               File layout: [hdr 0x200][KernelFront hdr 0x1000][body1 0x8000][body2 0x8000]
-               body1/body2: file_offset == drive_offset (NAND pass-through)
-               tail:        drive 0x011200, 0x1000 bytes of zeros (NAND gap, NOT header bytes) */
-        printf("[3/5] Kernel transfer (NAND-mapped 4-xfer, upgrade layout)...\n");
+        /* [3] Kernel — headerless 2-chunk layout (upgrade era)
+               Joni: "kernel without its header" = skip file[0x0000:0x0200],
+               send file[0x0200:0x11200] = 0x11000 bytes, drive offset 0x0000.
+               chunk1: FE off=0x000000 len=0x8000 (file[0x0200])
+               chunk2: FE off=0x008000 len=0x9000 (file[0x8200]) */
+        printf("[3/5] Kernel transfer (headerless 2-chunk, upgrade layout)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
-            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
-            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
-            sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);
-            { static const UCHAR zero_tail[0x1000] = {0};
-              sha256_update(&sha_ctx, zero_tail, 0x1000); }
+            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x8200, 0x9000);
             sha256_final(&sha_ctx, sha_digest);
-            printf("      SHA-256 (hdr+body1+body2+zero_tail):\n        ");
+            printf("      SHA-256 (headerless file[0x200:0x11200]):\n        ");
             for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
-        printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
+        printf("      chunk1: FE off=0x000000 len=0x8000 (file[0x0200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0200, 0x8000, "kernel_c1");
         if (st != 0) goto fail; Sleep(2);
-        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
-        if (st != 0) goto fail; Sleep(2);
-        printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
-        if (st != 0) goto fail; Sleep(2);
-        /* Tail: gap region in NAND at 0x011200 — send zeros (not header bytes).
-           The KernelFront header at file[0x0200] is NOT valid NAND content here;
-           the drive validates this region and rejects non-zero/non-NAND content. */
-        printf("      tail:  FE off=0x011200 len=0x1000 (zero-fill gap)\n");
-        { static const UCHAR zero_tail[0x1000] = {0};
-          st = xf_write_buffer(0x07, 0xFE, 0x011200, zero_tail, 0x1000, "kernel_tail"); }
+        printf("      chunk2: FE off=0x008000 len=0x9000 (file[0x8200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8200, 0x9000, "kernel_c2");
         if (st != 0) goto fail;
         printf("      OK\n\n");
         Sleep(200);

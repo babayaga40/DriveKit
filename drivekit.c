@@ -6567,43 +6567,6 @@ static int cmd_flashfw(void)
                 printf("  Cross-era commit: using unlock key=0x%08lX\n", commit_key);
             }
 
-            /* Post→pre downgrade: commit uses the UNLOCK key (post-cutoff drive's key),
-               NOT the target firmware's pre-cutoff key. The drive validates the commit
-               against the key used to unlock it — switching to ID05 here causes 04/4C/02. */
-            if (0 && !g_pre_cutoff && !fw2_postcut && g_patch_flag) {
-                /* For post→pre downgrade, target kernel ID is always "ID05"
-                   (pre-cutoff SAT 8D30/8D31 firmware). g_kernelID holds the
-                   drive's current (post-cutoff) kernel ID "ID35" — not what we want. */
-                /* Use kernel file's platform ID (fw_kernel_id=0x8D31 for XD07U)
-                   not the drive's hardware ID (g_driveID=0x8D30 for XD07).
-                   The commit model/key must match the target firmware, not the drive HW. */
-                printf("  [DBG] fw_kernel_id=0x%04X g_driveID=0x%04X\n", fw_kernel_id, g_driveID);
-                /* If fw_kernel_id wasn't parsed (0) or matches g_driveID, try 0x8D31
-                   explicitly for XD07/XD07U family (0x8D30 drive can run 8D31 FW) */
-                WORD lookup_id = fw_kernel_id ? fw_kernel_id : g_driveID;
-                if (lookup_id == g_driveID && (g_driveID == 0x8D30 || g_driveID == 0x8D31))
-                    lookup_id = 0x8D31; /* XD07U — always use XD07U model for commit */
-                DWORD pre_key = pioneer_key_lookup(lookup_id, "ID05");
-                if (!pre_key && lookup_id != 0x8D31)
-                    pre_key = pioneer_key_lookup(0x8D31, "ID05"); /* fallback */
-                const PIONEER_DRIVE *drv = pioneer_lookup(lookup_id);
-                if (!drv) drv = pioneer_lookup(0x8D31); /* fallback */
-                if (pre_key && drv && drv->model && drv->model[0]) {
-                    printf("  Downgrade commit: switching payload to pre-cutoff model/key\n");
-                    printf("    Model : %.16s\n", drv->model);
-                    printf("    Key   : 0x%08lX\n", pre_key);
-                    memset(trig_payload, 0, 0x100);
-                    memset(trig_payload, 0x20, 16);
-                    strncpy((char*)trig_payload, drv->model, 16);
-                    trig_payload[0x10] = (UCHAR)(pre_key & 0xFF);
-                    trig_payload[0x11] = (UCHAR)((pre_key >> 8) & 0xFF);
-                    trig_payload[0x12] = (UCHAR)((pre_key >> 16) & 0xFF);
-                    trig_payload[0x13] = (UCHAR)((pre_key >> 24) & 0xFF);
-                    commit_key = pre_key;
-                } else {
-                    printf("  Downgrade commit: WARNING — could not look up pre-cutoff key, using unlock key\n");
-                }
-            }
 
             printf("  Trigger payload: %.16s key=%02X%02X%02X%02X\n",
                    (char*)trig_payload,
@@ -9449,12 +9412,10 @@ static int cmd_crossflash(void)
         DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */
 
         if (g_pre_cutoff && target_is_postcut) {
-            /* pre→post cross-era: use the SAME key as the unlock payload.
-               Joni's USBPcap of BDRFlash confirms: commit key = unlock key,
-               NOT the target era's key.  key_le is already set to the current
-               drive's kernel key (e.g. ID05 = 0xFF8A27B1 for 8D31).
-               Previous ID35 override was wrong — reverted. */
-            printf("      Cross-era (pre→post): commit key = unlock key 0x%08lX (pcapng confirmed)\n",
+            /* pre→post cross-era: commit key = unlock key (same as key_le).
+               Joni's USBPcap of BDRFlash confirms this. key_le is the
+               current drive's kernel key — e.g. 0xFF8A27B1 for 8D31/ID05. */
+            printf("      Cross-era (pre→post): commit key = unlock key 0x%08lX\n",
                    commit_key);
         } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
             /* post→pre downgrade: try TARGET era key for commit.

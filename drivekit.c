@@ -7923,7 +7923,7 @@ static int cmd_decryptkernel(void)
         free(reenc);
         fclose(fout);
         printf("\nPatched+re-encrypted kernel written to: %s  (0x11200 bytes)\n", outpath);
-        printf("  Compare bytes 0x12FC, 0x2220, 0x2223 against known-good reference.\n");
+        printf("  Compare bytes 0x12FC, 0x2220, 0x2223 against Joni's reference.\n");
     } else {
         fwrite(body, 1, 0x10000, fout);
         fclose(fout);
@@ -9086,7 +9086,7 @@ static int cmd_crossflash(void)
        the era difference.  No user action needed. */
     if (g_pre_cutoff && target_is_postcut) {
         printf("  Cross-era flash: PRE-CUTOFF drive → POST-CUTOFF firmware\n");
-        printf("  Commit trigger uses unlock key=0x%08lX\n", key_le);
+        printf("  Commit trigger uses unlock key=0x%08lX (confirmed by pcapng)\n", key_le);
         printf("  (BDRFlash confirmed: this combination works)\n");
         printf("\n");
     }
@@ -9293,7 +9293,7 @@ static int cmd_crossflash(void)
                File layout: [hdr 0x200][tail_data 0x1000][body1 0x8000][body2 0x8000]
                body1/body2: file_offset == drive_offset (NAND pass-through)
                tail:        file[0x0200..0x11FF] → drive 0x011200 (gap bytes) */
-        printf("[3/5] Kernel transfer (upgrade layout)...\n");
+        printf("[3/5] Kernel transfer (NAND-mapped 4-xfer, upgrade layout)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
@@ -9315,7 +9315,7 @@ static int cmd_crossflash(void)
         printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
         if (st != 0) goto fail; Sleep(2);
-        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200..0x11FF])\n");
+        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200] — gap bytes)\n");
         st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x0200, 0x1000, "kernel_tail");
         if (st != 0) goto fail;
         printf("      OK\n\n");

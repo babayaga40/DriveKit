@@ -9359,30 +9359,14 @@ static int cmd_crossflash(void)
     Sleep(200);
 
     /* -------------------------------------------------------
-       STEP 4: SECOND FIRMWARE PASS (pre-cutoff cross-era only)
-       Pre-cutoff drives doing a cross-era flash require a second normal
-       fw pass before commit — this was confirmed working before the
-       single-pass change.  Post-cutoff drives (Joni's capture) use one
-       pass only.
-       ------------------------------------------------------- */
-    if (g_pre_cutoff) {
-        printf("[4a/5] Second firmware pass (pre-cutoff cross-era)...\n");
-        st = xf_send_normal_fw(normal_data, normal_size, 2);
-        if (st != 0) goto fail;
-        printf("\n");
-        Sleep(500);
-    }
-
-    /* -------------------------------------------------------
-       STEP 4b: INTERNAL VALIDATION WAIT
-       Joni's flasher (post-cutoff downgrade) waits ~13s here.
-       For pre-cutoff cross-era, keep a short wait only — too long
-       may expire the drive's internal validation window.
+       STEP 4: INTERNAL VALIDATION WAIT
+       Joni's capture: one fw pass, then ~13s wait, then commit.
+       No second fw pass — for any drive era.
+       The second pass was suspected to corrupt drive state before commit.
        ------------------------------------------------------- */
     {
-        int wait_ms = g_pre_cutoff ? 2000 : 13000;
-        printf("[4b/5] Waiting %dms for drive to validate images...\n", wait_ms);
-        Sleep(wait_ms);
+        printf("[4/5] Waiting 13000ms for drive to validate images...\n");
+        Sleep(13000);
         printf("      Wait complete.\n\n");
     }
 
@@ -9397,7 +9381,7 @@ static int cmd_crossflash(void)
        Wireshark capture of Pioneer BDRFlash (bCBWCBLength=0x0C).
        10-byte CDB for mode=0x05 causes 04/4C rejection.
        ------------------------------------------------------- */
-    printf("[5/5] Final commit trigger...\n");
+    printf("[5/5] Final commit trigger (mode=0x05)...\n");
     {
         UCHAR commit_trigger[256];
         DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */

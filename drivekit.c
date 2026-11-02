@@ -9586,41 +9586,34 @@ static int cmd_crossflash(void)
         }
         Sleep(200);
 
-        /* [3] Kernel — NAND-mapped 4-transfer layout (upgrade era)
-               Heisenberg pcapng: tail at 0x011200 works for 8D30/ID35.
-               XD07U/8D31/ID05 rejects 0x011200 with 04/4C/01 — trying
-               key table at 0x000200 (filling the gap between hdr and body1):
-                 hdr:   FE off=0x000000 len=0x0200  (file[0x0000:0x0200])
-                 ktbl:  FE off=0x000200 len=0x1000  (file[0x0200:0x1200])
-                 body1: FE off=0x001200 len=0x8000  (file[0x1200:0x9200])
-                 body2: FE off=0x009200 len=0x8000  (file[0x9200:0x11200]) */
-        printf("[3/5] Kernel transfer (NAND-mapped 4-xfer, upgrade layout)...\n");
+        /* [3] Kernel — 3-transfer layout (upgrade era: hdr + ktbl + body)
+               Heisenberg pcapng (8D30/ID35) shows 4 transfers with tail at 0x011200.
+               XD07U/8D31/ID05 rejects any 4th transfer with 04/4C/01 regardless
+               of offset/content — drive accepts exactly hdr+ktbl+body (3 xfers):
+                 hdr:  FE off=0x000000 len=0x0200   (file[0x0000:0x0200])
+                 ktbl: FE off=0x000200 len=0x1000   (file[0x0200:0x1200])
+                 body: FE off=0x001200 len=0x10000  (file[0x1200:0x11200]) */
+        printf("[3/5] Kernel transfer (3-xfer upgrade layout: hdr+ktbl+body)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
             sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
             sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);
-            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
-            sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x10000);
             sha256_final(&sha_ctx, sha_digest);
-            printf("      SHA-256 (hdr+ktbl+body1+body2):\n        ");
+            printf("      SHA-256 (hdr+ktbl+body):\n        ");
             for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
         printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
         if (st != 0) goto fail; Sleep(2);
-        /* key table fills the gap at 0x000200 (between hdr and body1) */
-        printf("      ktbl:  FE off=0x000200 len=0x1000 (file[0x0200] — key table bytes)\n");
+        printf("      ktbl:  FE off=0x000200 len=0x1000 (file[0x0200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x000200, kernel_data + 0x0200, 0x1000, "kernel_ktbl");
         if (st != 0) goto fail; Sleep(2);
-        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
-        if (st != 0) goto fail; Sleep(2);
-        /* body2: try 0x008000 (contiguous after ktbl+body1 at NAND level: 0x1000+0x8000=0x9000,
-           but NAND offset may wrap/alias differently) — downgrade layout uses 0x008000 */
-        printf("      body2: FE off=0x008000 len=0x8000 (file[0x9200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x9200, 0x8000, "kernel_body2");
+        /* body: single transfer of full 0x10000 bytes after hdr+ktbl */
+        printf("      body:  FE off=0x001200 len=0x10000 (file[0x1200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x10000, "kernel_body");
         if (st != 0) goto fail;
         printf("      OK\n\n");
         Sleep(200);

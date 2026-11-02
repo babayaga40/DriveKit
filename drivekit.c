@@ -9586,22 +9586,23 @@ static int cmd_crossflash(void)
         }
         Sleep(200);
 
-        /* [3] Kernel — 3-transfer layout (upgrade era: hdr + ktbl + body)
-               Heisenberg pcapng (8D30/ID35) shows 4 transfers with tail at 0x011200.
-               XD07U/8D31/ID05 rejects any 4th transfer with 04/4C/01 regardless
-               of offset/content — drive accepts exactly hdr+ktbl+body (3 xfers):
-                 hdr:  FE off=0x000000 len=0x0200   (file[0x0000:0x0200])
-                 ktbl: FE off=0x000200 len=0x1000   (file[0x0200:0x1200])
-                 body: FE off=0x001200 len=0x10000  (file[0x1200:0x11200]) */
-        printf("[3/5] Kernel transfer (3-xfer upgrade layout: hdr+ktbl+body)...\n");
+        /* [3] Kernel — upgrade era, 8D31/ID05 platform
+               Drive consistently accepts exactly 0x9200 bytes across 3 transfers
+               then rejects anything more with 04/4C/01.  Hypothesis: upgrade era
+               on this platform only needs hdr+ktbl+body1 (no body2 / tail):
+                 hdr:   FE off=0x000000 len=0x0200  (file[0x0000:0x0200])
+                 ktbl:  FE off=0x000200 len=0x1000  (file[0x0200:0x1200])
+                 body1: FE off=0x001200 len=0x8000  (file[0x1200:0x9200])
+               Total transferred: 0x9200 bytes.  body2 (file[0x9200:0x11200]) omitted. */
+        printf("[3/5] Kernel transfer (3-xfer upgrade layout: hdr+ktbl+body1 only)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
             sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
             sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);
-            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x10000);
+            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
             sha256_final(&sha_ctx, sha_digest);
-            printf("      SHA-256 (hdr+ktbl+body):\n        ");
+            printf("      SHA-256 (hdr+ktbl+body1):\n        ");
             for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
@@ -9611,9 +9612,8 @@ static int cmd_crossflash(void)
         printf("      ktbl:  FE off=0x000200 len=0x1000 (file[0x0200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x000200, kernel_data + 0x0200, 0x1000, "kernel_ktbl");
         if (st != 0) goto fail; Sleep(2);
-        /* body: single transfer of full 0x10000 bytes after hdr+ktbl */
-        printf("      body:  FE off=0x001200 len=0x10000 (file[0x1200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x10000, "kernel_body");
+        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
         if (st != 0) goto fail;
         printf("      OK\n\n");
         Sleep(200);

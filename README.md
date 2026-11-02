@@ -4,7 +4,12 @@
 
 Combined optical drive & storage research toolkit for Windows and Linux, targeting Pioneer BD-R/BD-RE optical drives. All functionality is bundled into a single binary, with the operation selected via a command-line subcommand.
 
-**November 2026 milestone:** DriveKit successfully performed a post-cutoff → pre-cutoff downgrade on a **Pioneer BDR-XD07U (SAT 8D31 / ID05)** using a patched 1.04 kernel. The commit returned SCSI GOOD, and a separate post-reflash `drivekit info`/INQUIRY confirmed **firmware 1.04**. This is a verified result on the tested hardware, not a claim of universal compatibility.
+**November 2026 milestones:**
+- DriveKit successfully performed a **pre-cutoff → post-cutoff upgrade** on a **Pioneer BDR-XD07U (SAT 8D31 / ID05)**: 1.04 → 1.06, using the new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.06.
+- DriveKit successfully performed a **post-cutoff → pre-cutoff downgrade**: post-cutoff firmware → 1.04 (patched kernel, `--patch`). Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.04.
+- DriveKit successfully performed a **post-cutoff → post-cutoff same-era flash**: 1.06 → 1.05 using the same new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.05.
+
+All three results are verified on tested hardware; not a claim of universal compatibility.
 
 See [Confirmed working](#-confirmed-working), [Flash Protocol](#flash-protocol), and [KernelFront patch validation](#kernelfront-patch-validation).
 
@@ -125,7 +130,7 @@ The encrypted kernel SHA-256 matched the complete kernel reconstructed from Heis
    same payload as step 1
 ```
 
-### Crossflash: Upgrade sequence — pre-cutoff drive → post-cutoff firmware (confirmed in Heisenberg's successful capture):
+### Crossflash: New layout sequence — post-cutoff target firmware (PRE→POST upgrade or POST→POST same-era):
 ```
 1. WRITE BUFFER mode=0x04 bufID=0xFF len=0x100   ← unlock trigger
    payload[0x00-0x0F] = internal model string (auto-detected from 0xA0/g_mdl_map)
@@ -134,19 +139,20 @@ The encrypted kernel SHA-256 matched the complete kernel reconstructed from Heis
 2. WRITE BUFFER mode=0x07 bufID=0xF0             ← normal firmware prefix
    First 0x1D6600 bytes in 0x8000-byte chunks
 
-3. WRITE BUFFER mode=0x07 bufID=0xFE             ← kernel, NAND-mapped 4 transfers:
-   off=0x000000  file[0x0000:0x0200]   len=0x0200   ← header
-   off=0x001200  file[0x1200:0x9200]   len=0x8000   ← body1
-   off=0x009200  file[0x9200:0x11200]  len=0x8000   ← body2
-   off=0x011200  file[0x0200:0x1200]   len=0x1000   ← tail (gap bytes, NAND addr past EOF)
+3. WRITE BUFFER mode=0x07 bufID=0xFE             ← kernel, flat binary 4 transfers:
+   off=0x000000  file[0x000000:0x000200]  len=0x0200   ← header (plain ASCII, sent as-is)
+   off=0x001200  file[0x000200:0x008200]  len=0x8000   ← body1
+   off=0x009200  file[0x008200:0x010200]  len=0x8000   ← body2
+   off=0x011200  file[0x010200:0x011200]  len=0x1000   ← tail
 
 4. WRITE BUFFER mode=0x07 bufID=0xF0             ← normal firmware, full pass
    Full file (0x1E6600 bytes) in 0x8000-byte chunks
 
 5. WRITE BUFFER mode=0x05 bufID=0xFF len=0x100   ← commit trigger (immediate, ~100ms after step 4)
-   key = SAT 8D31 / ID05 key 0xFF8A27B1 (wire bytes B1 27 8A FF) in the captured successful upgrade
+   key = SAT 8D31 / ID05 key 0xFF8A27B1 (wire bytes B1 27 8A FF)
    Drive reflashes internally after GOOD — wait 13s before reconnecting
 ```
+**Confirmed:** PRE→POST (1.04→1.06) from Heisenberg's capture and DriveKit; POST→POST (1.06→1.05) DriveKit verified November 2026.
 
 ### Crossflash: Downgrade sequence — post-cutoff drive → pre-cutoff firmware (DriveKit verified):
 ```
@@ -169,13 +175,14 @@ The encrypted kernel SHA-256 matched the complete kernel reconstructed from Heis
 
 **Commit timing:** In the successful Heisenberg upgrade capture, commit followed the last Normal transfer by about **62.5 ms**; the next captured device command occurred about **12.61 s after commit**. The successful DriveKit downgrade also committed immediately after the single Normal pass. The ~13-second validation/reflash interval is **after** commit, not a required sleep before it. Earlier `04/4C/02` failures were observed with different staging sequences; those captures do not isolate pre-commit delay as the sole cause.
 
-**Kernel file layout (0x11200 bytes total):**
+**Kernel file layout (0x11200 bytes total) — flat binary format (post-cutoff kernel):**
 ```
-file[0x0000:0x0200]  = 512-byte envelope header
-file[0x0200:0x1200]  = 1024× LE DWORD key table ("tail" — sent to NAND offset 0x011200)
-file[0x1200:0x9200]  = 32KB encrypted payload body1 (NAND offset = file offset)
-file[0x9200:0x11200] = 32KB encrypted payload body2 (NAND offset = file offset)
+file[0x000000:0x000200]  = 512-byte ASCII envelope header      → NAND 0x000000 len=0x0200
+file[0x000200:0x008200]  = 32KB encrypted payload body1        → NAND 0x001200 len=0x8000
+file[0x008200:0x010200]  = 32KB encrypted payload body2        → NAND 0x009200 len=0x8000
+file[0x010200:0x011200]  = 4KB tail                            → NAND 0x011200 len=0x1000
 ```
+Note: NAND offsets ≠ file offsets. The tail is 0x1000 bytes, not 0x1200. File regions confirmed by SHA-256 comparison against Joni's ID05 USB capture.
 
 **Normal firmware file format (upgrade, post-cutoff target):**
 ```
@@ -200,18 +207,26 @@ file[0x9200:0x11200] = 32KB encrypted payload body2 (NAND offset = file offset)
 - Model string: `PIONEER BDR-BDS7` (from `g_mdl_map[0x8D31]`)
 - Key: `0x6123789A` universal
 
-**Pre→Post upgrade crossflash (November 2026, Heisenberg/bdrflashpp2 capture):**
-- Drive: BDR-XD07U (SAT 8D31 ID05), starting at firmware 1.04
-- Confirmed with Heisenberg's flasher: **1.04 → 1.06**, including post-reflash identity verification
-- Captured protocol: Normal prefix `0x1D6600` → kernel four transfers → full Normal `0x1E6600` → immediate commit
-- Unlock/commit payload: `PIONEER BDR-BDS7`, key `0xFF8A27B1` (wire bytes `B1 27 8A FF`)
-- **Scope:** The successful upgrade was captured from Heisenberg's flasher; do not present it as an independently verified DriveKit upgrade without a corresponding DriveKit success log.
+**Pre→Post upgrade crossflash (November 2026, DriveKit verified):**
+- Drive: BDR-XD07U (SAT 8D31 ID05), firmware 1.04 (pre-cutoff)
+- Confirmed: **1.04 → 1.06** using `drivekit crossflash E --file xd07u_kernel_id05.bin --file2 xd07u_normal_id05.bin`
+- Protocol: new layout — normal prefix `0x1D6600` → flat 4-xfer kernel → full normal `0x1E6600` → immediate commit
+- Kernel file layout confirmed by SHA-256 comparison against Joni's ID05 USB capture (body1, body2, tail all matched)
+- Unlock/commit key: `0xFF8A27B1` (`B1 27 8A FF` on wire)
+- Commit returned **GOOD**; subsequent INQUIRY reported **firmware 1.06**.
+- Protocol first captured from Heisenberg's bdrflashpp2 capture; independently reproduced by DriveKit.
+
+**Post→Post same-era crossflash (November 2026, DriveKit verified):**
+- Drive: BDR-XD07U (SAT 8D31 ID05), firmware 1.06 (post-cutoff)
+- Confirmed: **1.06 → 1.05** using `drivekit crossflash E --file xd07u_kernel_1.05.bin --file2 xd07u_normal_1.05.bin`
+- Protocol: new layout — same 4-xfer kernel sequence as upgrade path (`target_is_postcut=1`)
+- Commit returned **GOOD**; subsequent INQUIRY reported **firmware 1.05**, date `23/01/06`.
 
 **Post→Pre downgrade crossflash (November 2026, DriveKit verified):**
 - Drive: BDR-XD07U (SAT 8D31 ID05), post-cutoff firmware
 - Confirmed: **downgrade to 1.04** using `drivekit crossflash E --file S8D31050.104 --file2 S8D31051.104 --patch`
 - Patched kernel: 0x11200 bytes, SHA-256 identical to Heisenberg's successful downgrade capture
-- Protocol: flat three-chunk kernel → one full `0x1D6500` Normal pass → immediate commit
+- Protocol: flat three-chunk kernel → one full Normal pass → immediate commit
 - Unlock/commit key: `0xFF8A27B1` (`B1 27 8A FF` on wire)
 - Commit returned **GOOD**; subsequent `drivekit info` and INQUIRY independently reported **firmware 1.04**, date `22/05/31`.
 
@@ -334,9 +349,9 @@ drivekit <command> <drive_letter> [options]
 drivekit crossflash E --file kernel.bin --file2 normal.bin
 ```
 
-Uses drive identification and `READ BUFFER 0xB0` behavior to select a crossflash sequence (subject to firmware/platform compatibility checks):
-- **Pre-cutoff drive** (`0xB0` readable) → upgrade sequence (normal prefix → kernel NAND-mapped → normal full → commit)
-- **Post-cutoff drive** (`0xB0` errors) → downgrade sequence (flat kernel → normal → commit)
+Uses drive identification, `READ BUFFER 0xB0` behavior, and target firmware date to select a crossflash sequence (subject to firmware/platform compatibility checks):
+- **Post-cutoff target firmware** (`target_is_postcut=1`) → new layout (normal prefix → flat 4-xfer kernel → full normal → commit). Covers PRE→POST upgrade and POST→POST same-era flash.
+- **Pre-cutoff target firmware** (`target_is_postcut=0`) → downgrade layout (flat 3-chunk kernel → normal → commit). Covers POST→PRE downgrade.
 
 Model string auto-detected from `READ BUFFER 0xA0` / `g_mdl_map` table.
 Unlock/commit keys are selected for the detected drive and protocol. For the verified SAT 8D31 / ID05 downgrade, the on-wire key is `B1 27 8A FF` (`0xFF8A27B1` as a LE DWORD).

@@ -8318,19 +8318,22 @@ static int cmd_scankey(void)
     int result = sk_find_key(body, (size_t)fsz, &m, &count);
     free(body);
 
-    printf("  Keyed handler matches: %zu\n", count);
     if (result == 1) {
         DWORD le = (DWORD)m.key[0]
                  | ((DWORD)m.key[1] <<  8)
                  | ((DWORD)m.key[2] << 16)
                  | ((DWORD)m.key[3] << 24);
-        printf("  Acceptance signature offset : 0x%zX\n", m.accept_offset);
-        printf("  Key comparison offset       : 0x%zX\n", m.compare_offset);
-        printf("  Key bytes offset            : 0x%zX\n", m.key_offset);
-        printf("  Reject branch variant       : %u-byte\n", m.reject_length);
-        printf("  Unlock key (wire order)     : %02X %02X %02X %02X\n",
+        printf("  +------------------------------------------+\n");
+        printf("  |  UNLOCK KEY SCAN RESULT                  |\n");
+        printf("  +------------------------------------------+\n");
+        printf("  Keyed handler matches        : %zu\n", count);
+        printf("  Acceptance signature offset  : 0x%zX\n", m.accept_offset);
+        printf("  Key comparison offset        : 0x%zX\n", m.compare_offset);
+        printf("  Key bytes offset             : 0x%zX\n", m.key_offset);
+        printf("  Reject branch variant        : %u-byte\n", m.reject_length);
+        printf("  Unlock key (wire order)      : %02X %02X %02X %02X\n",
                m.key[0], m.key[1], m.key[2], m.key[3]);
-        printf("  Unlock key (LE DWORD)       : 0x%08lX\n", (unsigned long)le);
+        printf("  Unlock key (LE DWORD)        : 0x%08lX\n", (unsigned long)le);
         printf("\n");
         /* Cross-check against known key table */
         DWORD known = pioneer_key_lookup(g_driveID, NULL);
@@ -8339,7 +8342,7 @@ static int cmd_scankey(void)
                    (unsigned long)le, (unsigned long)known);
             printf("           Verify against a known-good capture before flashing.\n");
         } else if (known && known == le) {
-            printf("  Cross-check: matches key-table entry. OK\n");
+            printf("  Cross-check: matches key-table entry  : OK\n");
         }
         return 0;
     } else if (result == 0) {

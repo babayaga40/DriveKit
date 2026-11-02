@@ -9587,42 +9587,38 @@ static int cmd_crossflash(void)
         Sleep(200);
 
         /* [3] Kernel — NAND-mapped 4-transfer layout (upgrade era)
-               Confirmed by heisenberg from pcapng analysis:
-               File layout: [hdr 0x200][key_table 0x1000][body1 0x8000][body2 0x8000]
-               Transfers:
+               Heisenberg pcapng: tail at 0x011200 works for 8D30/ID35.
+               XD07U/8D31/ID05 rejects 0x011200 with 04/4C/01 — trying
+               key table at 0x000200 (filling the gap between hdr and body1):
                  hdr:   FE off=0x000000 len=0x0200  (file[0x0000:0x0200])
+                 ktbl:  FE off=0x000200 len=0x1000  (file[0x0200:0x1200])
                  body1: FE off=0x001200 len=0x8000  (file[0x1200:0x9200])
-                 body2: FE off=0x009200 len=0x8000  (file[0x9200:0x11200])
-                 tail:  FE off=0x011200 len=0x1000  (file[0x0200:0x1200] — key table bytes)
-               The tail re-sends the key table at NAND offset 0x011200.
-               Intentional 0x1000-byte hole between hdr and body1 (0x0200→0x1200). */
+                 body2: FE off=0x009200 len=0x8000  (file[0x9200:0x11200]) */
         printf("[3/5] Kernel transfer (NAND-mapped 4-xfer, upgrade layout)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
             sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
+            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);
             sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
             sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);
-            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);
             sha256_final(&sha_ctx, sha_digest);
-            printf("      SHA-256 (hdr+body1+body2+key_tail):\n        ");
+            printf("      SHA-256 (hdr+ktbl+body1+body2):\n        ");
             for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
         printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
         if (st != 0) goto fail; Sleep(2);
+        /* key table fills the gap at 0x000200 (between hdr and body1) */
+        printf("      ktbl:  FE off=0x000200 len=0x1000 (file[0x0200] — key table bytes)\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000200, kernel_data + 0x0200, 0x1000, "kernel_ktbl");
+        if (st != 0) goto fail; Sleep(2);
         printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
         if (st != 0) goto fail; Sleep(2);
         printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
-        if (st != 0) goto fail; Sleep(200);
-        /* Tail: key table bytes at NAND offset 0x011200.
-           Confirmed from pcapng (heisenberg): real data, file[0x0200:0x1200], SHA-256 matches.
-           NOT zero-filled. Drive accepted all 4 transfers in the capture (SCSI GOOD). */
-        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200] — key table bytes)\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x0200, 0x1000, "kernel_tail");
         if (st != 0) goto fail;
         printf("      OK\n\n");
         Sleep(200);

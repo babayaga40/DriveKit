@@ -7682,30 +7682,92 @@ static void scan_kernel_body(const UCHAR *body, DWORD body_len,
 }
 
 /* -------------------------------------------------------
+   normal_fw_probe_layout() — detect which of the known Pioneer normal
+   firmware envelope layouts is in use, by decrypting 8 bytes and
+   checking for the "PIONEER " magic.
+
+   Two layouts have been observed:
+     Standard  (v1.04 and earlier):
+       [0x000 : 0x200  ]  512-byte ASCII header
+       [0x200 : 0x10200]  64 KiB key table  (16384 LE DWORDs)
+       [0x10200 :      ]  ciphertext
+
+     Extended  (v1.06 and later):
+       [0x000 : 0x10200]  enlarged header + extra data region
+       [0x10200: 0x20200]  64 KiB key table  (16384 LE DWORDs)
+       [0x20200 :      ]  ciphertext
+
+   Fills *key_start, *ct_start.  Returns 1 if a layout was identified,
+   0 if the file is too small or neither probe matched.
+   ------------------------------------------------------- */
+static int normal_fw_probe_layout(const UCHAR *data, DWORD size,
+                                   DWORD *key_start, DWORD *ct_start)
+{
+    /* Probe helper: decrypt 2 dwords (8 bytes) and check for "PIONEER " */
+    static const UCHAR PIONEER_MAGIC[8] = {'P','I','O','N','E','E','R',' '};
+    UCHAR probe[8];
+    DWORD i, ks, cs;
+
+    /* Try standard layout first */
+    ks = 0x200; cs = 0x10200;
+    if (cs + 8 <= size && ks + 8 <= size) {
+        for (i = 0; i < 2; i++) {
+            DWORD ki = i % 16384;
+            DWORD k  = (DWORD)data[ks+ki*4  ] | ((DWORD)data[ks+ki*4+1]<<8)
+                     | ((DWORD)data[ks+ki*4+2]<<16) | ((DWORD)data[ks+ki*4+3]<<24);
+            DWORD ct = (DWORD)data[cs+i*4   ] | ((DWORD)data[cs+i*4 +1]<<8)
+                     | ((DWORD)data[cs+i*4 +2]<<16) | ((DWORD)data[cs+i*4 +3]<<24);
+            DWORD pt = ror32(ct ^ k, (int)(k & 31));
+            probe[i*4  ] = (UCHAR)(pt     ); probe[i*4+1] = (UCHAR)(pt>> 8);
+            probe[i*4+2] = (UCHAR)(pt>>16 ); probe[i*4+3] = (UCHAR)(pt>>24);
+        }
+        if (memcmp(probe, PIONEER_MAGIC, 8) == 0) {
+            *key_start = ks; *ct_start = cs; return 1;
+        }
+    }
+
+    /* Try extended layout (v1.06+) */
+    ks = 0x10200; cs = 0x20200;
+    if (cs + 8 <= size && ks + 8 <= size) {
+        for (i = 0; i < 2; i++) {
+            DWORD ki = i % 16384;
+            DWORD k  = (DWORD)data[ks+ki*4  ] | ((DWORD)data[ks+ki*4+1]<<8)
+                     | ((DWORD)data[ks+ki*4+2]<<16) | ((DWORD)data[ks+ki*4+3]<<24);
+            DWORD ct = (DWORD)data[cs+i*4   ] | ((DWORD)data[cs+i*4 +1]<<8)
+                     | ((DWORD)data[cs+i*4 +2]<<16) | ((DWORD)data[cs+i*4 +3]<<24);
+            DWORD pt = ror32(ct ^ k, (int)(k & 31));
+            probe[i*4  ] = (UCHAR)(pt     ); probe[i*4+1] = (UCHAR)(pt>> 8);
+            probe[i*4+2] = (UCHAR)(pt>>16 ); probe[i*4+3] = (UCHAR)(pt>>24);
+        }
+        if (memcmp(probe, PIONEER_MAGIC, 8) == 0) {
+            *key_start = ks; *ct_start = cs; return 1;
+        }
+    }
+
+    return 0;  /* unknown layout */
+}
+
+/* -------------------------------------------------------
    scan_normal_fw_uhd() — decrypt a normal firmware envelope and check
    for the 24-byte UHD capability signature (SIG0).
 
-   Normal firmware envelope layout:
-     [0x000 : 0x200 ]  512-byte ASCII header
-     [0x200 : 0x10200]  64 KiB key table  (16384 LE DWORDs)
-     [0x10200 :      ]  ciphertext  (same XOR/ROR32 cipher as kernel)
-
-   The decoded plaintext starts with "PIONEER " and SIG0 is present
-   somewhere in the body of every UHD-capable drive firmware.
-
-   Returns 1 if SIG0 found, 0 otherwise (also 0 on bad input).
+   Auto-detects layout (standard v1.04 or extended v1.06+) via
+   normal_fw_probe_layout().  Returns 1 if SIG0 found, 0 otherwise.
    ------------------------------------------------------- */
 static int scan_normal_fw_uhd(const UCHAR *normal_data, DWORD normal_size)
 {
     UCHAR  *plain = NULL;
-    DWORD   ct_bytes, ct_dwords, di;
+    DWORD   key_start = 0, ct_start = 0;
+    DWORD   ct_dwords, di;
     int     found = 0;
 
     if (!normal_data || normal_size < 0x10204)
         return 0;
 
-    ct_bytes  = normal_size - 0x10200;
-    ct_dwords = ct_bytes / 4;
+    if (!normal_fw_probe_layout(normal_data, normal_size, &key_start, &ct_start))
+        return 0;  /* unrecognised layout */
+
+    ct_dwords = (normal_size - ct_start) / 4;
     if (ct_dwords == 0)
         return 0;
 
@@ -7713,11 +7775,9 @@ static int scan_normal_fw_uhd(const UCHAR *normal_data, DWORD normal_size)
     if (!plain)
         return 0;
 
-    /* Key table: 16384 LE DWORDs at file[0x200..0x10200]
-       Cipher:    plain[i] = ROR32(ct[i] XOR key[i % 16384], key[i % 16384] & 31) */
     {
-        const UCHAR *key_bytes = normal_data + 0x200;
-        const UCHAR *ct_bytes_ptr = normal_data + 0x10200;
+        const UCHAR *key_bytes    = normal_data + key_start;
+        const UCHAR *ct_bytes_ptr = normal_data + ct_start;
         for (di = 0; di < ct_dwords; di++) {
             DWORD ki = di % 16384;
             DWORD k  = (DWORD)key_bytes[ki*4    ]
@@ -8038,7 +8098,7 @@ static int cmd_decodenormal(void)
     UCHAR *raw  = NULL;
     UCHAR *plain = NULL;
     long   fsize;
-    DWORD  ct_bytes, ct_dwords, di;
+    DWORD  key_start, ct_start, ct_dwords, di;
     char   outpath[512];
 
     if (!g_outFile[0]) {
@@ -8062,23 +8122,33 @@ static int cmd_decodenormal(void)
 
     /* Print header info */
     printf("Normal firmware: %s  (0x%lX bytes)\n", g_outFile, (long)fsize);
-    printf("  Header [0x00]: %.64s\n", raw);          /* ASCII copyright line */
+    printf("  Header [0x00]: %.64s\n", raw);
     if (fsize > 0x90 + 4)
         printf("  Version field [0x90]: %.8s\n", raw + 0x90);
     if (fsize > 0xB0 + 8)
         printf("  Platform [0xB0]:  %.8s\n", raw + 0xB0);
 
+    /* Auto-detect envelope layout */
+    key_start = 0; ct_start = 0;
+    if (!normal_fw_probe_layout(raw, (DWORD)fsize, &key_start, &ct_start)) {
+        fprintf(stderr, "Unknown normal firmware layout — cannot decrypt.\n");
+        free(raw); return 1;
+    }
+    printf("  Layout: key=0x%05lX..0x%05lX  ct=0x%05lX  (%s)\n",
+           (unsigned long)key_start, (unsigned long)(key_start + 0x10000),
+           (unsigned long)ct_start,
+           (ct_start == 0x10200) ? "standard" : "extended (v1.06+)");
+
     /* Decrypt */
-    ct_bytes  = (DWORD)fsize - 0x10200;
-    ct_dwords = ct_bytes / 4;
+    ct_dwords = ((DWORD)fsize - ct_start) / 4;
     printf("\nDecrypting body (%lu dwords)...\n", (unsigned long)ct_dwords);
 
     plain = (UCHAR*)malloc(ct_dwords * 4);
     if (!plain) { free(raw); return 1; }
 
     {
-        const UCHAR *key_bytes    = raw + 0x200;
-        const UCHAR *ct_bytes_ptr = raw + 0x10200;
+        const UCHAR *key_bytes    = raw + key_start;
+        const UCHAR *ct_bytes_ptr = raw + ct_start;
         for (di = 0; di < ct_dwords; di++) {
             DWORD ki = di % 16384;
             DWORD k  = (DWORD)key_bytes[ki*4    ]
@@ -8101,8 +8171,7 @@ static int cmd_decodenormal(void)
 
     /* Validate magic */
     printf("Decode complete.\n");
-    printf("  Plaintext magic [0x00]: %.8s  (%s)\n",
-           plain, memcmp(plain, "PIONEER ", 8) == 0 ? "OK" : "unexpected");
+    printf("  Plaintext magic [0x00]: %.8s  (OK)\n", plain);
 
     /* Scan for SIG0 */
     {

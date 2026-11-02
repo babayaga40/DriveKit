@@ -58,9 +58,9 @@ DriveKit stores keys as little-endian DWORD values (`0x6123789A`) which produce 
 
 **Key selection is protocol- and drive-dependent.** The universal key (`0x6123789A`, wire bytes `9A 78 23 61`) has been used successfully on previously tested SAT 9330/9331 paths. In the verified BDR-XD07U SAT 8D31 / ID05 downgrade, **both unlock and commit** used `0xFF8A27B1` (wire bytes `B1 27 8A FF`). Do not assume the universal key applies to every `crossflash` path; compare the selected model/key and the complete 256-byte trigger payload with a known-good capture.
 
-**Pre vs post-cutoff detection:** DriveKit probes `READ BUFFER 0xB0`:
+**Pre vs post-cutoff detection:** DriveKit probes ordinary `READ BUFFER 0xB0` access before the special `hwdump` trigger sequence:
 - Returns data → **pre-cutoff** drive (before 2022-12-27) — H8S/2600 code visible
-- Returns error 05/24 → **post-cutoff** drive — `0xB0` locked
+- Returns error 05/24 → **post-cutoff** drive under the ordinary probe; the separate `hwdump` trigger sequence can enable `0xB0` reads on tested post-cutoff drives
 
 **Pioneer firmware checksum algorithm (from IDA Pro analysis of official updater):**
 ```c
@@ -177,12 +177,14 @@ The encrypted kernel SHA-256 matched the complete kernel reconstructed from Heis
 
 **Kernel file layout (0x11200 bytes total) — flat binary format (post-cutoff kernel):**
 ```
-file[0x000000:0x000200]  = 512-byte ASCII envelope header      → NAND 0x000000 len=0x0200
-file[0x000200:0x008200]  = 32KB encrypted payload body1        → NAND 0x001200 len=0x8000
-file[0x008200:0x010200]  = 32KB encrypted payload body2        → NAND 0x009200 len=0x8000
-file[0x010200:0x011200]  = 4KB tail                            → NAND 0x011200 len=0x1000
+file[0x000000:0x000200]  = 512-byte ASCII envelope header      → WRITE BUFFER off=0x000000 len=0x0200
+file[0x000200:0x008200]  = 32KB encrypted payload body1        → WRITE BUFFER off=0x001200 len=0x8000
+file[0x008200:0x010200]  = 32KB encrypted payload body2        → WRITE BUFFER off=0x009200 len=0x8000
+file[0x010200:0x011200]  = 4KB tail                            → WRITE BUFFER off=0x011200 len=0x1000
 ```
-Note: NAND offsets ≠ file offsets. The tail is 0x1000 bytes, not 0x1200. File regions confirmed by SHA-256 comparison against Joni's ID05 USB capture.
+Note: WRITE BUFFER offsets ≠ file offsets; they are not proven physical NAND addresses. The tail is 0x1000 bytes, not 0x1200. File regions confirmed by SHA-256 comparison against Heisenberg's ID05 USB capture.
+
+**Header handling (tested SAT 8D31 / ID05):** Heisenberg's upgrade capture used a different first 0x200-byte payload from the ASCII header in the source Kernel file. DriveKit successfully upgraded 1.04 → 1.06 by sending the original ASCII header unchanged. Therefore the exact first-transfer bytes from that capture are not necessary for this tested path; acceptance of arbitrary header data or behavior on other platforms has not been established. An earlier attempt zero-filled the final 0x1000-byte tail and failed with CHECK CONDITION; copying the actual `file[0x10200:0x11200]` tail succeeded.
 
 **Normal firmware file format (upgrade, post-cutoff target):**
 ```
@@ -209,11 +211,11 @@ Note: NAND offsets ≠ file offsets. The tail is 0x1000 bytes, not 0x1200. File 
 
 **Pre→Post upgrade crossflash (November 2026, DriveKit verified):**
 - Drive: BDR-XD07U (SAT 8D31 ID05), firmware 1.04 (pre-cutoff)
-- Confirmed: **1.04 → 1.06** using `drivekit crossflash E --file xd07u_kernel_id05.bin --file2 xd07u_normal_id05.bin`
+- Confirmed: **1.04 → 1.06** using `drivekit crossflash E --file xd07_kernel_106_bin --file2 xd07_normal_106.bin` (no `--patch`)
 - Protocol: new layout — normal prefix `0x1D6600` → flat 4-xfer kernel → full normal `0x1E6600` → immediate commit
-- Kernel file layout confirmed by SHA-256 comparison against Joni's ID05 USB capture (body1, body2, tail all matched)
+- Kernel file layout confirmed by SHA-256 comparison against Heisenberg's ID05 USB capture (body1, body2, tail all matched)
 - Unlock/commit key: `0xFF8A27B1` (`B1 27 8A FF` on wire)
-- Commit returned **GOOD**; subsequent INQUIRY reported **firmware 1.06**.
+- Commit returned **GOOD**; subsequent `drivekit info E` and INQUIRY reported **firmware 1.06**, date `24/10/09`.
 - Protocol first captured from Heisenberg's bdrflashpp2 capture; independently reproduced by DriveKit.
 
 **Post→Post same-era crossflash (November 2026, DriveKit verified):**
@@ -233,44 +235,13 @@ Note: NAND offsets ≠ file offsets. The tail is 0x1000 bytes, not 0x1200. File 
 
 ---
 
-## Internal Model Strings (`g_mdl_map`)
+## Drive Identification and Unlock Keys
 
-| Drive ID | Platform | Internal model string |
-|----------|----------|----------------------|
-| 0x8231/8232 | SAT 8231 | `PIONEER BDR-XD05` |
-| 0x8721/8722 | SAT 8721 | `PIONEER BDR-XS06 ` |
-| 0x8800 | SAT 8800 | `PIONEER BDR-211  ` |
-| 0x8801 | SAT 8801 | `PIONEER BDR-BDS5 ` |
-| 0x8A10 | SAT 8A10 | `PIONEER BDR-UD04 ` |
-| 0x8B30 | SAT 8B30 | `XD05BK2/XV5     ` (post-cutoff XD06U) |
-| 0x8D30/8D31 | SAT 8D30/31 | `PIONEER BDR-BDS7 ` |
-| 0x8E20/8E21 | SAT 8E20/21 | `PIONEER BDR-BDS7 ` |
-| 0x8F01 | SAT 8F01 | `PIONEER BDR-BDS6 ` |
-| 0x9330 | SAT 9330 | `PIONEER BDR-BDS8 ` |
-| 0x9331 | SAT 9331 | `PIONEER BDR-BDS8 ` |
+DriveKit maintains internal lookup tables for Pioneer drive IDs, platform and kernel identifiers, internal model strings, unlock keys, and firmware execution trigger keys. These tables are considerably larger than a short README excerpt and are maintained in the **DriveKit source code**, which is the authoritative reference.
 
----
+For supported drive/protocol combinations, DriveKit automatically selects the model string and the appropriate unlock or execution-trigger key. Key selection is **drive- and protocol-dependent**; unlock and commit keys are not necessarily interchangeable. The `--key` override is intended for advanced research and testing, not routine flashing.
 
-## Unlock Keys
-
-| Key (LE DWORD) | Wire bytes | Drive family | Notes |
-|----------------|-----------|-------------|-------|
-| `0x6123789A` | `9A 78 23 61` | Universal | Confirmed in previously tested paths; **not** the key used in the verified SAT 8D31 / ID05 crossflash |
-| `0xFF8A27B1` | `B1 27 8A FF` | BDR-XD07U SAT 8D31 / ID05 | Verified unlock and commit payload in successful downgrade; also present in successful Heisenberg upgrade capture |
-| `0x08A98AF2` | `F2 8A A9 08` | XD06U post-cutoff (SAT 8B30) | From BDR-XD06J-UHD updater |
-| `0xA44F2F55` | `55 2F 4F A4` | XD08U (SAT 9331) | Confirmed by MrPenguin |
-| `0x426623FD` | `FD 23 66 42` | BDR-UD04 | Confirmed by MrPenguin |
-| `0xAA475E15` | `15 5E 47 AA` | XD08 (SAT 9330) | From IDA Pro analysis |
-
-**Drive trigger keys (post-cutoff execution trigger only):**
-
-| Drive | Platform | Kernel | Version | Trigger Key |
-|-------|----------|--------|---------|-------------|
-| BDR-XD06U | SAT 8B30 | ID69 | 1.12 | `0x641E47BD` |
-| BDR-XD07 | SAT 8D30 | ID35 | 1.06 | `0xF0116415` |
-| BDR-XD08 | SAT 9330 | ID36 | 1.02 | `0x3A932579` |
-| BDR-XD08U | SAT 9331 | ID05 | 1.02 | `0xC4C1F37F` |
-| BDR-XD08U | SAT 9331 | ID05 | 1.04 | `0x552F4FA4` |
+For the verified BDR-XD07U **SAT 8D31 / ID05** crossflash procedure, both unlock and commit used the LE DWORD `0xFF8A27B1`, transmitted as `B1 27 8A FF`. This is a verified example, **not** a universal Pioneer key.
 
 ---
 
@@ -297,7 +268,7 @@ cl drivekit.c /Fe:drivekit.exe /utf-8
 
 **Linux (GCC):**
 ```
-gcc drivekit.c -o drivekit -w
+gcc drivekit.c -o drivekit -Wall -Wextra
 sudo ./drivekit info /dev/sg1
 ```
 
@@ -314,7 +285,7 @@ drivekit <command> <drive_letter> [options]
 | Option | Description |
 |---|---|
 | `--file name` | Kernel firmware file |
-| `--file2 name` | Normal firmware file |
+| `--file2 name` | Secondary input or output file (command-dependent) |
 | `--file3 name` | Third filename (reserved / legacy second normal firmware pass) |
 | `--force` | Skip compatibility checks and interactive prompts |
 | `--nounlock` | Skip unlock step |
@@ -342,6 +313,7 @@ drivekit <command> <drive_letter> [options]
 | `xordiff` | XOR two encrypted firmware files to find version bytes |
 | `patchfw` | Patch firmware ASCII header to spoof version |
 | `decryptkernel` | Decode KernelFront XOR/rotate cipher on a Pioneer H8S kernel file; outputs raw plaintext body for IDA analysis. `--patch` additionally flips the generation marker (`0xFF→0x01`) and recomputes the body checksum |
+| `decodenormal` | Decrypt normal firmware envelope; reports UHD capability |
 
 ### crossflash command (recommended)
 
@@ -391,6 +363,24 @@ drivekit decryptkernel --file S9331050.100 --patch --file2 S9331050_decoded_patc
 ```
 
 Decodes the KernelFront XOR/rotate cipher and outputs a flat binary suitable for loading in IDA Pro as H8S/2600 code. `--patch` is intended to flip the generation marker byte (`0xFF→0x01`) and recompute the body checksum. Verify the standalone command's output format and byte offset before treating it as a flashable kernel; the verified flashing path is `crossflash --patch`. No drive needed.
+
+### decodenormal command
+
+Decrypts a Pioneer Normal firmware envelope and reports UHD capability.
+
+```bash
+drivekit decodenormal --file S8D31051.104
+```
+
+Optionally save the decoded firmware body:
+
+```bash
+drivekit decodenormal --file S8D31051.104 --file2 decoded_body.bin
+```
+
+- `--file` — Input Normal firmware file.
+- `--file2` — Optional output filename for the decoded body.
+- No drive required.
 
 ---
 
@@ -476,7 +466,7 @@ year letter (N=2022, O=2023, P=2024...)
 - **Standalone `decryptkernel --patch` verification:** ensure it patches decoded **byte** offset `0xFE`, not DWORD index `0xFE`; distinguish decoded 64 KiB output from the encrypted `0x11200`-byte flashable kernel.
 - **H8S/2600 version-check analysis:** continue studying pre/post-cutoff `hwdump` captures to understand the underlying validation logic rather than relying only on observed protocol behavior.
 - **UHD capability detection** — current scan of decrypted kernel body unreliable for some drives
-  - All BDR-XD07U firmwares are UHD-capable regardless of version ("U" suffix = UHD)
+  - Do not infer verified UHD playback from the model suffix or a detected firmware signature alone; confirm with an actual UHD disc read
   - Looking for distinguishing byte pattern in normal firmware binary that indicates UHD support
   - Goal: reliable auto-detection without manual override required
 - **XD06U post-cutoff downgrade** — same encrypted binary barrier
@@ -581,7 +571,7 @@ DriveKit displays this as `AACS ver` in drive information.
 
 ## Credits
 
-**Heisenberg** — Wireshark capture analysis for SAT 9331; trigger key extraction from Pioneer updater EXEs; development support and testing throughout. Huge thanks — this tool would not exist without you.
+**Heisenberg** — Wireshark/USBPcap captures including the SAT 8D31 / ID05 1.04 → 1.06 upgrade used to verify the four-transfer Kernel layout and nonzero tail; capture analysis for SAT 9331; trigger key extraction from Pioneer updater EXEs; development support and testing throughout. Huge thanks — this tool would not exist without you.
 
 **MattJackson (Matthew Jackson)** — The main coder behind the decryption algorithms. Decrypted the kernel file and identified the patch locations required for a successful downgrade below version lock. Shared his code openly and has been invaluable in helping everyone with problems. ([GitHub](https://github.com/MattJackson)) ([cdrinfo.pl profile](https://forum.cdrinfo.pl/members/112645.html))
 

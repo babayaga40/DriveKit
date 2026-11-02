@@ -9312,11 +9312,31 @@ static int cmd_crossflash(void)
         int   b0_st = 0;
         int   is_precut = 0;
         if (g_nounlock) {
-            /* Drive is in kernel mode — 0xB0 is always open here, can't use it.
-               Classify from the target firmware date (from normal fw header). */
-            is_precut = !target_is_postcut;
-            printf("  Drive detection: --nounlock (kernel mode) → inferring era from target FW date\n");
-            printf("  Target FW date → %s\n", is_precut ? "PRE-CUTOFF" : "POST-CUTOFF");
+            /* Drive is in kernel mode — 0xB0 is always open but unreliable here.
+               Read the drive's current firmware date via INQUIRY to classify the DRIVE era.
+               The kernel layout to send depends on the DRIVE's era, not the target fw era:
+                 pre-cutoff drive → upgrade layout (4-xfer NAND-mapped)
+                 post-cutoff drive → downgrade layout (flat 3-chunk)
+               Fallback: infer from target fw date if INQUIRY fails. */
+            {
+                UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+                UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+                send_scsi(g_hDrive, inqcdb, 6, inq, 64,
+                          SCSI_IOCTL_DATA_IN, inqs, &inqst);
+                if (inqst == 0 && inq[0x25] >= 0x20) {
+                    char date[9]={0}; int di;
+                    for (di=0; di<8 && inq[0x25+di]>=0x20 && inq[0x25+di]<=0x7E; di++)
+                        date[di] = inq[0x25+di];
+                    is_precut = (strcmp(date,"22/12/01") < 0);
+                    printf("  Drive detection: --nounlock (kernel mode), drive FW date %s → %s\n",
+                           date, is_precut ? "PRE-CUTOFF drive" : "POST-CUTOFF drive");
+                } else {
+                    /* INQUIRY failed — fall back to inferring from target fw direction */
+                    is_precut = !target_is_postcut;
+                    printf("  Drive detection: --nounlock, INQUIRY failed → inferring from target FW date → %s\n",
+                           is_precut ? "PRE-CUTOFF" : "POST-CUTOFF");
+                }
+            }
         } else {
         send_scsi(g_hDrive, b0_cdb, 10, b0_probe, 0x10,
                   SCSI_IOCTL_DATA_IN, b0_sense, &b0_st);

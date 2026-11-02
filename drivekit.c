@@ -9362,14 +9362,9 @@ static int cmd_crossflash(void)
         } /* end !g_nounlock */
         if (is_precut) {
             g_pre_cutoff = 1;
-            if (normal_size > 0x1E0000) {
-                printf("  Pre-cutoff: truncating normal fw to 0x1E0000 (NAND boundary)\n");
-                printf("  Pre-cutoff drives reject ECC/OOB trailer (0x%06X bytes dropped)\n",
-                       normal_size - 0x1E0000);
-                normal_size = 0x1E0000;
-            } else {
-                printf("  Normal fw already <= NAND boundary — no truncation needed\n");
-            }
+            /* For upgrade (pre→post): capture confirms full file sent in step 4.
+               Truncation only applies to the prefix (step 2) and downgrade path. */
+            printf("  Pre-cutoff drive detected (full normal fw file will be sent in step 4)\n");
         } else {
             printf("  Sending full firmware file including ECC/OOB trailer\n");
         }
@@ -9586,39 +9581,45 @@ static int cmd_crossflash(void)
         }
         Sleep(200);
 
-        /* [3] Kernel — upgrade era, confirmed from Heisenberg pcapng (8D30/ID35).
-               4-transfer layout, key table sent LAST as 0x1000-byte tail:
-                 hdr:   FE off=0x000000 len=0x0200  (file[0x0000:0x0200])
-                 body1: FE off=0x001200 len=0x8000  (file[0x1200:0x9200])
-                 body2: FE off=0x009200 len=0x8000  (file[0x9200:0x11200])
-                 tail:  FE off=0x011200 len=0x1000  (file[0x0200:0x1200]) ← key table
-               CDBs confirmed: 3B 07 FE <off3> <off2> <off1> 00 <len2> <len1> 00 00 00
-               Previous failures were sending tail len=0x1200; correct is 0x1000. */
-        printf("[3/5] Kernel transfer (3-xfer upgrade layout: hdr+body1+body2, no tail)...\n");
+        /* [3] Kernel — upgrade era, confirmed from Joni's ID05 capture (8D31/ID05).
+               File layout (flat binary, NOT KernelFront):
+                 file[0x000000:0x000200]  ASCII header  (transformation unknown; try plain)
+                 file[0x000200:0x008200]  body1  (32 KiB)
+                 file[0x008200:0x010200]  body2  (32 KiB)
+                 file[0x010200:0x011200]  tail   (4 KiB)
+               4-transfer layout confirmed by CDB analysis:
+                 hdr:   3B 07 FE 00 00 00 00 02 00 ...  NAND 0x000000 len=0x0200
+                 body1: 3B 07 FE 00 12 00 00 80 00 ...  NAND 0x001200 len=0x8000
+                 body2: 3B 07 FE 00 92 00 00 80 00 ...  NAND 0x009200 len=0x8000
+                 tail:  3B 07 FE 01 12 00 00 10 00 ...  NAND 0x011200 len=0x1000
+               body1/body2/tail SHA-256 verified against ID05 Wireshark capture.
+               Header is transformed by updater (session-specific?); sending plain
+               and checking if drive cares about header content. */
+        printf("[3/5] Kernel transfer (4-xfer upgrade layout, ID05 confirmed)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
-            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);  /* hdr   */
-            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);  /* body1 */
-            sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);  /* body2 */
+            sha256_update(&sha_ctx, kernel_data + 0x000000, 0x0200);  /* hdr   file[0x0000] */
+            sha256_update(&sha_ctx, kernel_data + 0x000200, 0x8000);  /* body1 file[0x0200] */
+            sha256_update(&sha_ctx, kernel_data + 0x008200, 0x8000);  /* body2 file[0x8200] */
+            sha256_update(&sha_ctx, kernel_data + 0x010200, 0x1000);  /* tail  file[0x10200] */
             sha256_final(&sha_ctx, sha_digest);
-            printf("      SHA-256 (hdr+body1+body2, no tail):\n        ");
+            printf("      SHA-256 (hdr+body1+body2+tail as sent):\n        ");
             for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
-        printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
+        printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x000000] — plain header)\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x000000, 0x0200, "kernel_hdr");
         if (st != 0) goto fail; Sleep(2);
-        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
+        printf("      body1: FE off=0x001200 len=0x8000 (file[0x000200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x000200, 0x8000, "kernel_body1");
         if (st != 0) goto fail; Sleep(2);
-        printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
+        printf("      body2: FE off=0x009200 len=0x8000 (file[0x008200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x008200, 0x8000, "kernel_body2");
+        if (st != 0) goto fail; Sleep(2);
+        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x010200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x010200, 0x1000, "kernel_tail");
         if (st != 0) goto fail;
-        /* tail at 0x011200 passes on ID35 but fails on ID05 with 04/4C/01.
-           Hypothesis: ID05 uses 3-transfer layout (no tail), commit validates
-           differently.  Skip tail and let commit attempt proceed. */
-        printf("      (tail skipped — ID05 rejects 0x011200, testing 3-xfer completion)\n");
         printf("      OK\n\n");
         Sleep(200);
 

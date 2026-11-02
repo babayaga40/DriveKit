@@ -9617,8 +9617,10 @@ static int cmd_crossflash(void)
         printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
         if (st != 0) goto fail; Sleep(2);
-        printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
+        /* body2: try 0x008000 (contiguous after ktbl+body1 at NAND level: 0x1000+0x8000=0x9000,
+           but NAND offset may wrap/alias differently) — downgrade layout uses 0x008000 */
+        printf("      body2: FE off=0x008000 len=0x8000 (file[0x9200])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x9200, 0x8000, "kernel_body2");
         if (st != 0) goto fail;
         printf("      OK\n\n");
         Sleep(200);

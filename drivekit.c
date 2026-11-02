@@ -8792,6 +8792,25 @@ static int cmd_crossflash(void)
                         plain[0x1023] = (UCHAR)(new_word      );
                         printf("  KernelFront: checksum word 0x%08X -> 0x%08X\n",
                                old_word, new_word);
+
+                        /* Verify patch correctness from actual patched buffer */
+                        {
+                            DWORD be_sum = 0, vi;
+                            for (vi = 0; vi < 0x10000/4; vi++) {
+                                DWORD w = ((DWORD)plain[vi*4  ] << 24) |
+                                          ((DWORD)plain[vi*4+1] << 16) |
+                                          ((DWORD)plain[vi*4+2] <<  8) |
+                                           (DWORD)plain[vi*4+3];
+                                be_sum += w;
+                            }
+                            DWORD cw = ((DWORD)plain[0x1020]<<24)|((DWORD)plain[0x1021]<<16)|
+                                       ((DWORD)plain[0x1022]<< 8)| (DWORD)plain[0x1023];
+                            printf("  KernelFront: patch verify:\n");
+                            printf("    plain[0xFE]        = %02X\n", plain[0xFE]);
+                            printf("    BE32(plain+0x1020) = %08X\n", cw);
+                            printf("    BE32 body sum      = %08X  (%s)\n",
+                                   be_sum, be_sum == 0 ? "OK" : "CHECKSUM ERROR");
+                        }
                     }
                 } else {
                     printf("  KernelFront: unknown generation marker 0x%02X — skipping patch\n",

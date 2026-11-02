@@ -9547,14 +9547,18 @@ static int cmd_crossflash(void)
         goto fail;
     }
 
-    if (g_pre_cutoff) {
+    if (target_is_postcut) {
         /* =============================================================
-           PRE-CUTOFF DRIVE → POST-CUTOFF FW  (upgrade, e.g. pre-1.06)
-           Confirmed from Joni's 1.04→1.06 pcapng:
+           TARGET = POST-CUTOFF FW  (upgrade PRE→POST, or same-era POST→POST)
+           Joni's tool calls this the "new layout": firmware sent first,
+           then kernel without its header (plain header accepted by drive).
+           Confirmed from Joni's 1.04→1.06 pcapng (8D31/ID05):
              [2] Normal prefix:  F0, 0x1D6600 bytes
-             [3] Kernel:         FE, NAND-mapped 4 transfers
-             [4] Normal full:    F0, full normal_size bytes
+             [3] Kernel:         FE, flat 4-transfer layout
+             [4] Normal full:    F0, full normal_size bytes (incl. ECC trailer)
              [5] Commit immediately
+           NOTE: PRE→PRE (pre-cutoff drive + pre-cutoff firmware) is not
+           handled here — use flashfw for same-era pre-cutoff flashing.
            ============================================================= */
 
         /* [2] Normal firmware prefix */

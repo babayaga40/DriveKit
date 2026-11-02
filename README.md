@@ -298,8 +298,9 @@ drivekit <command> <drive_letter> [options]
 | Command | Description |
 |---|---|
 | `info` / `inquiry` | Full drive information with serial decode |
-| `flash` | Auto-detect pre/post-cutoff and flash (legacy — use `crossflash` instead) |
-| **`crossflash`** | **Cross-era flash/downgrade — recommended** |
+| **`flash`** | **Firmware flash — recommended (was `crossflash`)** |
+| `crossflash` | Alias for `flash` (kept for compatibility) |
+| `flash_legacy` | Legacy auto-detect wrapper (old `flash` command) |
 | `flashfw` | Legacy flash command (pre/post-cutoff, complex sweep logic) |
 | `unlock` | Service mode unlock |
 | `e5test` | Test Engineering Mode flag |
@@ -315,10 +316,10 @@ drivekit <command> <drive_letter> [options]
 | `decryptkernel` | Decode KernelFront XOR/rotate cipher on a Pioneer H8S kernel file; outputs raw plaintext body for IDA analysis. `--patch` additionally flips the generation marker (`0xFF→0x01`) and recomputes the body checksum |
 | `decodenormal` | Decrypt normal firmware envelope; reports UHD capability |
 
-### crossflash command (recommended)
+### flash command (recommended)
 
 ```
-drivekit crossflash E --file kernel.bin --file2 normal.bin
+drivekit flash E --file kernel.bin --file2 normal.bin
 ```
 
 Uses drive identification, `READ BUFFER 0xB0` behavior, and target firmware date to select a crossflash sequence (subject to firmware/platform compatibility checks):
@@ -328,13 +329,13 @@ Uses drive identification, `READ BUFFER 0xB0` behavior, and target firmware date
 Model string auto-detected from `READ BUFFER 0xA0` / `g_mdl_map` table.
 Unlock/commit keys are selected for the detected drive and protocol. For the verified SAT 8D31 / ID05 downgrade, the on-wire key is `B1 27 8A FF` (`0xFF8A27B1` as a LE DWORD).
 
-### flash command (legacy)
+### flash_legacy command
 
 ```
-drivekit flash E --file kernel.bin --file2 normal.bin
+drivekit flash_legacy E --file kernel.bin --file2 normal.bin
 ```
 
-Older auto-detect wrapper. Use `crossflash` instead.
+Older auto-detect wrapper. Use `flash` instead.
 
 ### xordiff command
 

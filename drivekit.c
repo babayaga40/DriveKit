@@ -83,7 +83,7 @@ static int     g_skip_checks = 0; /* skip compat/ready checks when chaining */
 static DWORD   g_maxDumpSize = 0;  /* 0 = no limit */
 static int     g_nounlock = 0;    /* skip unlock step */
 static int     g_e5eng   = 0;    /* --e5: send WRITE BUFFER 0xE5 engineering mode enable before unlock */
-static int     g_pre_cutoff = 0; /* set by cmd_flash when 0xB0 readable */
+static int     g_pre_cutoff = 0; /* set by cmd_crossflash when 0xB0 readable */
 static WORD    g_driveID = 0;     /* detected drive ID for trigger key selection */
 static char    g_kernelID[5] = {0}; /* kernel ID string from 0xF1 response (e.g. "9331") */
 static UCHAR   g_payload[PAYLOAD_SIZE]; /* unlock payload buffer — shared across commands */
@@ -126,9 +126,9 @@ static int   cmd_inquiry(void);
 static int   cmd_probef0(void);
 static int   cmd_flashfw(void);
 static int   cmd_flashfw_precut(void);
-static int   cmd_flash(void);
+static int   cmd_flash_legacy(void);
 static int   cmd_autoflash(void);
-static int   cmd_crossflash(void);
+static int   cmd_crossflash(void);   /* renamed to "flash" on CLI */
 static int   cmd_decodenormal(void);
 static int   cmd_hwdump(void);
 static int   cmd_flashinfo(void);
@@ -7096,8 +7096,9 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "brutekey")    == 0) ret = cmd_brutekey();
     else if (strcmp(cmd, "autoflash")  == 0) ret = cmd_autoflash();
     else if (strcmp(cmd, "flashfw")    == 0) ret = cmd_flashfw();
-    else if (strcmp(cmd, "flash")      == 0) ret = cmd_flash();
-    else if (strcmp(cmd, "crossflash") == 0) ret = cmd_crossflash();
+    else if (strcmp(cmd, "flash")        == 0) ret = cmd_crossflash();
+    else if (strcmp(cmd, "flash_legacy") == 0) ret = cmd_flash_legacy();
+    else if (strcmp(cmd, "crossflash")   == 0) ret = cmd_crossflash(); /* kept as alias */
     else if (strcmp(cmd, "xordiff")    == 0) ret = cmd_xordiff();
     else if (strcmp(cmd, "flashinfo")  == 0) ret = cmd_flashinfo();
     else if (strcmp(cmd, "kernellimbo") == 0) {
@@ -8743,7 +8744,7 @@ static int cmd_flashfw_precut(void)
    Usage:
      drivekit flash E --file kernel.bin --file2 normal.bin
    ========================================================= */
-static int cmd_flash(void)
+static int cmd_flash_legacy(void)
 {
     UCHAR b0buf[16]      = {0};
     UCHAR b0cdb[10]      = {0x3C,0x02,0xB0,0,0,0,0,0,0x10,0};

@@ -9594,16 +9594,15 @@ static int cmd_crossflash(void)
                  tail:  FE off=0x011200 len=0x1000  (file[0x0200:0x1200]) ← key table
                CDBs confirmed: 3B 07 FE <off3> <off2> <off1> 00 <len2> <len1> 00 00 00
                Previous failures were sending tail len=0x1200; correct is 0x1000. */
-        printf("[3/5] Kernel transfer (4-xfer upgrade layout: hdr+body1+body2+tail)...\n");
+        printf("[3/5] Kernel transfer (3-xfer upgrade layout: hdr+body1+body2, no tail)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
             sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);  /* hdr   */
             sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);  /* body1 */
             sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);  /* body2 */
-            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);  /* tail = key table */
             sha256_final(&sha_ctx, sha_digest);
-            printf("      SHA-256 (hdr+body1+body2+tail[ktbl]):\n        ");
+            printf("      SHA-256 (hdr+body1+body2, no tail):\n        ");
             for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
@@ -9615,10 +9614,11 @@ static int cmd_crossflash(void)
         if (st != 0) goto fail; Sleep(2);
         printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
-        if (st != 0) goto fail; Sleep(2);
-        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200] — key table)\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x0200, 0x1000, "kernel_tail");
         if (st != 0) goto fail;
+        /* tail at 0x011200 passes on ID35 but fails on ID05 with 04/4C/01.
+           Hypothesis: ID05 uses 3-transfer layout (no tail), commit validates
+           differently.  Skip tail and let commit attempt proceed. */
+        printf("      (tail skipped — ID05 rejects 0x011200, testing 3-xfer completion)\n");
         printf("      OK\n\n");
         Sleep(200);
 

@@ -7877,36 +7877,30 @@ static int cmd_decryptkernel(void)
         DWORD cs_old_be = ((cs_old_le & 0xFF) << 24) | (((cs_old_le>>8) & 0xFF) << 16)
                         | (((cs_old_le>>16) & 0xFF) << 8) | ((cs_old_le>>24) & 0xFF);
 
-        /* Marker is at decoded body dword 0xFE */
-        DWORD mk_idx = 0xFE;
-        DWORD mk_old_le = (DWORD)body[mk_idx*4 + 0]
-                        | ((DWORD)body[mk_idx*4 + 1] <<  8)
-                        | ((DWORD)body[mk_idx*4 + 2] << 16)
-                        | ((DWORD)body[mk_idx*4 + 3] << 24);
-        DWORD mk_new_le = (mk_old_le & 0xFFFFFF00) | 0x01;  /* byte0: 0xFF→0x01 */
+        /* Generation marker is at BYTE offset 0xFE in the decoded body.
+           It sits at byte position 2 (big-endian) of the BE32 word whose
+           body byte range is [0xFC..0xFF] (dword index 0x3F in LE storage).
+           The BE32 contribution of this word changes by (new_marker - old_marker) << 8. */
+        UCHAR mk_old = body[0xFE];
+        UCHAR mk_new = 0x01;
+        body[0xFE] = mk_new;
 
-        DWORD mk_old_be = ((mk_old_le & 0xFF) << 24) | (((mk_old_le>>8) & 0xFF) << 16)
-                        | (((mk_old_le>>16) & 0xFF) << 8) | ((mk_old_le>>24) & 0xFF);
-        DWORD mk_new_be = ((mk_new_le & 0xFF) << 24) | (((mk_new_le>>8) & 0xFF) << 16)
-                        | (((mk_new_le>>16) & 0xFF) << 8) | ((mk_new_le>>24) & 0xFF);
-
-        /* New checksum = old_cs_be - (mk_new_be - mk_old_be) to keep sum = 0 */
-        DWORD cs_new_be = cs_old_be - (mk_new_be - mk_old_be);
+        /* Delta in BE32 space: marker is byte-position 1 of the BE32 word
+           (BE layout of bytes [0xFC,0xFD,0xFE,0xFF] is byte2=0xFE at shift 8) */
+        DWORD marker_delta = ((DWORD)mk_new - (DWORD)mk_old) * 0x100;  /* << 8 */
+        DWORD cs_new_be = cs_old_be - marker_delta;
         DWORD cs_new_le = ((cs_new_be & 0xFF) << 24) | (((cs_new_be>>8) & 0xFF) << 16)
                         | (((cs_new_be>>16) & 0xFF) << 8) | ((cs_new_be>>24) & 0xFF);
 
-        printf("  Marker:   dword[0x%03X]  0x%08X → 0x%08X  (byte0: 0x%02X → 0x01)\n",
-               mk_idx, mk_old_le, mk_new_le, mk_old_le & 0xFF);
-        printf("  Checksum: dword[0x%03X]  0x%08X → 0x%08X  (BE: 0x%08X → 0x%08X)\n",
-               cs_idx, cs_old_le, cs_new_le, cs_old_be, cs_new_be);
+        /* Convert new checksum BE→LE for storage */
+        DWORD cs_new_le = ((cs_new_be & 0xFF) << 24) | (((cs_new_be>>8) & 0xFF) << 16)
+                        | (((cs_new_be>>16) & 0xFF) << 8) | ((cs_new_be>>24) & 0xFF);
 
-        /* Apply marker patch */
-        body[mk_idx*4 + 0] = (UCHAR)(mk_new_le       );
-        body[mk_idx*4 + 1] = (UCHAR)(mk_new_le >>  8 );
-        body[mk_idx*4 + 2] = (UCHAR)(mk_new_le >> 16 );
-        body[mk_idx*4 + 3] = (UCHAR)(mk_new_le >> 24 );
+        printf("  Marker:   body[0x%03X]  0x%02X → 0x%02X\n", 0xFE, mk_old, mk_new);
+        printf("  Checksum: dword[0x%03X]  BE: 0x%08X → 0x%08X\n",
+               cs_idx, cs_old_be, cs_new_be);
 
-        /* Apply checksum patch */
+        /* Apply checksum patch (marker already applied above) */
         body[cs_idx*4 + 0] = (UCHAR)(cs_new_le       );
         body[cs_idx*4 + 1] = (UCHAR)(cs_new_le >>  8 );
         body[cs_idx*4 + 2] = (UCHAR)(cs_new_le >> 16 );
@@ -7941,9 +7935,41 @@ static int cmd_decryptkernel(void)
         fprintf(stderr, "Cannot write %s\n", outpath);
         free(raw); free(body); return 1;
     }
-    fwrite(body, 1, 0x10000, fout);
-    fclose(fout);
-    printf("\nDecoded body written to: %s  (%u bytes)\n", outpath, 0x10000);
+
+    if (do_patch) {
+        /* Re-encrypt patched body and write full 0x11200 container
+           (header + key table + re-encrypted body) for byte-level comparison. */
+        const UCHAR *key_bytes2 = raw + 0x200;
+        UCHAR *reenc = (UCHAR*)malloc(0x10000);
+        if (!reenc) { fclose(fout); free(raw); free(body); return 1; }
+        for (i = 0; i < 0x10000/4; i++) {
+            DWORD ki = i % 1024;
+            DWORD k  = (DWORD)key_bytes2[ki*4    ]        |
+                       ((DWORD)key_bytes2[ki*4 + 1] <<  8) |
+                       ((DWORD)key_bytes2[ki*4 + 2] << 16) |
+                       ((DWORD)key_bytes2[ki*4 + 3] << 24);
+            DWORD pt = (DWORD)body[i*4    ]        |
+                       ((DWORD)body[i*4 + 1] <<  8) |
+                       ((DWORD)body[i*4 + 2] << 16) |
+                       ((DWORD)body[i*4 + 3] << 24);
+            DWORD ct = rol32(pt, (int)(k & 31)) ^ k;
+            reenc[i*4    ] = (UCHAR)(ct      );
+            reenc[i*4 + 1] = (UCHAR)(ct >>  8);
+            reenc[i*4 + 2] = (UCHAR)(ct >> 16);
+            reenc[i*4 + 3] = (UCHAR)(ct >> 24);
+        }
+        /* Write: original header[0..0x1200) + re-encrypted body */
+        fwrite(raw,   1, 0x1200,  fout);
+        fwrite(reenc, 1, 0x10000, fout);
+        free(reenc);
+        fclose(fout);
+        printf("\nPatched+re-encrypted kernel written to: %s  (0x11200 bytes)\n", outpath);
+        printf("  Compare bytes 0x12FC, 0x2220, 0x2223 against Joni's reference.\n");
+    } else {
+        fwrite(body, 1, 0x10000, fout);
+        fclose(fout);
+        printf("\nDecoded body written to: %s  (%u bytes)\n", outpath, 0x10000);
+    }
 
     free(raw);
     free(body);

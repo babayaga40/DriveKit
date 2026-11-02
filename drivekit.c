@@ -7892,10 +7892,6 @@ static int cmd_decryptkernel(void)
         DWORD cs_new_le = ((cs_new_be & 0xFF) << 24) | (((cs_new_be>>8) & 0xFF) << 16)
                         | (((cs_new_be>>16) & 0xFF) << 8) | ((cs_new_be>>24) & 0xFF);
 
-        /* Convert new checksum BE→LE for storage */
-        DWORD cs_new_le = ((cs_new_be & 0xFF) << 24) | (((cs_new_be>>8) & 0xFF) << 16)
-                        | (((cs_new_be>>16) & 0xFF) << 8) | ((cs_new_be>>24) & 0xFF);
-
         printf("  Marker:   body[0x%03X]  0x%02X → 0x%02X\n", 0xFE, mk_old, mk_new);
         printf("  Checksum: dword[0x%03X]  BE: 0x%08X → 0x%08X\n",
                cs_idx, cs_old_be, cs_new_be);

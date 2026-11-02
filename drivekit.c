@@ -9811,9 +9811,6 @@ static int cmd_crossflash(void)
     }
 
     printf("=== CROSSFLASH COMPLETE ===\n\n");
-    printf("  Drive is now rebooting with new firmware.\n");
-    printf("  Wait 10-15 seconds then reconnect.\n");
-    printf("  Verify with: drivekit inquiry E\n\n");
     free(kernel_data);
     free(normal_data);
     return 0;

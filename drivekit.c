@@ -9251,193 +9251,193 @@ static int cmd_crossflash(void)
     } /* end !g_nounlock */
 
     /* -------------------------------------------------------
-       STEP 2: KERNEL TRANSFER
-       Layout depends on drive era — pre-cutoff drives reject writes
-       at offset >= 0x010000 (04/4C/01), so they use the old header+body
-       layout which stays within that boundary.
+       STEP 2: NORMAL FIRMWARE PREFIX
+       Joni's sequence (confirmed from pcapng):
+         unlock → normal_prefix → kernel → normal_full → commit
 
-       POST-CUTOFF (Joni's flat layout):
-         cmd1: FE offset=0x000000 len=0x8000  (file[0x0000..0x7FFF])
-         cmd2: FE offset=0x008000 len=0x8000  (file[0x8000..0xFFFF])
-         cmd3: FE offset=0x010000 len=0x1200  (file[0x10000..0x111FF])
-
-       PRE-CUTOFF (header token + body at NAND offsets):
-         hdr:  FE offset=0x000000 len=0x0200  (file[0x0000..0x01FF])
-         cmd1: FE offset=0x001200 len=0x8000  (file[0x1200..0x91FF])
-         cmd2: FE offset=0x009200 len=0x8000  (file[0x9200..0x111FF])
+       Pass 1 (prefix): first 0x1D6600 bytes  (58 × 0x8000 + 1 × 0x6600)
+       The prefix stage primes the drive's receive buffer.
        ------------------------------------------------------- */
-    printf("[2/5] Kernel transfer (%s)...\n",
-           g_pre_cutoff ? "pre-cutoff layout" : "Joni's flat layout");
     {
-        /* Pre-flight SHA-256: hash bytes in exact transfer order */
+        DWORD prefix_size = (normal_size > 0x1D6600) ? 0x1D6600 : normal_size;
+        DWORD chunk_sz = 0x8000;
+        DWORD total_chunks = (prefix_size + chunk_sz - 1) / chunk_sz;
+        DWORD chunk_num = 0;
+        DWORD offset;
+        printf("[2/5] Normal firmware prefix (%lu bytes = 0x%lX, %lu chunks)...\n",
+               prefix_size, prefix_size, total_chunks);
+        for (offset = 0; offset < prefix_size; offset += chunk_sz) {
+            DWORD this_sz = prefix_size - offset;
+            if (this_sz > chunk_sz) this_sz = chunk_sz;
+            chunk_num++;
+            if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
+                printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
+                fflush(stdout);
+            }
+            {
+                char desc[64];
+                snprintf(desc, sizeof(desc), "nfw_prefix@0x%06lX", offset);
+                st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc);
+            }
+            if (st != 0) { printf("\n"); goto fail; }
+            Sleep(50);
+        }
+        printf("\n    Normal prefix done.\n\n");
+    }
+    Sleep(200);
+
+    /* -------------------------------------------------------
+       STEP 3: KERNEL TRANSFER
+       Confirmed from Joni's pcapng — 4 transfers, NAND-mapped offsets:
+         hdr:   FE off=0x000000 len=0x0200  src=file[0x0000..0x01FF]
+         body1: FE off=0x001200 len=0x8000  src=file[0x1200..0x91FF]
+         body2: FE off=0x009200 len=0x8000  src=file[0x9200..0x111FF]
+         tail:  FE off=0x011200 len=0x1000  src=file[0x0200..0x11FF]
+
+       The file layout is: [hdr 0x200][tail_data 0x1000][body1 0x8000][body2 0x8000]
+       For body1/body2: file_offset == drive_offset (NAND pass-through).
+       The tail_data at file[0x0200..0x11FF] maps to the gap between hdr and body1,
+       and is sent last to drive offset 0x011200 (past the 0x010000 hw boundary —
+       this is accepted because the drive is now in kernel-receive mode, not raw NAND
+       write mode; the 04/4C/01 boundary only applies before kernel upload starts).
+
+       Total: 0x0200 + 0x8000 + 0x8000 + 0x1000 = 0x11200 bytes == kernel file size.
+       ------------------------------------------------------- */
+    if (kernel_size < 0x11200) {
+        fprintf(stderr, "  FAILED: kernel file too small (0x%lX < 0x11200)\n", kernel_size);
+        goto fail;
+    }
+    printf("[3/5] Kernel transfer (Joni's NAND-mapped 4-transfer layout)...\n");
+    {
+        /* Pre-flight SHA-256: hash in exact transfer order (hdr, body1, body2, tail) */
         {
             SHA256_CTX sha_ctx;
             UCHAR sha_digest[32];
             int sha_i;
             sha256_init(&sha_ctx);
-            if (g_pre_cutoff) {
-                /* Flat layout, cmd1+cmd2 only (cmd3 skipped — hw boundary at 0x010000) */
-                sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
-                sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
-                printf("      Pre-flight SHA-256 (pre-cutoff stream, 0x10000 bytes, cmd3 skipped):\n");
-            } else {
-                sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
-                sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
-                if (kernel_size >= 0x11200)
-                    sha256_update(&sha_ctx, kernel_data + 0x10000, 0x1200);
-                printf("      Pre-flight SHA-256 (flat stream, 0x11200 bytes):\n");
-            }
+            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);   /* hdr */
+            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);   /* body1 */
+            sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);   /* body2 */
+            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);   /* tail (gap bytes) */
             sha256_final(&sha_ctx, sha_digest);
-            printf("        ");
+            printf("      Pre-flight SHA-256 (hdr+body1+body2+tail, 0x11200 bytes):\n        ");
             for (sha_i = 0; sha_i < 32; sha_i++) printf("%02x", sha_digest[sha_i]);
-            printf("\n");
-            if (!g_pre_cutoff) {
-                printf("      Expected (1.05->1.04 --patch):\n");
-                printf("        4d1fa7cbae04b7db36689f4539d45ff8e01c72a7c8341e762224f2a76a670b9a\n");
-                {
-                    static const UCHAR expected[32] = {
-                        0x4d,0x1f,0xa7,0xcb,0xae,0x04,0xb7,0xdb,
-                        0x36,0x68,0x9f,0x45,0x39,0xd4,0x5f,0xf8,
-                        0xe0,0x1c,0x72,0xa7,0xc8,0x34,0x1e,0x76,
-                        0x22,0x24,0xf2,0xa7,0x6a,0x67,0x0b,0x9a
-                    };
-                    if (memcmp(sha_digest, expected, 32) == 0)
-                        printf("      SHA-256 MATCH — kernel stream identical to Joni's successful downgrade\n\n");
-                    else
-                        printf("      SHA-256 MISMATCH (expected only for 1.05->1.04 --patch; other fw pairs will differ)\n\n");
-                }
-            } else {
-                printf("\n");
-            }
+            printf("\n\n");
         }
 
-        if (g_pre_cutoff) {
-            /* Pre-cutoff drive: use flat layout but stop before offset 0x010000.
-               Hardware rejects WRITE BUFFER at offset >= 0x010000 (04/4C/01).
-               cmd3 (the 0x1200-byte trailer) lives at offset 0x010000 in the
-               flat layout — we skip it.  The drive validates the kernel image
-               from what it received; if it needs that trailing sector it will
-               reject the commit, but the old invented header+body layout was
-               also failing, so this is the next thing to try. */
-            printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");
-            if (st != 0) goto fail;
-            Sleep(2);
+        printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000..0x01FF])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
+        if (st != 0) goto fail;
+        Sleep(2);
 
-            printf("      cmd2: FE off=0x008000 len=0x8000 (file[0x8000..0xFFFF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8000, 0x8000, "kernel_chunk2");
-            if (st != 0) goto fail;
+        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200..0x91FF])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
+        if (st != 0) goto fail;
+        Sleep(2);
 
-            printf("      cmd3: SKIPPED (pre-cutoff drive rejects offset >= 0x010000)\n");
-        } else {
-            printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");
-            if (st != 0) goto fail;
-            Sleep(2);
+        printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200..0x111FF])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
+        if (st != 0) goto fail;
+        Sleep(2);
 
-            printf("      cmd2: FE off=0x008000 len=0x8000 (file[0x8000..0xFFFF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8000, 0x8000, "kernel_chunk2");
-            if (st != 0) goto fail;
-            Sleep(2);
+        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200..0x11FF] — gap bytes)\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x0200, 0x1000, "kernel_tail");
+        if (st != 0) goto fail;
 
-            if (kernel_size >= 0x11200) {
-                printf("      cmd3: FE off=0x010000 len=0x1200 (file[0x10000..0x111FF])\n");
-                st = xf_write_buffer(0x07, 0xFE, 0x010000, kernel_data + 0x10000, 0x1200, "kernel_chunk3");
-                if (st != 0) goto fail;
-            } else {
-                printf("      cmd3: skipped (kernel file < 0x11200 bytes)\n");
-            }
-        }
         printf("      OK\n\n");
     }
     Sleep(200);
 
     /* -------------------------------------------------------
-       STEP 3: NORMAL FIRMWARE PASS
-       Joni's capture order: unlock → kernel → normal → wait → commit
-       mode=0x07 bufID=0xF0, 0x8000-byte chunks
-       ------------------------------------------------------- */
-    printf("[3/5] Firmware pass...\n");
-    st = xf_send_normal_fw(normal_data, normal_size, 1);
-    if (st != 0) goto fail;
-    printf("\n");
-    Sleep(500);
-
-    /* -------------------------------------------------------
-       STEP 4: INTERNAL VALIDATION WAIT
-       Joni's capture: ~13s between normal fw and commit.
+       STEP 4: NORMAL FIRMWARE FULL UPLOAD
+       After kernel, Joni sends the COMPLETE firmware image.
+       Full: 0x1E6600 bytes  (60 × 0x8000 + 1 × 0x6600)
+       For pre-cutoff drives, normal_size has already been set to 0x1E0000
+       (ECC/OOB trailer stripped). We send whatever normal_size is.
        ------------------------------------------------------- */
     {
-        printf("[4/5] Waiting 13000ms for drive to validate images...\n");
-        Sleep(13000);
-        printf("      Wait complete.\n\n");
+        DWORD chunk_sz = 0x8000;
+        DWORD total_chunks = (normal_size + chunk_sz - 1) / chunk_sz;
+        DWORD chunk_num = 0;
+        DWORD offset;
+        printf("[4/5] Normal firmware full upload (%lu bytes = 0x%lX, %lu chunks)...\n",
+               normal_size, normal_size, total_chunks);
+        for (offset = 0; offset < normal_size; offset += chunk_sz) {
+            DWORD this_sz = normal_size - offset;
+            if (this_sz > chunk_sz) this_sz = chunk_sz;
+            chunk_num++;
+            if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
+                printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
+                fflush(stdout);
+            }
+            {
+                char desc[64];
+                snprintf(desc, sizeof(desc), "nfw_full@0x%06lX", offset);
+                st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc);
+            }
+            if (st != 0) { printf("\n"); goto fail; }
+            Sleep(50);
+        }
+        printf("\n    Normal full upload done.\n\n");
     }
 
     /* -------------------------------------------------------
-       STEP 5: FINAL COMMIT TRIGGER
-       mode=0x05 bufID=0xFF len=0x100
-       For same-era flash:  payload = same model+key as step-1 unlock
-       For cross-era flash: payload uses target-era key from tkey_map[]
-         (BDRFlash uses dword_5D4B38[index=0] — the commit key table —
-          which is keyed by target firmware version, not source drive era)
-       IMPORTANT: mode=0x05 requires a 12-byte CDB — confirmed from
-       Wireshark capture of Pioneer BDRFlash (bCBWCBLength=0x0C).
-       10-byte CDB for mode=0x05 causes 04/4C rejection.
+       STEP 5: COMMIT TRIGGER — immediately after last normal transfer
+       Joni's capture: commit fires 62.5ms after final firmware chunk.
+       The ~13s wait comes AFTER commit GOOD, as the drive reflashes internally.
+       mode=0x05 bufID=0xFF len=0x100 — 12-byte CDB required.
+       Key = unlock key (confirmed identical in Joni's unlock + commit payloads).
        ------------------------------------------------------- */
-    printf("[5/5] Final commit trigger (mode=0x05)...\n");
+    printf("[5/5] Commit trigger (mode=0x05, immediate after firmware)...\n");
+    Sleep(100); /* ~62.5ms in Joni's capture; 100ms is safe */
     {
         UCHAR commit_trigger[256];
-        DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */
+        DWORD commit_key = key_le;
 
         if (g_pre_cutoff && target_is_postcut) {
-            /* pre→post cross-era: commit key = unlock key (same as key_le).
-               Joni's USBPcap of BDRFlash confirms this. key_le is the
-               current drive's kernel key — e.g. 0xFF8A27B1 for 8D31/ID05. */
-            printf("      Cross-era (pre→post): commit key = unlock key 0x%08lX\n",
-                   commit_key);
+            /* pre→post upgrade: commit key = unlock key (same key_le).
+               Confirmed by Joni's pcapng: unlock and commit payloads are identical. */
+            printf("      Cross-era (pre→post): commit key = unlock key 0x%08lX\n", commit_key);
         } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
-            /* post→pre downgrade: try TARGET era key for commit.
-               Hypothesis: drive finalizes with the key matching the newly-written
-               firmware, not the key used to unlock (which was the current era's key).
-               If this also fails 04/4C/02, we'll need to try unlock key instead. */
+            /* post→pre downgrade: use target (pre-cutoff) kernel key for commit.
+               The drive finalizes with the key matching the newly-written firmware era. */
             DWORD tgt_key = pioneer_key_lookup(g_driveID, target_kern_id);
             if (tgt_key) {
                 commit_key = tgt_key;
-                printf("      Downgrade (post→pre): using TARGET kernel key=0x%08lX (kernelID=%s)\n",
+                printf("      Downgrade (post→pre): commit key = target key 0x%08lX (kernelID=%s)\n",
                        commit_key, target_kern_id);
             } else {
-                printf("      Downgrade (post→pre): no key for kernelID=%s driveID=0x%04lX — falling back to unlock key 0x%08lX\n",
-                       target_kern_id, (DWORD)g_driveID, commit_key);
+                printf("      Downgrade (post→pre): no key for kernelID=%s — falling back to unlock key 0x%08lX\n",
+                       target_kern_id, commit_key);
             }
-            /* Build commit trigger using platform family model from g_pioneer_drives[].
-               For BDS7 family (0x8D30/0x8D31), this is "PIONEER BDR-BDS7". */
+            /* Rebuild commit trigger with target-era key */
             {
                 const PIONEER_DRIVE *drv = pioneer_lookup(g_driveID);
                 if (drv && drv->model && drv->model[0]) {
                     memset(commit_trigger, 0, 256);
                     memset(commit_trigger, 0x20, 16);
                     strncpy((char*)commit_trigger, drv->model, 16);
-                    printf("      Downgrade (post→pre): model='%.16s' key=0x%08lX\n",
-                           (char*)commit_trigger, commit_key);
                     commit_trigger[0x10] = (UCHAR)(commit_key      );
                     commit_trigger[0x11] = (UCHAR)(commit_key >>  8);
                     commit_trigger[0x12] = (UCHAR)(commit_key >> 16);
                     commit_trigger[0x13] = (UCHAR)(commit_key >> 24);
-                    goto commit_built;
+                    goto commit_trigger_built;
                 }
             }
         }
-
         xf_build_trigger(commit_trigger, model, commit_key);
-        commit_built:;
+        commit_trigger_built:;
         printf("      CDB: 3B 05 FF 00 00 00 00 01 00 00 00 00  (12-byte)\n");
         printf("      Payload[0x00]: %.16s  Key@[0x10]: 0x%08lX\n",
                (char*)commit_trigger, commit_key);
         printf("      Payload hex[0x00..0x1F]: ");
         { int _pi; for (_pi=0;_pi<0x20;_pi++) printf("%02X ",commit_trigger[_pi]); printf("\n"); }
         st = xf_write_buffer(0x05, 0xFF, 0x000000, commit_trigger, 0x100, "commit_trigger");
-        printf("      Status: %s\n", st == 0 ? "GOOD" : "FAIL");
-        printf("\n");
+        printf("      Status: %s\n\n", st == 0 ? "GOOD" : "FAIL");
+        if (st == 0) {
+            printf("      Drive is now performing internal reflash (~13-20s).\n");
+            printf("      Wait for drive LED activity to stop before reconnecting.\n\n");
+        }
     }
 
     /* Post-flash capability summary */

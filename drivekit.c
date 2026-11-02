@@ -9405,21 +9405,32 @@ static int cmd_crossflash(void)
     Sleep(200);
 
     /* -------------------------------------------------------
-       STEP 4: INTERNAL VALIDATION WAIT
-       After uploading both images, the drive validates them internally
-       before it will accept the commit trigger.  Joni's flasher waits
-       ~13 seconds here with the message "the drive checks the images
-       first".  Sending commit too early causes 04/4C/02.
+       STEP 4: SECOND FIRMWARE PASS (pre-cutoff cross-era only)
+       Pre-cutoff drives doing a cross-era flash require a second normal
+       fw pass before commit — this was confirmed working before the
+       single-pass change.  Post-cutoff drives (Joni's capture) use one
+       pass only.
        ------------------------------------------------------- */
-    printf("[4/5] Waiting ~13s for drive to validate images internally...\n");
-    {
-        int i;
-        for (i = 0; i < 13; i++) {
-            printf("      %2d...\n", i + 1);
-            Sleep(1000);
-        }
+    if (g_pre_cutoff) {
+        printf("[4a/5] Second firmware pass (pre-cutoff cross-era)...\n");
+        st = xf_send_normal_fw(normal_data, normal_size, 2);
+        if (st != 0) goto fail;
+        printf("\n");
+        Sleep(500);
     }
-    printf("      Wait complete.\n\n");
+
+    /* -------------------------------------------------------
+       STEP 4b: INTERNAL VALIDATION WAIT
+       Joni's flasher (post-cutoff downgrade) waits ~13s here.
+       For pre-cutoff cross-era, keep a short wait only — too long
+       may expire the drive's internal validation window.
+       ------------------------------------------------------- */
+    {
+        int wait_ms = g_pre_cutoff ? 2000 : 13000;
+        printf("[4b/5] Waiting %dms for drive to validate images...\n", wait_ms);
+        Sleep(wait_ms);
+        printf("      Wait complete.\n\n");
+    }
 
     /* -------------------------------------------------------
        STEP 5: FINAL COMMIT TRIGGER

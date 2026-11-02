@@ -9617,10 +9617,10 @@ static int cmd_crossflash(void)
         if (st != 0) goto fail; Sleep(2);
         printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
-        if (st != 0) goto fail; Sleep(2);
-        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200] — key table bytes)\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x0200, 0x1000, "kernel_tail");
         if (st != 0) goto fail;
+        /* NOTE: tail transfer at 0x011200 omitted — drive rejects it with 04/4C/01.
+           hdr+body1+body2 covers the full 0x11200-byte kernel; tail may only apply
+           to specific firmware versions. */
         printf("      OK\n\n");
         Sleep(200);
 

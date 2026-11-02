@@ -9250,135 +9250,160 @@ static int cmd_crossflash(void)
     Sleep(200);
     } /* end !g_nounlock */
 
-    /* -------------------------------------------------------
-       STEP 2: NORMAL FIRMWARE PREFIX
-       Joni's sequence (confirmed from pcapng):
-         unlock → normal_prefix → kernel → normal_full → commit
-
-       Pass 1 (prefix): first 0x1D6600 bytes  (58 × 0x8000 + 1 × 0x6600)
-       The prefix stage primes the drive's receive buffer.
-       ------------------------------------------------------- */
-    {
-        DWORD prefix_size = (normal_size > 0x1D6600) ? 0x1D6600 : normal_size;
-        DWORD chunk_sz = 0x8000;
-        DWORD total_chunks = (prefix_size + chunk_sz - 1) / chunk_sz;
-        DWORD chunk_num = 0;
-        DWORD offset;
-        printf("[2/5] Normal firmware prefix (%lu bytes = 0x%lX, %lu chunks)...\n",
-               prefix_size, prefix_size, total_chunks);
-        for (offset = 0; offset < prefix_size; offset += chunk_sz) {
-            DWORD this_sz = prefix_size - offset;
-            if (this_sz > chunk_sz) this_sz = chunk_sz;
-            chunk_num++;
-            if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
-                printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
-                fflush(stdout);
-            }
-            {
-                char desc[64];
-                snprintf(desc, sizeof(desc), "nfw_prefix@0x%06lX", offset);
-                st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc);
-            }
-            if (st != 0) { printf("\n"); goto fail; }
-            Sleep(50);
-        }
-        printf("\n    Normal prefix done.\n\n");
-    }
-    Sleep(200);
-
-    /* -------------------------------------------------------
-       STEP 3: KERNEL TRANSFER
-       Confirmed from Joni's pcapng — 4 transfers, NAND-mapped offsets:
-         hdr:   FE off=0x000000 len=0x0200  src=file[0x0000..0x01FF]
-         body1: FE off=0x001200 len=0x8000  src=file[0x1200..0x91FF]
-         body2: FE off=0x009200 len=0x8000  src=file[0x9200..0x111FF]
-         tail:  FE off=0x011200 len=0x1000  src=file[0x0200..0x11FF]
-
-       The file layout is: [hdr 0x200][tail_data 0x1000][body1 0x8000][body2 0x8000]
-       For body1/body2: file_offset == drive_offset (NAND pass-through).
-       The tail_data at file[0x0200..0x11FF] maps to the gap between hdr and body1,
-       and is sent last to drive offset 0x011200 (past the 0x010000 hw boundary —
-       this is accepted because the drive is now in kernel-receive mode, not raw NAND
-       write mode; the 04/4C/01 boundary only applies before kernel upload starts).
-
-       Total: 0x0200 + 0x8000 + 0x8000 + 0x1000 = 0x11200 bytes == kernel file size.
-       ------------------------------------------------------- */
     if (kernel_size < 0x11200) {
         fprintf(stderr, "  FAILED: kernel file too small (0x%lX < 0x11200)\n", kernel_size);
         goto fail;
     }
-    printf("[3/5] Kernel transfer (Joni's NAND-mapped 4-transfer layout)...\n");
-    {
-        /* Pre-flight SHA-256: hash in exact transfer order (hdr, body1, body2, tail) */
+
+    if (g_pre_cutoff) {
+        /* =============================================================
+           PRE-CUTOFF DRIVE → POST-CUTOFF FW  (upgrade, e.g. pre-1.06)
+           Confirmed from Joni's 1.04→1.06 pcapng:
+             [2] Normal prefix:  F0, 0x1D6600 bytes
+             [3] Kernel:         FE, NAND-mapped 4 transfers
+             [4] Normal full:    F0, full normal_size bytes
+             [5] Commit immediately
+           ============================================================= */
+
+        /* [2] Normal firmware prefix */
         {
-            SHA256_CTX sha_ctx;
-            UCHAR sha_digest[32];
-            int sha_i;
+            DWORD prefix_size = (normal_size > 0x1D6600) ? 0x1D6600 : normal_size;
+            DWORD chunk_sz = 0x8000, chunk_num = 0, offset;
+            DWORD total_chunks = (prefix_size + chunk_sz - 1) / chunk_sz;
+            printf("[2/5] Normal firmware prefix (%lu bytes = 0x%lX, %lu chunks)...\n",
+                   prefix_size, prefix_size, total_chunks);
+            for (offset = 0; offset < prefix_size; offset += chunk_sz) {
+                DWORD this_sz = prefix_size - offset;
+                if (this_sz > chunk_sz) this_sz = chunk_sz;
+                chunk_num++;
+                if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
+                    printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
+                    fflush(stdout);
+                }
+                { char desc[64]; snprintf(desc, sizeof(desc), "nfw_pfx@0x%06lX", offset);
+                  st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc); }
+                if (st != 0) { printf("\n"); goto fail; }
+                Sleep(50);
+            }
+            printf("\n    Normal prefix done.\n\n");
+        }
+        Sleep(200);
+
+        /* [3] Kernel — NAND-mapped 4-transfer layout (upgrade era)
+               File layout: [hdr 0x200][tail_data 0x1000][body1 0x8000][body2 0x8000]
+               body1/body2: file_offset == drive_offset (NAND pass-through)
+               tail:        file[0x0200..0x11FF] → drive 0x011200 (gap bytes) */
+        printf("[3/5] Kernel transfer (NAND-mapped 4-xfer, upgrade layout)...\n");
+        {
+            SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);
-            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);   /* hdr */
-            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);   /* body1 */
-            sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);   /* body2 */
-            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);   /* tail (gap bytes) */
+            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
+            sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x0200, 0x1000);
             sha256_final(&sha_ctx, sha_digest);
-            printf("      Pre-flight SHA-256 (hdr+body1+body2+tail, 0x11200 bytes):\n        ");
-            for (sha_i = 0; sha_i < 32; sha_i++) printf("%02x", sha_digest[sha_i]);
+            printf("      SHA-256 (hdr+body1+body2+tail):\n        ");
+            for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n\n");
         }
-
-        printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000..0x01FF])\n");
+        printf("      hdr:   FE off=0x000000 len=0x0200 (file[0x0000])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
-        if (st != 0) goto fail;
-        Sleep(2);
-
-        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200..0x91FF])\n");
+        if (st != 0) goto fail; Sleep(2);
+        printf("      body1: FE off=0x001200 len=0x8000 (file[0x1200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
-        if (st != 0) goto fail;
-        Sleep(2);
-
-        printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200..0x111FF])\n");
+        if (st != 0) goto fail; Sleep(2);
+        printf("      body2: FE off=0x009200 len=0x8000 (file[0x9200])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
-        if (st != 0) goto fail;
-        Sleep(2);
-
-        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200..0x11FF] — gap bytes)\n");
+        if (st != 0) goto fail; Sleep(2);
+        printf("      tail:  FE off=0x011200 len=0x1000 (file[0x0200] — gap bytes)\n");
         st = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x0200, 0x1000, "kernel_tail");
         if (st != 0) goto fail;
-
         printf("      OK\n\n");
-    }
-    Sleep(200);
+        Sleep(200);
 
-    /* -------------------------------------------------------
-       STEP 4: NORMAL FIRMWARE FULL UPLOAD
-       After kernel, Joni sends the COMPLETE firmware image.
-       Full: 0x1E6600 bytes  (60 × 0x8000 + 1 × 0x6600)
-       For pre-cutoff drives, normal_size has already been set to 0x1E0000
-       (ECC/OOB trailer stripped). We send whatever normal_size is.
-       ------------------------------------------------------- */
-    {
-        DWORD chunk_sz = 0x8000;
-        DWORD total_chunks = (normal_size + chunk_sz - 1) / chunk_sz;
-        DWORD chunk_num = 0;
-        DWORD offset;
-        printf("[4/5] Normal firmware full upload (%lu bytes = 0x%lX, %lu chunks)...\n",
-               normal_size, normal_size, total_chunks);
-        for (offset = 0; offset < normal_size; offset += chunk_sz) {
-            DWORD this_sz = normal_size - offset;
-            if (this_sz > chunk_sz) this_sz = chunk_sz;
-            chunk_num++;
-            if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
-                printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
-                fflush(stdout);
+        /* [4] Normal firmware full upload */
+        {
+            DWORD chunk_sz = 0x8000, chunk_num = 0, offset;
+            DWORD total_chunks = (normal_size + chunk_sz - 1) / chunk_sz;
+            printf("[4/5] Normal firmware full upload (%lu bytes = 0x%lX, %lu chunks)...\n",
+                   normal_size, normal_size, total_chunks);
+            for (offset = 0; offset < normal_size; offset += chunk_sz) {
+                DWORD this_sz = normal_size - offset;
+                if (this_sz > chunk_sz) this_sz = chunk_sz;
+                chunk_num++;
+                if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
+                    printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
+                    fflush(stdout);
+                }
+                { char desc[64]; snprintf(desc, sizeof(desc), "nfw_full@0x%06lX", offset);
+                  st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc); }
+                if (st != 0) { printf("\n"); goto fail; }
+                Sleep(50);
             }
-            {
-                char desc[64];
-                snprintf(desc, sizeof(desc), "nfw_full@0x%06lX", offset);
-                st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc);
-            }
-            if (st != 0) { printf("\n"); goto fail; }
-            Sleep(50);
+            printf("\n    Normal full upload done.\n\n");
         }
-        printf("\n    Normal full upload done.\n\n");
+
+    } else {
+        /* =============================================================
+           POST-CUTOFF DRIVE → PRE-CUTOFF FW  (downgrade, --patch)
+           Confirmed from Joni's 1.05→1.04 pcapng:
+             [2] Kernel:      FE, flat 3-chunk layout
+             [3] Normal:      F0, single pass (0x1D6500 bytes)
+             [4] (no step)
+             [5] Commit immediately
+           ============================================================= */
+
+        /* [2] Kernel — flat 3-chunk layout (downgrade era)
+               chunk1: FE off=0x000000 len=0x8000
+               chunk2: FE off=0x008000 len=0x8000
+               chunk3: FE off=0x010000 len=0x1200
+               Total: 0x11200 bytes, sent in file order */
+        printf("[2/5] Kernel transfer (flat 3-chunk, downgrade layout)...\n");
+        {
+            SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
+            sha256_init(&sha_ctx);
+            sha256_update(&sha_ctx, kernel_data + 0x00000, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x08000, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x10000, 0x1200);
+            sha256_final(&sha_ctx, sha_digest);
+            printf("      SHA-256 (flat 0x11200 bytes):\n        ");
+            for (sha_i=0; sha_i<32; sha_i++) printf("%02x", sha_digest[sha_i]);
+            printf("\n\n");
+        }
+        printf("      chunk1: FE off=0x000000 len=0x8000\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x00000, 0x8000, "kernel_c1");
+        if (st != 0) goto fail; Sleep(2);
+        printf("      chunk2: FE off=0x008000 len=0x8000\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x08000, 0x8000, "kernel_c2");
+        if (st != 0) goto fail; Sleep(2);
+        printf("      chunk3: FE off=0x010000 len=0x1200\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x010000, kernel_data + 0x10000, 0x1200, "kernel_c3");
+        if (st != 0) goto fail;
+        printf("      OK\n\n");
+        Sleep(200);
+
+        /* [3] Normal firmware — single pass */
+        {
+            DWORD chunk_sz = 0x8000, chunk_num = 0, offset;
+            DWORD total_chunks = (normal_size + chunk_sz - 1) / chunk_sz;
+            printf("[3/5] Normal firmware (%lu bytes = 0x%lX, %lu chunks)...\n",
+                   normal_size, normal_size, total_chunks);
+            for (offset = 0; offset < normal_size; offset += chunk_sz) {
+                DWORD this_sz = normal_size - offset;
+                if (this_sz > chunk_sz) this_sz = chunk_sz;
+                chunk_num++;
+                if (chunk_num == 1 || chunk_num == total_chunks || (chunk_num % 16) == 0) {
+                    printf("    chunk %lu/%lu  offset=0x%06lX\r", chunk_num, total_chunks, offset);
+                    fflush(stdout);
+                }
+                { char desc[64]; snprintf(desc, sizeof(desc), "nfw@0x%06lX", offset);
+                  st = xf_write_buffer(0x07, 0xF0, offset, normal_data + offset, this_sz, desc); }
+                if (st != 0) { printf("\n"); goto fail; }
+                Sleep(50);
+            }
+            printf("\n    Normal firmware done.\n\n");
+        }
+        printf("[4/5] (no extra pass for downgrade)\n\n");
     }
 
     /* -------------------------------------------------------

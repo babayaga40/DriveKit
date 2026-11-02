@@ -9088,7 +9088,7 @@ static int cmd_crossflash(void)
        This token is used as the commit trigger payload.
        Must be read BEFORE unlock (0xA0 may become inaccessible after).
        ------------------------------------------------------- */
-    printf("[0/6] Reading session token (READ BUFFER 0xA0)...\n");
+    printf("[0/5] Reading session token (READ BUFFER 0xA0)...\n");
     {
         UCHAR sense0[SENSE_SIZE] = {0};
         memset(a0token, 0, sizeof(a0token));
@@ -9141,9 +9141,9 @@ static int cmd_crossflash(void)
        Payload: model string at [0x79] + key at [0x89]
        ------------------------------------------------------- */
     if (g_nounlock) {
-        printf("[1/6] Unlock trigger SKIPPED (--nounlock — drive already in kernel mode)\n\n");
+        printf("[1/5] Unlock trigger SKIPPED (--nounlock — drive already in kernel mode)\n\n");
     } else {
-    printf("[1/6] Unlock trigger (mode=0x04 bufID=0xFF)...\n");
+    printf("[1/5] Unlock trigger (mode=0x04 bufID=0xFF)...\n");
     xf_build_trigger(trigger, model, key_le);
     printf("      payload[0x00]='%.16s' key@[0x10]=0x%08X\n", model, key_le);
     st = xf_write_buffer(0x04, 0xFF, 0, trigger, 0x100, "unlock_trigger");
@@ -9160,81 +9160,41 @@ static int cmd_crossflash(void)
        STEP 2: FIRST FIRMWARE PASS
        mode=0x07 bufID=0xF0, 0x8000-byte chunks
        ------------------------------------------------------- */
-    printf("[2/6] First firmware pass...\n");
+    printf("[2/5] Firmware pass...\n");
     st = xf_send_normal_fw(normal_data, normal_size, 1);
     if (st != 0) goto fail;
     printf("\n");
     Sleep(500);
 
     /* -------------------------------------------------------
-       STEP 3: KERNEL HEADER + TOKEN  (= BDRFlash's first FE write)
-       mode=0x07 bufID=0xFE off=0x000000 len=0x200
-
-       BDRFlash's first FE write sends 512 opaque bytes at offset 0.
-       For a same-version flash this region already holds the correct
-       header — BDRFlash may just be resending it unchanged (it looks
-       random because it's encrypted/proprietary).
-
-       For a VERSION-CHANGE (downgrade/crossflash), the NAND header
-       at 0x0000 belongs to the OLD firmware.  The body we are about
-       to write belongs to the TARGET firmware.  If the drive validates
-       header/body consistency on commit-boot, a mismatched header
-       would cause 04/4C/02.
-
-       Strategy: send the TARGET kernel's header (kernel_data[0..0x1FF])
-       as the "token" payload.  This is the same 0x200 bytes, same
-       offset, same NAND position — we're just sending the right header
-       instead of random data.  For same-era reflash the header would
-       be identical to what's already in NAND anyway.
+       STEPS 3+4: KERNEL — three flat sequential WRITE BUFFER 0xFE transfers
+       Matching Joni's confirmed successful Wireshark sequence exactly:
+         cmd1: FE offset=0x000000 len=0x8000  (kernel_data[0x0000..0x7FFF])
+         cmd2: FE offset=0x008000 len=0x8000  (kernel_data[0x8000..0xFFFF])
+         cmd3: FE offset=0x010000 len=0x1200  (kernel_data[0x10000..0x111FF])
+       The full 0x11200-byte KernelFront file is sent flat — header, key table,
+       and encrypted body — in three contiguous chunks with no separate header
+       token write and no gaps.
        ------------------------------------------------------- */
-    printf("[3/6] Kernel header (FE off=0x000000 len=0x200, target kernel header)...\n");
-    /* Use the target kernel's ASCII header as the token payload */
-    memcpy(token, kernel_data, 0x200);
-    st = xf_write_buffer(0x07, 0xFE, 0x000000, token, 0x200, "kernel_hdr_token");
-    if (st != 0) goto fail;
-    printf("      OK\n\n");
-    Sleep(100);
-
-    /* -------------------------------------------------------
-       STEP 4: KERNEL BODY
-       mode=0x07 bufID=0xFE — three writes, matching BDRFlash exactly:
-         cmd1: NAND 0x001200 len=0x8000  (file[0x1200..0x91FF])
-         cmd2: NAND 0x009200 len=0x8000  (file[0x9200..0x111FF])
-         cmd3: NAND 0x011200 len=0x1000  (file[0x10200..0x111FF], tail re-send)
-       Header region (NAND 0x0000–0x01FF): written by token step above (left as-is).
-       Key table region (NAND 0x0200–0x11FF): NOT sent — lives permanently in NAND.
-       Body is 0x10000 bytes; cmd1+cmd2 cover it completely; cmd3 re-sends the tail.
-       ------------------------------------------------------- */
-    printf("[4/6] Kernel body (mode=0x07 bufID=0xFE)...\n");
+    printf("[3/5] Kernel (FE flat sequential, 3 chunks matching Joni's sequence)...\n");
     {
-        /* cmd1: encrypted body chunk 1, NAND 0x001200, file[0x1200..0x91FF] */
-        printf("      cmd1: NAND 0x001200 len=0x8000 (file[0x1200..0x91FF])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
+        /* cmd1: kernel_data[0x0000..0x7FFF] → NAND offset 0x000000 */
+        printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");
         if (st != 0) goto fail;
         Sleep(2);
 
-        /* cmd2: encrypted body chunk 2, NAND 0x009200, file[0x9200..0x111FF] */
-        printf("      cmd2: NAND 0x009200 len=0x8000 (file[0x9200..0x111FF])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
+        /* cmd2: kernel_data[0x8000..0xFFFF] → NAND offset 0x008000 */
+        printf("      cmd2: FE off=0x008000 len=0x8000 (file[0x8000..0xFFFF])\n");
+        st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8000, 0x8000, "kernel_chunk2");
         if (st != 0) goto fail;
         Sleep(2);
 
-        /* cmd3: tail re-send, NAND 0x011200, file[0x10200..0x111FF]
-           Overlaps with last 0x1000 bytes of cmd2. BDRFlash always sends this —
-           likely flushes/finalises the NAND write buffer for the last block.
-           The tail bytes are unaffected by --patch (patched byte is at file[0x12FE],
-           inside cmd1's range), so this data is identical to BDRFlash's payload. */
+        /* cmd3: kernel_data[0x10000..0x111FF] → NAND offset 0x010000 */
         if (kernel_size >= 0x11200) {
-            int st3;
-            printf("      cmd3: NAND 0x011200 len=0x1000 (file[0x10200..0x111FF], tail flush)\n");
-            st3 = xf_write_buffer(0x07, 0xFE, 0x011200, kernel_data + 0x10200, 0x1000, "kernel_tail");
-            if (st3 != 0) {
-                printf("      cmd3: SOFT FAIL (ignored) — sense=%02X/%02X/%02X\n",
-                       /* sense bytes already printed by xf_write_buffer */
-                       0,0,0);
-            } else {
-                printf("      cmd3: OK\n");
-            }
+            printf("      cmd3: FE off=0x010000 len=0x1200 (file[0x10000..0x111FF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x010000, kernel_data + 0x10000, 0x1200, "kernel_chunk3");
+            if (st != 0) goto fail;
         } else {
             printf("      cmd3: skipped (kernel file < 0x11200 bytes)\n");
         }
@@ -9243,17 +9203,24 @@ static int cmd_crossflash(void)
     Sleep(200);
 
     /* -------------------------------------------------------
-       STEP 5: SECOND FIRMWARE PASS
-       mode=0x07 bufID=0xF0, 0x8000-byte chunks (same as pass 1)
+       STEP 4: INTERNAL VALIDATION WAIT
+       After uploading both images, the drive validates them internally
+       before it will accept the commit trigger.  Joni's flasher waits
+       ~13 seconds here with the message "the drive checks the images
+       first".  Sending commit too early causes 04/4C/02.
        ------------------------------------------------------- */
-    printf("[5/6] Second firmware pass...\n");
-    st = xf_send_normal_fw(normal_data, normal_size, 2);
-    if (st != 0) goto fail;
-    printf("\n");
-    Sleep(500);
+    printf("[4/5] Waiting ~13s for drive to validate images internally...\n");
+    {
+        int i;
+        for (i = 0; i < 13; i++) {
+            printf("      %2d...\n", i + 1);
+            Sleep(1000);
+        }
+    }
+    printf("      Wait complete.\n\n");
 
     /* -------------------------------------------------------
-       STEP 6: FINAL COMMIT TRIGGER
+       STEP 5: FINAL COMMIT TRIGGER
        mode=0x05 bufID=0xFF len=0x100
        For same-era flash:  payload = same model+key as step-1 unlock
        For cross-era flash: payload uses target-era key from tkey_map[]
@@ -9262,11 +9229,8 @@ static int cmd_crossflash(void)
        IMPORTANT: mode=0x05 requires a 12-byte CDB — confirmed from
        Wireshark capture of Pioneer BDRFlash (bCBWCBLength=0x0C).
        10-byte CDB for mode=0x05 causes 04/4C rejection.
-       Wait 500ms after second firmware pass before committing —
-       drive needs time to finish NAND write before accepting trigger.
        ------------------------------------------------------- */
-    printf("[6/6] Final commit trigger...\n");
-    Sleep(1000); /* Give drive extra time to finish NAND writes (was 500ms) */
+    printf("[5/5] Final commit trigger...\n");
     {
         UCHAR commit_trigger[256];
         DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */

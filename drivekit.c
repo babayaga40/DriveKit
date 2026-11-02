@@ -8871,9 +8871,37 @@ static int cmd_crossflash(void)
             }
         }
 
-        if (kf_detected) {
+        if (kf_detected && !g_patch_flag) {
+            /* KernelFront detected but --patch not requested.
+               No need to decrypt/re-encrypt — send the file as-is.
+               Decrypting without patching and re-encrypting would be a
+               no-op only if the key table is used identically in both
+               directions; any asymmetry corrupts the kernel silently. */
+            UCHAR marker_disp = 0xFF;
+            {
+                /* Peek at the generation marker for display only — decrypt
+                   just the one dword containing plain[0xFE] (body dword 63,
+                   file offset 0x1200 + 63*4 = 0x12FC). */
+                DWORD ki = 63 % 1024;
+                DWORD k  = (DWORD)(kernel_data + 0x200)[ki*4    ]        |
+                           ((DWORD)(kernel_data + 0x200)[ki*4 + 1] <<  8) |
+                           ((DWORD)(kernel_data + 0x200)[ki*4 + 2] << 16) |
+                           ((DWORD)(kernel_data + 0x200)[ki*4 + 3] << 24);
+                DWORD c  = (DWORD)(kernel_data + 0x1200)[63*4    ]        |
+                           ((DWORD)(kernel_data + 0x1200)[63*4 + 1] <<  8) |
+                           ((DWORD)(kernel_data + 0x1200)[63*4 + 2] << 16) |
+                           ((DWORD)(kernel_data + 0x1200)[63*4 + 3] << 24);
+                DWORD p  = ror32(c ^ k, (int)(k & 31));
+                /* plain[0xFE] is byte 2 of this dword (LE: byte0=plain[0xFC]) */
+                marker_disp = (UCHAR)(p >> 16);
+            }
+            printf("  KernelFront: --patch not set — sending as-is (marker peek: 0x%02X = %s)\n\n",
+                   marker_disp,
+                   (marker_disp == 0x01) ? "post-cutoff" :
+                   (marker_disp == 0xFF || marker_disp == 0x00) ? "pre-cutoff" : "unknown");
+        } else if (kf_detected) {
             printf("  KernelFront: detected — decrypting in-place");
-            if (g_patch_flag) printf(" + patching generation marker");
+            printf(" + patching generation marker");
             printf("...\n");
 
             const UCHAR *key_bytes = kernel_data + 0x200;

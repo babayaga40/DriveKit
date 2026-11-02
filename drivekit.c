@@ -129,6 +129,7 @@ static int   cmd_flashfw_precut(void);
 static int   cmd_flash(void);
 static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);
+static int   cmd_decodenormal(void);
 static int   cmd_hwdump(void);
 static int   cmd_flashinfo(void);
 static int   cmd_dumpfw(void);
@@ -5059,6 +5060,8 @@ static void print_help(void)
     printf("  patchfw       Patch firmware header to spoof version for downgrade\n");
     printf("  decryptkernel Decode KernelFront cipher; --patch applies gen-marker fix\n");
     printf("                  --file kernel.100 [--patch] [--file2 out.bin]\n");
+    printf("  decodenormal  Decrypt normal firmware envelope; reports UHD capability\n");
+    printf("                  --file S8D31051.104 [--file2 decoded_body.bin]\n");
     printf("  encryptkernel Re-encrypt a patched decoded kernel body back to .100\n");
     printf("                  --file decoded.bin --file2 original.100 [--file3 out.100]\n");
     printf("  autoflash     Auto-detect and flash from firmware\\ folder\n");
@@ -7062,6 +7065,7 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "xordiff")       == 0) return cmd_xordiff();
     if (strcmp(cmd, "patchfw")       == 0) return cmd_patchfw();
     if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
+    if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
     if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
 
     if (open_drive(drv)) return 1;
@@ -7098,6 +7102,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "flashinfo")  == 0) ret = cmd_flashinfo();
     else if (strcmp(cmd, "patchfw")        == 0) ret = cmd_patchfw();
     else if (strcmp(cmd, "decryptkernel")  == 0) ret = cmd_decryptkernel();
+    else if (strcmp(cmd, "decodenormal")   == 0) ret = cmd_decodenormal();
     else if (strcmp(cmd, "encryptkernel")  == 0) ret = cmd_encryptkernel();
     else if (strcmp(cmd, "kernellimbo") == 0) {
         /* Enter kernel limbo on post-cutoff drives
@@ -8008,6 +8013,137 @@ static int cmd_decryptkernel(void)
 
     free(raw);
     free(body);
+    return 0;
+}
+
+/* =========================================================
+   CMD_DECODENORMAL
+   Decrypt a Pioneer normal firmware envelope and report UHD capability.
+
+   Usage:
+     drivekit decodenormal --file S8D31051.104
+     drivekit decodenormal --file S8D31051.104 --file2 decoded_body.bin
+
+   Normal firmware envelope layout:
+     [0x000 : 0x200 ]  512-byte ASCII header
+     [0x200 : 0x10200]  64 KiB key table  (16384 LE DWORDs)
+     [0x10200 :      ]  ciphertext  (same XOR/ROR32 cipher as kernel)
+   Decoded plaintext starts with "PIONEER ".
+   SIG0 (24-byte UHD signature) is at 0x1738FC in XD07U v1.04 plaintext.
+   ========================================================= */
+static int cmd_decodenormal(void)
+{
+    FILE  *fin  = NULL;
+    FILE  *fout = NULL;
+    UCHAR *raw  = NULL;
+    UCHAR *plain = NULL;
+    long   fsize;
+    DWORD  ct_bytes, ct_dwords, di;
+    char   outpath[512];
+
+    if (!g_outFile[0]) {
+        fprintf(stderr, "Usage: drivekit decodenormal --file <normal.bin> [--file2 out.bin]\n");
+        return 1;
+    }
+    fin = fopen(g_outFile, "rb");
+    if (!fin) { fprintf(stderr, "Cannot open %s\n", g_outFile); return 1; }
+    fseek(fin, 0, SEEK_END); fsize = ftell(fin); fseek(fin, 0, SEEK_SET);
+
+    if (fsize < (long)0x10204) {
+        fprintf(stderr, "File too small for normal firmware layout (need >= 0x10204 bytes, got 0x%lX)\n",
+                (long)fsize);
+        fclose(fin); return 1;
+    }
+
+    raw = (UCHAR*)malloc((DWORD)fsize);
+    if (!raw) { fclose(fin); return 1; }
+    fread(raw, 1, (DWORD)fsize, fin);
+    fclose(fin); fin = NULL;
+
+    /* Print header info */
+    printf("Normal firmware: %s  (0x%lX bytes)\n", g_outFile, (long)fsize);
+    printf("  Header [0x00]: %.64s\n", raw);          /* ASCII copyright line */
+    if (fsize > 0x90 + 4)
+        printf("  Version field [0x90]: %.8s\n", raw + 0x90);
+    if (fsize > 0xB0 + 8)
+        printf("  Platform [0xB0]:  %.8s\n", raw + 0xB0);
+
+    /* Decrypt */
+    ct_bytes  = (DWORD)fsize - 0x10200;
+    ct_dwords = ct_bytes / 4;
+    printf("\nDecrypting body (%lu dwords)...\n", (unsigned long)ct_dwords);
+
+    plain = (UCHAR*)malloc(ct_dwords * 4);
+    if (!plain) { free(raw); return 1; }
+
+    {
+        const UCHAR *key_bytes    = raw + 0x200;
+        const UCHAR *ct_bytes_ptr = raw + 0x10200;
+        for (di = 0; di < ct_dwords; di++) {
+            DWORD ki = di % 16384;
+            DWORD k  = (DWORD)key_bytes[ki*4    ]
+                     | ((DWORD)key_bytes[ki*4 + 1] <<  8)
+                     | ((DWORD)key_bytes[ki*4 + 2] << 16)
+                     | ((DWORD)key_bytes[ki*4 + 3] << 24);
+            DWORD ct = (DWORD)ct_bytes_ptr[di*4    ]
+                     | ((DWORD)ct_bytes_ptr[di*4 + 1] <<  8)
+                     | ((DWORD)ct_bytes_ptr[di*4 + 2] << 16)
+                     | ((DWORD)ct_bytes_ptr[di*4 + 3] << 24);
+            DWORD pt  = ror32(ct ^ k, (int)(k & 31));
+            plain[di*4    ] = (UCHAR)(pt      );
+            plain[di*4 + 1] = (UCHAR)(pt >>  8);
+            plain[di*4 + 2] = (UCHAR)(pt >> 16);
+            plain[di*4 + 3] = (UCHAR)(pt >> 24);
+        }
+    }
+
+    DWORD plain_len = ct_dwords * 4;
+
+    /* Validate magic */
+    printf("Decode complete.\n");
+    printf("  Plaintext magic [0x00]: %.8s  (%s)\n",
+           plain, memcmp(plain, "PIONEER ", 8) == 0 ? "OK" : "unexpected");
+
+    /* Scan for SIG0 */
+    {
+        int found = 0;
+        DWORD sig_off = 0;
+        if (plain_len >= 24) {
+            DWORD i;
+            for (i = 0; i <= plain_len - 24; i++) {
+                if (memcmp(plain + i, KF_UHD_SIG, 24) == 0) {
+                    found = 1;
+                    sig_off = i;
+                    break;
+                }
+            }
+        }
+        if (found)
+            printf("  UHD signature (SIG0): FOUND at plaintext offset 0x%06lX  → UHD capable: YES\n",
+                   (unsigned long)sig_off);
+        else
+            printf("  UHD signature (SIG0): not found  → UHD capable: NO\n");
+    }
+
+    /* Optional: dump decoded body */
+    if (g_outFile2[0]) {
+        strncpy(outpath, g_outFile2, sizeof(outpath)-1);
+        outpath[sizeof(outpath)-1] = '\0';
+    } else {
+        snprintf(outpath, sizeof(outpath), "%.499s_decoded.bin", g_outFile);
+    }
+
+    fout = fopen(outpath, "wb");
+    if (!fout) {
+        fprintf(stderr, "Cannot write %s\n", outpath);
+        free(plain); free(raw); return 1;
+    }
+    fwrite(plain, 1, plain_len, fout);
+    fclose(fout);
+    printf("\nDecoded body written to: %s  (0x%lX bytes)\n", outpath, (unsigned long)plain_len);
+
+    free(plain);
+    free(raw);
     return 0;
 }
 

@@ -8290,13 +8290,14 @@ static int sk_find_key(const UCHAR *body, size_t size,
 
 static int cmd_scankey(void)
 {
-    const char *inpath = g_file;
+    const char *inpath = g_outFile;
     if (!inpath || !inpath[0]) {
         fprintf(stderr, "Usage: drivekit scankey --file <decoded-normal-body.bin>\n");
         fprintf(stderr, "  Input must be the decoded body output from 'decodenormal',\n");
         fprintf(stderr, "  not the raw encrypted firmware.\n");
         return 1;
     }
+
 
     FILE *fp = fopen(inpath, "rb");
     if (!fp) { fprintf(stderr, "Cannot open '%s'\n", inpath); return 1; }

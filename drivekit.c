@@ -6893,6 +6893,13 @@ int main(int argc, char *argv[])
     }
     } /* end arg parse block */
 
+    /* File-only commands need no drive, no banner, no prompts — dispatch immediately */
+    if (strcmp(cmd, "xordiff")       == 0) return cmd_xordiff();
+    if (strcmp(cmd, "patchfw")       == 0) return cmd_patchfw();
+    if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
+    if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
+    if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
+
     printf("\n");
     printf(" \xE2\x96\x84\xE2\x96\x80\xE2\x96\x84\xE2\x96\x84\xE2\x96\x84\xE2\x96\x84                                           \xE2\x96\x80\xE2\x96\x84\xE2\x96\x80\xE2\x96\x84\xE2\x96\x84 \xE2\x96\x84\xE2\x96\x88\xE2\x96\x84\xE2\x96\x80         \xE2\x96\x84\xE2\x96\x80\xE2\x96\x84\xE2\x96\x84\n");
     printf("     \xE2\x96\x88\xE2\x96\x88\xE2\x96\x88\xE2\x96\xA0\xE2\x96\x88\xE2\x96\x88\xE2\x96\x84\xE2\x96\x80               \xE2\x96\x84                         \xE2\x96\x88\xE2\x96\x93\xE2\x96\x88\xE2\x96\x88 \xE2\x96\x88\xE2\x96\x93\xE2\x96\x88\xE2\x96\x88    \xE2\x96\xA0\xE2\x96\x84   \xE2\x96\x88\xE2\x96\x93\xE2\x96\x88\xE2\x96\x90\n");
@@ -7061,13 +7068,6 @@ int main(int argc, char *argv[])
         printf("\n");
     }
 
-    /* xordiff and patchfw are pure file analysis — no drive needed */
-    if (strcmp(cmd, "xordiff")       == 0) return cmd_xordiff();
-    if (strcmp(cmd, "patchfw")       == 0) return cmd_patchfw();
-    if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
-    if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
-    if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
-
     if (open_drive(drv)) return 1;
 
     /* Skip drive info banner for flash commands - reads disturb drive state */
@@ -7100,10 +7100,6 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "crossflash") == 0) ret = cmd_crossflash();
     else if (strcmp(cmd, "xordiff")    == 0) ret = cmd_xordiff();
     else if (strcmp(cmd, "flashinfo")  == 0) ret = cmd_flashinfo();
-    else if (strcmp(cmd, "patchfw")        == 0) ret = cmd_patchfw();
-    else if (strcmp(cmd, "decryptkernel")  == 0) ret = cmd_decryptkernel();
-    else if (strcmp(cmd, "decodenormal")   == 0) ret = cmd_decodenormal();
-    else if (strcmp(cmd, "encryptkernel")  == 0) ret = cmd_encryptkernel();
     else if (strcmp(cmd, "kernellimbo") == 0) {
         /* Enter kernel limbo on post-cutoff drives
            Unlocks drive, sends current firmware, fires XS06 trigger

@@ -9769,6 +9769,10 @@ static int cmd_crossflash(void)
         if (st == 0) {
             printf("      Drive is now performing internal reflash (~13-20s).\n");
             printf("      Wait for drive LED activity to stop before reconnecting.\n\n");
+            printf("  Flashing");
+            fflush(stdout);
+            { int _wi; for (_wi = 0; _wi < 13; _wi++) { Sleep(1000); printf("."); fflush(stdout); } }
+            printf(" done.\n\n");
         }
     }
 

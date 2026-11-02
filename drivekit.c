@@ -130,6 +130,7 @@ static int   cmd_flash_legacy(void);
 static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);   /* renamed to "flash" on CLI */
 static int   cmd_decodenormal(void);
+static int   cmd_scankey(void);
 static int   cmd_hwdump(void);
 static int   cmd_flashinfo(void);
 static int   cmd_dumpfw(void);
@@ -5061,6 +5062,7 @@ static void print_help(void)
     printf("  decryptkernel Decode KernelFront cipher; --patch applies gen-marker fix\n");
     printf("                  --file kernel.100 [--patch] [--file2 out.bin]\n");
     printf("  decodenormal  Decrypt normal firmware envelope; reports UHD capability\n");
+    printf("  scankey       Extract unlock key from a decoded Normal firmware body\n");
     printf("                  --file S8D31051.104 [--file2 decoded_body.bin]\n");
     printf("  encryptkernel Re-encrypt a patched decoded kernel body back to .100\n");
     printf("                  --file decoded.bin --file2 original.100 [--file3 out.100]\n");
@@ -6898,6 +6900,7 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "patchfw")       == 0) return cmd_patchfw();
     if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
     if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
+    if (strcmp(cmd, "scankey")       == 0) return cmd_scankey();
     if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
 
     printf("\n");
@@ -8215,6 +8218,141 @@ static int cmd_decodenormal(void)
 
 /* =========================================================
    CMD_ENCRYPTKERNEL
+   =========================================================
+   cmd_scankey — offline unlock key extractor
+   Port of MattJackson's content-derived keyed-handler recognition
+   algorithm from his Rust Pioneer firmware library.
+
+   Input MUST be a decoded Normal firmware body (output of decodenormal),
+   NOT the raw encrypted firmware file.
+
+   Usage:
+     drivekit scankey --file decoded_normal_body.bin
+   =========================================================
+
+/* --- key scanner (ported from MattJackson's Rust algorithm) ------------- */
+#define SK_ACCEPT_LEN 8u
+#define SK_KEY_LEN    4u
+
+static const UCHAR sk_accept_compare[7] = {
+    0x7A, 0x20, 0x9A, 0x78, 0x23, 0x61, 0x47
+};
+static const UCHAR sk_key_compare[2] = { 0x7A, 0x20 };
+
+typedef struct {
+    size_t accept_offset;
+    size_t compare_offset;
+    size_t key_offset;
+    unsigned reject_length;
+    UCHAR key[SK_KEY_LEN];
+} SK_MATCH;
+
+/* Returns 1=unique, 0=not found, -1=ambiguous */
+static int sk_find_key(const UCHAR *body, size_t size,
+                       SK_MATCH *found, size_t *count)
+{
+    size_t n = 0;
+    if (size < SK_ACCEPT_LEN) { *count = 0; return 0; }
+    for (size_t i = 0; i <= size - SK_ACCEPT_LEN; i += 2) {
+        if (memcmp(body + i, sk_accept_compare, sizeof sk_accept_compare) != 0)
+            continue;
+        int displacement = (int)(signed char)body[i + 7];
+        if (displacement < 8) continue;
+        size_t end = i + SK_ACCEPT_LEN + (size_t)displacement;
+        if (end > size) continue;
+        /* try short (8) then long (10) variant */
+        const unsigned lengths[] = { 8, 10 };
+        for (size_t k = 0; k < 2; ++k) {
+            unsigned length = lengths[k];
+            if (displacement < (int)length || end < length) continue;
+            size_t start = end - length;
+            const UCHAR *p = body + start;
+            if (memcmp(p, sk_key_compare, sizeof sk_key_compare) != 0) continue;
+            if (length == 8) {
+                if (p[6] != 0x46) continue;
+            } else {
+                if (p[6] != 0x58 || p[7] != 0x60) continue;
+            }
+            SK_MATCH m;
+            m.accept_offset  = i;
+            m.compare_offset = start;
+            m.key_offset     = start + 2;
+            m.reject_length  = length;
+            memcpy(m.key, p + 2, SK_KEY_LEN);
+            if (n == 0) *found = m;
+            ++n;
+            break; /* one match per acceptance signature */
+        }
+    }
+    *count = n;
+    return n == 1 ? 1 : (n == 0 ? 0 : -1);
+}
+
+static int cmd_scankey(void)
+{
+    const char *inpath = g_file;
+    if (!inpath || !inpath[0]) {
+        fprintf(stderr, "Usage: drivekit scankey --file <decoded-normal-body.bin>\n");
+        fprintf(stderr, "  Input must be the decoded body output from 'decodenormal',\n");
+        fprintf(stderr, "  not the raw encrypted firmware.\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(inpath, "rb");
+    if (!fp) { fprintf(stderr, "Cannot open '%s'\n", inpath); return 1; }
+    fseek(fp, 0, SEEK_END);
+    long fsz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsz <= 0) { fprintf(stderr, "Empty or unreadable file\n"); fclose(fp); return 1; }
+    UCHAR *body = (UCHAR*)malloc((size_t)fsz);
+    if (!body) { fprintf(stderr, "Out of memory\n"); fclose(fp); return 1; }
+    if (fread(body, 1, (size_t)fsz, fp) != (size_t)fsz) {
+        fprintf(stderr, "Read error\n"); free(body); fclose(fp); return 1;
+    }
+    fclose(fp);
+
+    printf("scankey: %s  (%ld bytes = 0x%lX)\n\n", inpath, fsz, fsz);
+
+    SK_MATCH m = {0};
+    size_t count = 0;
+    int result = sk_find_key(body, (size_t)fsz, &m, &count);
+    free(body);
+
+    printf("  Keyed handler matches: %zu\n", count);
+    if (result == 1) {
+        DWORD le = (DWORD)m.key[0]
+                 | ((DWORD)m.key[1] <<  8)
+                 | ((DWORD)m.key[2] << 16)
+                 | ((DWORD)m.key[3] << 24);
+        printf("  Acceptance signature offset : 0x%zX\n", m.accept_offset);
+        printf("  Key comparison offset       : 0x%zX\n", m.compare_offset);
+        printf("  Key bytes offset            : 0x%zX\n", m.key_offset);
+        printf("  Reject branch variant       : %u-byte\n", m.reject_length);
+        printf("  Unlock key (wire order)     : %02X %02X %02X %02X\n",
+               m.key[0], m.key[1], m.key[2], m.key[3]);
+        printf("  Unlock key (LE DWORD)       : 0x%08lX\n", (unsigned long)le);
+        printf("\n");
+        /* Cross-check against known key table */
+        DWORD known = pioneer_key_lookup(g_driveID, NULL);
+        if (known && known != le) {
+            printf("  WARNING: extracted key 0x%08lX differs from key-table entry 0x%08lX\n",
+                   (unsigned long)le, (unsigned long)known);
+            printf("           Verify against a known-good capture before flashing.\n");
+        } else if (known && known == le) {
+            printf("  Cross-check: matches key-table entry. OK\n");
+        }
+        return 0;
+    } else if (result == 0) {
+        fprintf(stderr, "  No recognized keyed handler found.\n");
+        fprintf(stderr, "  The file may be wrong format, or this firmware uses a different layout.\n");
+        return 1;
+    } else {
+        fprintf(stderr, "  Ambiguous: %zu keyed handlers found — refusing to choose.\n", count);
+        return 1;
+    }
+}
+
+/* =========================================================
    Re-encrypt a decoded (plaintext) Pioneer kernel body back
    into a KernelFront-encrypted .100 file ready to flash.
 

@@ -9261,61 +9261,98 @@ static int cmd_crossflash(void)
     Sleep(500);
 
     /* -------------------------------------------------------
-       STEP 3: KERNEL TRANSFER — Joni's flat layout (universal)
-         cmd1: FE offset=0x000000 len=0x8000  (kernel_data[0x0000..0x7FFF])
-         cmd2: FE offset=0x008000 len=0x8000  (kernel_data[0x8000..0xFFFF])
-         cmd3: FE offset=0x010000 len=0x1200  (kernel_data[0x10000..0x111FF])
+       STEP 3: KERNEL TRANSFER
+       Layout depends on drive era — pre-cutoff drives reject writes
+       at offset >= 0x010000 (04/4C/01), so they use the old header+body
+       layout which stays within that boundary.
+
+       POST-CUTOFF (Joni's flat layout):
+         cmd1: FE offset=0x000000 len=0x8000  (file[0x0000..0x7FFF])
+         cmd2: FE offset=0x008000 len=0x8000  (file[0x8000..0xFFFF])
+         cmd3: FE offset=0x010000 len=0x1200  (file[0x10000..0x111FF])
+
+       PRE-CUTOFF (header token + body at NAND offsets):
+         hdr:  FE offset=0x000000 len=0x0200  (file[0x0000..0x01FF])
+         cmd1: FE offset=0x001200 len=0x8000  (file[0x1200..0x91FF])
+         cmd2: FE offset=0x009200 len=0x8000  (file[0x9200..0x111FF])
        ------------------------------------------------------- */
-    printf("[3/5] Kernel transfer (Joni's flat layout)...\n");
+    printf("[3/5] Kernel transfer (%s)...\n",
+           g_pre_cutoff ? "pre-cutoff layout" : "Joni's flat layout");
     {
-        /* Pre-flight: hash the full flat stream in transfer order. */
+        /* Pre-flight SHA-256: hash bytes in exact transfer order */
         {
             SHA256_CTX sha_ctx;
             UCHAR sha_digest[32];
             int sha_i;
             sha256_init(&sha_ctx);
-            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
-            sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
-            if (kernel_size >= 0x11200)
-                sha256_update(&sha_ctx, kernel_data + 0x10000, 0x1200);
+            if (g_pre_cutoff) {
+                sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
+                sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
+                sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);
+                printf("      Pre-flight SHA-256 (pre-cutoff stream, 0x10400 bytes):\n");
+            } else {
+                sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
+                sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
+                if (kernel_size >= 0x11200)
+                    sha256_update(&sha_ctx, kernel_data + 0x10000, 0x1200);
+                printf("      Pre-flight SHA-256 (flat stream, 0x11200 bytes):\n");
+            }
             sha256_final(&sha_ctx, sha_digest);
-            printf("      Pre-flight kernel stream SHA-256 (0x11200 bytes):\n");
             printf("        ");
             for (sha_i = 0; sha_i < 32; sha_i++) printf("%02x", sha_digest[sha_i]);
             printf("\n");
-            printf("      Expected (1.05->1.04 --patch):\n");
-            printf("        4d1fa7cbae04b7db36689f4539d45ff8e01c72a7c8341e762224f2a76a670b9a\n");
-            {
-                static const UCHAR expected[32] = {
-                    0x4d,0x1f,0xa7,0xcb,0xae,0x04,0xb7,0xdb,
-                    0x36,0x68,0x9f,0x45,0x39,0xd4,0x5f,0xf8,
-                    0xe0,0x1c,0x72,0xa7,0xc8,0x34,0x1e,0x76,
-                    0x22,0x24,0xf2,0xa7,0x6a,0x67,0x0b,0x9a
-                };
-                if (memcmp(sha_digest, expected, 32) == 0)
-                    printf("      SHA-256 MATCH — kernel stream identical to Joni's successful downgrade\n\n");
-                else
-                    printf("      SHA-256 MISMATCH (expected only for 1.05->1.04 --patch; other fw pairs will differ)\n\n");
+            if (!g_pre_cutoff) {
+                printf("      Expected (1.05->1.04 --patch):\n");
+                printf("        4d1fa7cbae04b7db36689f4539d45ff8e01c72a7c8341e762224f2a76a670b9a\n");
+                {
+                    static const UCHAR expected[32] = {
+                        0x4d,0x1f,0xa7,0xcb,0xae,0x04,0xb7,0xdb,
+                        0x36,0x68,0x9f,0x45,0x39,0xd4,0x5f,0xf8,
+                        0xe0,0x1c,0x72,0xa7,0xc8,0x34,0x1e,0x76,
+                        0x22,0x24,0xf2,0xa7,0x6a,0x67,0x0b,0x9a
+                    };
+                    if (memcmp(sha_digest, expected, 32) == 0)
+                        printf("      SHA-256 MATCH — kernel stream identical to Joni's successful downgrade\n\n");
+                    else
+                        printf("      SHA-256 MISMATCH (expected only for 1.05->1.04 --patch; other fw pairs will differ)\n\n");
+                }
+            } else {
+                printf("\n");
             }
         }
 
-        /* Flat layout per Joni's capture: three sequential chunks covering full 0x11200 file */
-        printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");
-        if (st != 0) goto fail;
-        Sleep(2);
+        if (g_pre_cutoff) {
+            printf("      hdr:  FE off=0x000000 len=0x0200 (file[0x0000..0x01FF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
+            if (st != 0) goto fail;
+            Sleep(2);
 
-        printf("      cmd2: FE off=0x008000 len=0x8000 (file[0x8000..0xFFFF])\n");
-        st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8000, 0x8000, "kernel_chunk2");
-        if (st != 0) goto fail;
-        Sleep(2);
+            printf("      cmd1: FE off=0x001200 len=0x8000 (file[0x1200..0x91FF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
+            if (st != 0) goto fail;
+            Sleep(2);
 
-        if (kernel_size >= 0x11200) {
-            printf("      cmd3: FE off=0x010000 len=0x1200 (file[0x10000..0x111FF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x010000, kernel_data + 0x10000, 0x1200, "kernel_chunk3");
+            printf("      cmd2: FE off=0x009200 len=0x8000 (file[0x9200..0x111FF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
             if (st != 0) goto fail;
         } else {
-            printf("      cmd3: skipped (kernel file < 0x11200 bytes)\n");
+            printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");
+            if (st != 0) goto fail;
+            Sleep(2);
+
+            printf("      cmd2: FE off=0x008000 len=0x8000 (file[0x8000..0xFFFF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8000, 0x8000, "kernel_chunk2");
+            if (st != 0) goto fail;
+            Sleep(2);
+
+            if (kernel_size >= 0x11200) {
+                printf("      cmd3: FE off=0x010000 len=0x1200 (file[0x10000..0x111FF])\n");
+                st = xf_write_buffer(0x07, 0xFE, 0x010000, kernel_data + 0x10000, 0x1200, "kernel_chunk3");
+                if (st != 0) goto fail;
+            } else {
+                printf("      cmd3: skipped (kernel file < 0x11200 bytes)\n");
+            }
         }
         printf("      OK\n\n");
     }

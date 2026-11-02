@@ -9276,10 +9276,10 @@ static int cmd_crossflash(void)
             int sha_i;
             sha256_init(&sha_ctx);
             if (g_pre_cutoff) {
-                sha256_update(&sha_ctx, kernel_data + 0x0000, 0x0200);
-                sha256_update(&sha_ctx, kernel_data + 0x1200, 0x8000);
-                sha256_update(&sha_ctx, kernel_data + 0x9200, 0x8000);
-                printf("      Pre-flight SHA-256 (pre-cutoff stream, 0x10400 bytes):\n");
+                /* Flat layout, cmd1+cmd2 only (cmd3 skipped — hw boundary at 0x010000) */
+                sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
+                sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
+                printf("      Pre-flight SHA-256 (pre-cutoff stream, 0x10000 bytes, cmd3 skipped):\n");
             } else {
                 sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
                 sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
@@ -9312,19 +9312,23 @@ static int cmd_crossflash(void)
         }
 
         if (g_pre_cutoff) {
-            printf("      hdr:  FE off=0x000000 len=0x0200 (file[0x0000..0x01FF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x0200, "kernel_hdr");
+            /* Pre-cutoff drive: use flat layout but stop before offset 0x010000.
+               Hardware rejects WRITE BUFFER at offset >= 0x010000 (04/4C/01).
+               cmd3 (the 0x1200-byte trailer) lives at offset 0x010000 in the
+               flat layout — we skip it.  The drive validates the kernel image
+               from what it received; if it needs that trailing sector it will
+               reject the commit, but the old invented header+body layout was
+               also failing, so this is the next thing to try. */
+            printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");
             if (st != 0) goto fail;
             Sleep(2);
 
-            printf("      cmd1: FE off=0x001200 len=0x8000 (file[0x1200..0x91FF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x001200, kernel_data + 0x1200, 0x8000, "kernel_body1");
+            printf("      cmd2: FE off=0x008000 len=0x8000 (file[0x8000..0xFFFF])\n");
+            st = xf_write_buffer(0x07, 0xFE, 0x008000, kernel_data + 0x8000, 0x8000, "kernel_chunk2");
             if (st != 0) goto fail;
-            Sleep(2);
 
-            printf("      cmd2: FE off=0x009200 len=0x8000 (file[0x9200..0x111FF])\n");
-            st = xf_write_buffer(0x07, 0xFE, 0x009200, kernel_data + 0x9200, 0x8000, "kernel_body2");
-            if (st != 0) goto fail;
+            printf("      cmd3: SKIPPED (pre-cutoff drive rejects offset >= 0x010000)\n");
         } else {
             printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
             st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");

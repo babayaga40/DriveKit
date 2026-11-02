@@ -8,6 +8,7 @@ Combined optical drive & storage research toolkit for Windows and Linux, targeti
 - DriveKit successfully performed a **pre-cutoff → post-cutoff upgrade** on a **Pioneer BDR-XD07U (SAT 8D31 / ID05)**: 1.04 → 1.06, using the new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.06.
 - DriveKit successfully performed a **post-cutoff → pre-cutoff downgrade**: post-cutoff firmware → 1.04 (patched kernel, `--patch`). Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.04.
 - DriveKit successfully performed a **post-cutoff → post-cutoff same-era flash**: 1.06 → 1.05 using the same new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.05.
+- Added **`scankey`**, an offline scanner that extracts the update-entry unlock key directly from decoded Normal firmware. It recovered the known XD07 key and flagged a conflicting entry for `S8800601.153`.
 
 All three results are verified on tested hardware; not a claim of universal compatibility.
 
@@ -57,6 +58,10 @@ H8S/2600 assembly: CMP.L #0x9a782361:32, ER0
 DriveKit stores keys as little-endian DWORD values (`0x6123789A`) which produce the correct wire bytes (`9A 78 23 61`) when sent LE.
 
 **Key selection is protocol- and drive-dependent.** The universal key (`0x6123789A`, wire bytes `9A 78 23 61`) has been used successfully on previously tested SAT 9330/9331 paths. In the verified BDR-XD07U SAT 8D31 / ID05 downgrade, **both unlock and commit** used `0xFF8A27B1` (wire bytes `B1 27 8A FF`). Do not assume the universal key applies to every `crossflash` path; compare the selected model/key and the complete 256-byte trigger payload with a known-good capture.
+
+**Firmware-derived update-entry key detection (`scankey`):** The scanner examines *decoded Normal firmware* for a recognized H8S/2600 acceptance-handler instruction pattern, follows its branch displacement to a key-comparison instruction, and extracts the embedded four-byte key. The recognition method is based on MattJackson's content-derived receiver-control analysis. This is **not** the Normal firmware decryption key. The extracted bytes are reported in wire order and as a little-endian DWORD. The scanner requires an unambiguous keyed-handler match; a matching pattern does not by itself prove a flash protocol is safe for the target drive. See [scankey command](#scankey-command).
+
+**Important key-table audit:** On decoded `S8800601.153`, `scankey` found `94 E0 F2 5C` (LE DWORD `0x5CF2E094`), while the existing table selected `0x6123789A`. This is a **discrepancy**, not yet a hardware-validated replacement for that drive/protocol. The old value corresponds to the fixed four-byte immediate `9A 78 23 61` within the acceptance signature; this makes accidental extraction of that signature constant a plausible explanation worth auditing, but does not invalidate all other previously successful uses of `0x6123789A`. Verify against a known-good capture before flashing.
 
 **Pre vs post-cutoff detection:** DriveKit probes ordinary `READ BUFFER 0xB0` access before the special `hwdump` trigger sequence:
 - Returns data → **pre-cutoff** drive (before 2022-12-27) — H8S/2600 code visible
@@ -241,7 +246,9 @@ DriveKit maintains internal lookup tables for Pioneer drive IDs, platform and ke
 
 For supported drive/protocol combinations, DriveKit automatically selects the model string and the appropriate unlock or execution-trigger key. Key selection is **drive- and protocol-dependent**; unlock and commit keys are not necessarily interchangeable. The `--key` override is intended for advanced research and testing, not routine flashing.
 
-For the verified BDR-XD07U **SAT 8D31 / ID05** crossflash procedure, both unlock and commit used the LE DWORD `0xFF8A27B1`, transmitted as `B1 27 8A FF`. This is a verified example, **not** a universal Pioneer key.
+For the verified BDR-XD07U **SAT 8D31 / ID05** crossflash procedure, both unlock and commit used the LE DWORD `0xFF8A27B1`, transmitted as `B1 27 8A FF`. Offline `scankey` analysis of decoded XD07 Normal 1.06 independently recovered this same key at offset `0x3BFEC`. This is a verified example, **not** a universal Pioneer key.
+
+The key table should be treated as a cross-check rather than the sole source of truth when a decoded Normal image is available. `scankey` reports mismatches instead of silently replacing table values; the extracted key still needs hardware/capture validation for a new model or protocol.
 
 ---
 
@@ -315,6 +322,48 @@ drivekit <command> <drive_letter> [options]
 | `patchfw` | Patch firmware ASCII header to spoof version |
 | `decryptkernel` | Decode KernelFront XOR/rotate cipher on a Pioneer H8S kernel file; outputs raw plaintext body for IDA analysis. `--patch` additionally flips the generation marker (`0xFF→0x01`) and recomputes the body checksum |
 | `decodenormal` | Decrypt normal firmware envelope; reports UHD capability |
+| **`scankey`** | **Scan a decoded Normal firmware body for its update-entry unlock key; cross-check the internal key table** |
+
+### scankey command
+
+Extract the **update-entry unlock key** from a *decoded* Pioneer Normal firmware body. No optical drive is required and no firmware is written. Decode the Normal firmware first with `decodenormal` if necessary.
+
+```powershell
+.\drivekit scankey --file xd07_normal_106.bin_decoded.bin
+.\drivekit scankey --file S8800601.153_decoded.bin
+```
+
+**XD07 Normal 1.06 — recovered key agrees with the known working ID05 key:**
+
+```text
+Keyed handler matches        : 1
+Acceptance signature offset  : 0x3BFD6
+Key comparison offset        : 0x3BFEA
+Key bytes offset             : 0x3BFEC
+Reject branch variant        : 10-byte
+Unlock key (wire order)      : B1 27 8A FF
+Unlock key (LE DWORD)        : 0xFF8A27B1
+Cross-check: matches key-table entry  : OK
+```
+
+**`S8800601.153` — discrepancy detected:**
+
+```text
+scankey: S8800601.153_decoded.bin  (1858816 bytes = 0x1C5D00)
+
+Keyed handler matches        : 1
+Acceptance signature offset  : 0x3BBD4
+Key comparison offset        : 0x3BBE4
+Key bytes offset             : 0x3BBE6
+Reject branch variant        : 10-byte
+Unlock key (wire order)      : 94 E0 F2 5C
+Unlock key (LE DWORD)        : 0x5CF2E094
+
+WARNING: extracted key 0x5CF2E094 differs from key-table entry 0x6123789A
+         Verify against a known-good capture before flashing.
+```
+
+The scanner identifies a recognizable **keyed update-entry handler** in the decoded firmware, not an arbitrary four-byte match. The extracted key is distinct from the cipher key used to decode Normal firmware. A single unambiguous match is strong static evidence of the embedded comparison value, but does not establish that the target drive accepts a particular unlock/commit payload. **Do not automatically flash using a newly extracted key without checking the descriptor, protocol, and known-good captures.** A missing key-table entry is different from a mismatch.
 
 ### flash command (recommended)
 
@@ -463,6 +512,7 @@ year letter (N=2022, O=2023, P=2024...)
 
 ## Pending Research
 
+- **Audit unlock-key table entries with `scankey`:** investigate the `S8800601.153` mismatch (`0x5CF2E094` extracted vs `0x6123789A` in the table); validate new keys against captures/hardware and check for accidental use of the fixed acceptance-signature immediate.
 - **Generalize the verified post→pre downgrade** beyond the tested BDR-XD07U SAT 8D31 / ID05 and 1.04 kernel; validate marker/checksum locations and transfer behavior for other kernel families before claiming support.
 - **Standalone `decryptkernel --patch` verification:** ensure it patches decoded **byte** offset `0xFE`, not DWORD index `0xFE`; distinguish decoded 64 KiB output from the encrypted `0x11200`-byte flashable kernel.
 - **H8S/2600 version-check analysis:** continue studying pre/post-cutoff `hwdump` captures to understand the underlying validation logic rather than relying only on observed protocol behavior.
@@ -574,7 +624,7 @@ DriveKit displays this as `AACS ver` in drive information.
 
 **Heisenberg** — Wireshark/USBPcap captures including the SAT 8D31 / ID05 1.04 → 1.06 upgrade used to verify the four-transfer Kernel layout and nonzero tail; capture analysis for SAT 9331; trigger key extraction from Pioneer updater EXEs; development support and testing throughout. Huge thanks — this tool would not exist without you.
 
-**MattJackson (Matthew Jackson)** — The main coder behind the decryption algorithms. Decrypted the kernel file and identified the patch locations required for a successful downgrade below version lock. Shared his code openly and has been invaluable in helping everyone with problems. ([GitHub](https://github.com/MattJackson)) ([cdrinfo.pl profile](https://forum.cdrinfo.pl/members/112645.html))
+**MattJackson (Matthew Jackson)** — The main coder behind the decryption algorithms and the content-derived update-entry handler/key recognition approach used by `scankey`. Decrypted the kernel file and identified the patch locations required for a successful downgrade below version lock. Shared his code openly and has been invaluable in helping everyone with problems. ([GitHub](https://github.com/MattJackson)) ([cdrinfo.pl profile](https://forum.cdrinfo.pl/members/112645.html))
 
 **MrPenguin** — H8S/2600 deep firmware analysis, rolling XOR cipher reverse engineering, BDR-S12U pypcode/Ghidra analysis, unlock key endianness clarification, `0xB0` READ BUFFER disassembly, and ongoing technical guidance invaluable throughout this project.
 

@@ -8603,6 +8603,109 @@ static int cmd_flash(void)
      SAT 8B30  (XD06U)  key=0x08A98AF2  model="PIONEER BDR-XS06"
      Universal fallback  key=0x6123789A  model="PIONEER BDR-BDS8"
    ========================================================= */
+
+/* =========================================================
+   Minimal self-contained SHA-256 (FIPS 180-4).
+   Used to verify kernel transfer payload before sending to drive.
+   ========================================================= */
+typedef struct {
+    DWORD  state[8];
+    DWORD  count[2];   /* bit count lo/hi */
+    UCHAR  buf[64];
+} SHA256_CTX;
+
+static const DWORD sha256_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,
+    0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
+    0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,
+    0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,
+    0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
+    0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,
+    0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,
+    0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
+    0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+#define SHA256_ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+#define SHA256_CH(x,y,z)  (((x)&(y))^(~(x)&(z)))
+#define SHA256_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
+#define SHA256_EP0(x) (SHA256_ROR(x,2)^SHA256_ROR(x,13)^SHA256_ROR(x,22))
+#define SHA256_EP1(x) (SHA256_ROR(x,6)^SHA256_ROR(x,11)^SHA256_ROR(x,25))
+#define SHA256_SIG0(x)(SHA256_ROR(x,7)^SHA256_ROR(x,18)^((x)>>3))
+#define SHA256_SIG1(x)(SHA256_ROR(x,17)^SHA256_ROR(x,19)^((x)>>10))
+
+static void sha256_transform(SHA256_CTX *ctx, const UCHAR *data)
+{
+    DWORD a,b,c,d,e,f,g,h,t1,t2,m[64];
+    int i;
+    for (i=0;i<16;i++)
+        m[i]=((DWORD)data[i*4]<<24)|((DWORD)data[i*4+1]<<16)|
+             ((DWORD)data[i*4+2]<<8)|(DWORD)data[i*4+3];
+    for (;i<64;i++)
+        m[i]=SHA256_SIG1(m[i-2])+m[i-7]+SHA256_SIG0(m[i-15])+m[i-16];
+    a=ctx->state[0];b=ctx->state[1];c=ctx->state[2];d=ctx->state[3];
+    e=ctx->state[4];f=ctx->state[5];g=ctx->state[6];h=ctx->state[7];
+    for (i=0;i<64;i++){
+        t1=h+SHA256_EP1(e)+SHA256_CH(e,f,g)+sha256_K[i]+m[i];
+        t2=SHA256_EP0(a)+SHA256_MAJ(a,b,c);
+        h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
+    }
+    ctx->state[0]+=a;ctx->state[1]+=b;ctx->state[2]+=c;ctx->state[3]+=d;
+    ctx->state[4]+=e;ctx->state[5]+=f;ctx->state[6]+=g;ctx->state[7]+=h;
+}
+
+static void sha256_init(SHA256_CTX *ctx)
+{
+    ctx->count[0]=ctx->count[1]=0;
+    ctx->state[0]=0x6a09e667;ctx->state[1]=0xbb67ae85;
+    ctx->state[2]=0x3c6ef372;ctx->state[3]=0xa54ff53a;
+    ctx->state[4]=0x510e527f;ctx->state[5]=0x9b05688c;
+    ctx->state[6]=0x1f83d9ab;ctx->state[7]=0x5be0cd19;
+}
+
+static void sha256_update(SHA256_CTX *ctx, const UCHAR *data, DWORD len)
+{
+    DWORD i, used, free;
+    used = (ctx->count[0] >> 3) & 0x3F;
+    free = 64 - used;
+    ctx->count[0] += len << 3;
+    if (ctx->count[0] < (len << 3)) ctx->count[1]++;
+    ctx->count[1] += len >> 29;
+    if (len >= free) {
+        memcpy(ctx->buf + used, data, free);
+        sha256_transform(ctx, ctx->buf);
+        for (i = free; i + 64 <= len; i += 64)
+            sha256_transform(ctx, data + i);
+        used = 0;
+        memcpy(ctx->buf, data + i, len - i);
+    } else {
+        memcpy(ctx->buf + used, data, len);
+    }
+}
+
+static void sha256_final(SHA256_CTX *ctx, UCHAR digest[32])
+{
+    DWORD used = (ctx->count[0] >> 3) & 0x3F;
+    ctx->buf[used++] = 0x80;
+    if (used > 56) {
+        memset(ctx->buf + used, 0, 64 - used);
+        sha256_transform(ctx, ctx->buf);
+        used = 0;
+    }
+    memset(ctx->buf + used, 0, 56 - used);
+    ctx->buf[56]=(UCHAR)(ctx->count[1]>>24);ctx->buf[57]=(UCHAR)(ctx->count[1]>>16);
+    ctx->buf[58]=(UCHAR)(ctx->count[1]>>8); ctx->buf[59]=(UCHAR)(ctx->count[1]);
+    ctx->buf[60]=(UCHAR)(ctx->count[0]>>24);ctx->buf[61]=(UCHAR)(ctx->count[0]>>16);
+    ctx->buf[62]=(UCHAR)(ctx->count[0]>>8); ctx->buf[63]=(UCHAR)(ctx->count[0]);
+    sha256_transform(ctx, ctx->buf);
+    { int i; for(i=0;i<8;i++){
+        digest[i*4]=(UCHAR)(ctx->state[i]>>24);digest[i*4+1]=(UCHAR)(ctx->state[i]>>16);
+        digest[i*4+2]=(UCHAR)(ctx->state[i]>>8);digest[i*4+3]=(UCHAR)(ctx->state[i]);
+    }}
+}
+
 static int cmd_crossflash(void)
 {
     UCHAR  trigger[256];
@@ -9178,6 +9281,46 @@ static int cmd_crossflash(void)
        ------------------------------------------------------- */
     printf("[3/5] Kernel (FE flat sequential, 3 chunks matching Joni's sequence)...\n");
     {
+        /* Pre-flight: hash the exact bytes about to be sent, in transfer order.
+           Expected SHA-256 for a 1.05→1.04 downgrade (--patch applied):
+             4d1fa7cbae04b7db36689f4539d45ff8e01c72a7c8341e762224f2a76a670b9a
+           A mismatch before the first USB write means the kernel file is wrong;
+           abort rather than flash a bad kernel. */
+        {
+            SHA256_CTX sha_ctx;
+            UCHAR sha_digest[32];
+            int sha_i;
+            DWORD expected_kernel_send_len = 0x8000 + 0x8000 + 0x1200; /* 0x11200 */
+            sha256_init(&sha_ctx);
+            sha256_update(&sha_ctx, kernel_data + 0x0000, 0x8000);
+            sha256_update(&sha_ctx, kernel_data + 0x8000, 0x8000);
+            if (kernel_size >= 0x11200)
+                sha256_update(&sha_ctx, kernel_data + 0x10000, 0x1200);
+            sha256_final(&sha_ctx, sha_digest);
+            printf("      Pre-flight kernel stream SHA-256 (%lu bytes):\n",
+                   (unsigned long)expected_kernel_send_len);
+            printf("        ");
+            for (sha_i = 0; sha_i < 32; sha_i++) printf("%02x", sha_digest[sha_i]);
+            printf("\n");
+            printf("      Expected (1.05->1.04 --patch):\n");
+            printf("        4d1fa7cbae04b7db36689f4539d45ff8e01c72a7c8341e762224f2a76a670b9a\n");
+            {
+                static const UCHAR expected[32] = {
+                    0x4d,0x1f,0xa7,0xcb,0xae,0x04,0xb7,0xdb,
+                    0x36,0x68,0x9f,0x45,0x39,0xd4,0x5f,0xf8,
+                    0xe0,0x1c,0x72,0xa7,0xc8,0x34,0x1e,0x76,
+                    0x22,0x24,0xf2,0xa7,0x6a,0x67,0x0b,0x9a
+                };
+                if (memcmp(sha_digest, expected, 32) == 0) {
+                    printf("      SHA-256 MATCH — kernel stream identical to Joni's successful downgrade\n\n");
+                } else {
+                    printf("      SHA-256 MISMATCH — kernel stream differs from Joni's reference\n");
+                    printf("      This does not necessarily mean the flash will fail (different fw pair),\n");
+                    printf("      but for a 1.05->1.04 downgrade with --patch this should match exactly.\n\n");
+                }
+            }
+        }
+
         /* cmd1: kernel_data[0x0000..0x7FFF] → NAND offset 0x000000 */
         printf("      cmd1: FE off=0x000000 len=0x8000 (file[0x0000..0x7FFF])\n");
         st = xf_write_buffer(0x07, 0xFE, 0x000000, kernel_data + 0x0000, 0x8000, "kernel_chunk1");

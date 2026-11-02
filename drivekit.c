@@ -9449,21 +9449,13 @@ static int cmd_crossflash(void)
         DWORD commit_key = key_le; /* default: same as unlock key (current drive's key) */
 
         if (g_pre_cutoff && target_is_postcut) {
-            /* pre→post cross-era: try the TARGET era key (ID35) for commit.
-               BDRFlash's commit key table is indexed by target fw version, not
-               source drive era — so for a post-cutoff target the commit key should
-               be the post-cutoff key, not the pre-cutoff unlock key.
-               Previous "confirmed by pcapng" note was for 9330/9331 family;
-               the 8D31 may differ. */
-            DWORD tgt_key = pioneer_key_lookup(g_driveID, "ID35");
-            if (tgt_key) {
-                commit_key = tgt_key;
-                printf("      Cross-era (pre→post): using TARGET post-cutoff key=0x%08lX (ID35)\n",
-                       commit_key);
-            } else {
-                printf("      Cross-era (pre→post): no ID35 key for driveID=0x%04lX — using unlock key=0x%08lX\n",
-                       (DWORD)g_driveID, commit_key);
-            }
+            /* pre→post cross-era: use the SAME key as the unlock payload.
+               Joni's USBPcap of BDRFlash confirms: commit key = unlock key,
+               NOT the target era's key.  key_le is already set to the current
+               drive's kernel key (e.g. ID05 = 0xFF8A27B1 for 8D31).
+               Previous ID35 override was wrong — reverted. */
+            printf("      Cross-era (pre→post): commit key = unlock key 0x%08lX (pcapng confirmed)\n",
+                   commit_key);
         } else if (!g_pre_cutoff && !target_is_postcut && target_kern_id[0]) {
             /* post→pre downgrade: try TARGET era key for commit.
                Hypothesis: drive finalizes with the key matching the newly-written

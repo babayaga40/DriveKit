@@ -590,5 +590,6 @@ Research and educational purposes only.
          /__\
         /\  /\
        /__\/__\
-   Razor 1911 - Since 1985
+   RAZOR 1911 — SINCE 1985
+   Still making hardware do things it wasn't supposed to do.
 ```

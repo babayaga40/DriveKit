@@ -7647,12 +7647,14 @@ static int cmd_patchfw(void)
    scan_kernel_body() — inspect a decrypted 64 KiB KernelFront body.
 
    Fills *out_marker  with the generation marker byte at body offset 0xFE.
-   Fills *out_uhd     with 1 if the UHD-capability signature is present,
-                      0 otherwise.
-
-   The 24-byte UHD signature (SIG0 from Pioneer's body analyser) is present
-   in every UHD-capable H8S/2600 kernel body and in no other.
+   NOTE: UHD capability is NOT detected from the kernel body.
+         Use scan_normal_fw_uhd() on the normal firmware envelope instead.
    ------------------------------------------------------- */
+
+/* 24-byte UHD capability signature (SIG0).
+   Present in the decoded normal firmware plaintext of UHD-capable drives.
+   Found at offset 0x1738FC in S8D31051.104 (BDR-XD07U v1.04) decoded body.
+   NOT present in the kernel body — kernel scans will always report No. */
 static const UCHAR KF_UHD_SIG[24] = {
     0x5E, 0x40, 0x83, 0xB8, 0x7A, 0x00, 0x41, 0x00,
     0x03, 0x89, 0x01, 0x00, 0x6F, 0xE0, 0x00, 0xC4,
@@ -7669,16 +7671,82 @@ static void scan_kernel_body(const UCHAR *body, DWORD body_len,
         return;
 
     *out_marker = body[0xFE];
+    /* UHD detection intentionally removed — SIG0 lives in normal firmware,
+       not the kernel body.  Call scan_normal_fw_uhd() for UHD detection. */
+    (void)out_uhd;
+}
 
-    if (body_len >= 24) {
+/* -------------------------------------------------------
+   scan_normal_fw_uhd() — decrypt a normal firmware envelope and check
+   for the 24-byte UHD capability signature (SIG0).
+
+   Normal firmware envelope layout:
+     [0x000 : 0x200 ]  512-byte ASCII header
+     [0x200 : 0x10200]  64 KiB key table  (16384 LE DWORDs)
+     [0x10200 :      ]  ciphertext  (same XOR/ROR32 cipher as kernel)
+
+   The decoded plaintext starts with "PIONEER " and SIG0 is present
+   somewhere in the body of every UHD-capable drive firmware.
+
+   Returns 1 if SIG0 found, 0 otherwise (also 0 on bad input).
+   ------------------------------------------------------- */
+static int scan_normal_fw_uhd(const UCHAR *normal_data, DWORD normal_size)
+{
+    UCHAR  *plain = NULL;
+    DWORD   ct_bytes, ct_dwords, di;
+    int     found = 0;
+
+    if (!normal_data || normal_size < 0x10204)
+        return 0;
+
+    ct_bytes  = normal_size - 0x10200;
+    ct_dwords = ct_bytes / 4;
+    if (ct_dwords == 0)
+        return 0;
+
+    plain = (UCHAR*)malloc(ct_dwords * 4);
+    if (!plain)
+        return 0;
+
+    /* Key table: 16384 LE DWORDs at file[0x200..0x10200]
+       Cipher:    plain[i] = ROR32(ct[i] XOR key[i % 16384], key[i % 16384] & 31) */
+    {
+        const UCHAR *key_bytes = normal_data + 0x200;
+        const UCHAR *ct_bytes_ptr = normal_data + 0x10200;
+        for (di = 0; di < ct_dwords; di++) {
+            DWORD ki = di % 16384;
+            DWORD k  = (DWORD)key_bytes[ki*4    ]
+                     | ((DWORD)key_bytes[ki*4 + 1] <<  8)
+                     | ((DWORD)key_bytes[ki*4 + 2] << 16)
+                     | ((DWORD)key_bytes[ki*4 + 3] << 24);
+            DWORD ct = (DWORD)ct_bytes_ptr[di*4    ]
+                     | ((DWORD)ct_bytes_ptr[di*4 + 1] <<  8)
+                     | ((DWORD)ct_bytes_ptr[di*4 + 2] << 16)
+                     | ((DWORD)ct_bytes_ptr[di*4 + 3] << 24);
+            DWORD pt  = ror32(ct ^ k, (int)(k & 31));
+            plain[di*4    ] = (UCHAR)(pt      );
+            plain[di*4 + 1] = (UCHAR)(pt >>  8);
+            plain[di*4 + 2] = (UCHAR)(pt >> 16);
+            plain[di*4 + 3] = (UCHAR)(pt >> 24);
+        }
+    }
+
+    /* Scan decoded plaintext for SIG0 */
+    {
+        DWORD plain_len = ct_dwords * 4;
         DWORD i;
-        for (i = 0; i <= body_len - 24; i++) {
-            if (memcmp(body + i, KF_UHD_SIG, 24) == 0) {
-                *out_uhd = 1;
-                break;
+        if (plain_len >= 24) {
+            for (i = 0; i <= plain_len - 24; i++) {
+                if (memcmp(plain + i, KF_UHD_SIG, 24) == 0) {
+                    found = 1;
+                    break;
+                }
             }
         }
     }
+
+    free(plain);
+    return found;
 }
 
 /* Decrypt a KernelFront payload into a caller-supplied 0x10000-byte buffer.
@@ -7708,8 +7776,12 @@ static int kf_decrypt_body(const UCHAR *key_bytes, const UCHAR *enc_bytes,
     return 1;
 }
 
-/* Print a one-line kernel capability summary (used before and after flash). */
-static void print_kernel_caps(const UCHAR *kf_file, DWORD kf_size, const char *label)
+/* Print a one-line kernel capability summary (used before and after flash).
+   Pass normal_data/normal_size for UHD detection (scans decoded normal
+   firmware envelope).  Either may be NULL/0 to skip UHD detection. */
+static void print_kernel_caps(const UCHAR *kf_file, DWORD kf_size,
+                               const UCHAR *normal_data, DWORD normal_size,
+                               const char *label)
 {
     UCHAR marker = 0xFF;
     int   uhd    = 0;
@@ -7722,6 +7794,10 @@ static void print_kernel_caps(const UCHAR *kf_file, DWORD kf_size, const char *l
             free(plain);
         }
     }
+
+    /* UHD capability lives in the normal firmware body, not the kernel */
+    if (normal_data && normal_size >= 0x10204)
+        uhd = scan_normal_fw_uhd(normal_data, normal_size);
 
     printf("  %s  Gen: %s (0x%02X)  UHD: %s\n",
            label,
@@ -8775,8 +8851,8 @@ static int cmd_crossflash(void)
         }
     }
 
-    /* Pre-flash capability snapshot */
-    print_kernel_caps(kernel_data, kernel_size, "Before:");
+    /* Pre-flash capability snapshot (normal fw not yet loaded — UHD shown after) */
+    print_kernel_caps(kernel_data, kernel_size, NULL, 0, "Before:");
 
     /* -------------------------------------------------------
        KernelFront auto-detect, patch and re-encrypt (in-place)
@@ -9469,19 +9545,22 @@ static int cmd_crossflash(void)
     {
         UCHAR after_marker = 0xFF;
         int   after_uhd    = 0;
-        UCHAR before_marker = 0xFF;
-        int   before_uhd    = 0;
 
+        /* Generation marker comes from the kernel body */
         if (kernel_size >= 0x11200) {
             UCHAR *plain = (UCHAR*)malloc(0x10000);
             if (plain) {
                 /* Scan what we actually sent (already patched + re-encrypted
                    in kernel_data if --patch was used) */
+                int dummy_uhd = 0;
                 kf_decrypt_body(kernel_data + 0x200, kernel_data + 0x1200, plain);
-                scan_kernel_body(plain, 0x10000, &after_marker, &after_uhd);
+                scan_kernel_body(plain, 0x10000, &after_marker, &dummy_uhd);
                 free(plain);
             }
         }
+
+        /* UHD capability is in the normal firmware body, not the kernel */
+        after_uhd = scan_normal_fw_uhd(normal_data, normal_size);
 
         printf("  After:   Gen: %s (0x%02X)  UHD: %s\n",
                (after_marker == 0x01) ? "New" : "Old",

@@ -9251,17 +9251,7 @@ static int cmd_crossflash(void)
     } /* end !g_nounlock */
 
     /* -------------------------------------------------------
-       STEP 2: FIRST FIRMWARE PASS
-       mode=0x07 bufID=0xF0, 0x8000-byte chunks
-       ------------------------------------------------------- */
-    printf("[2/5] Firmware pass...\n");
-    st = xf_send_normal_fw(normal_data, normal_size, 1);
-    if (st != 0) goto fail;
-    printf("\n");
-    Sleep(500);
-
-    /* -------------------------------------------------------
-       STEP 3: KERNEL TRANSFER
+       STEP 2: KERNEL TRANSFER
        Layout depends on drive era — pre-cutoff drives reject writes
        at offset >= 0x010000 (04/4C/01), so they use the old header+body
        layout which stays within that boundary.
@@ -9276,7 +9266,7 @@ static int cmd_crossflash(void)
          cmd1: FE offset=0x001200 len=0x8000  (file[0x1200..0x91FF])
          cmd2: FE offset=0x009200 len=0x8000  (file[0x9200..0x111FF])
        ------------------------------------------------------- */
-    printf("[3/5] Kernel transfer (%s)...\n",
+    printf("[2/5] Kernel transfer (%s)...\n",
            g_pre_cutoff ? "pre-cutoff layout" : "Joni's flat layout");
     {
         /* Pre-flight SHA-256: hash bytes in exact transfer order */
@@ -9359,10 +9349,19 @@ static int cmd_crossflash(void)
     Sleep(200);
 
     /* -------------------------------------------------------
+       STEP 3: NORMAL FIRMWARE PASS
+       Joni's capture order: unlock → kernel → normal → wait → commit
+       mode=0x07 bufID=0xF0, 0x8000-byte chunks
+       ------------------------------------------------------- */
+    printf("[3/5] Firmware pass...\n");
+    st = xf_send_normal_fw(normal_data, normal_size, 1);
+    if (st != 0) goto fail;
+    printf("\n");
+    Sleep(500);
+
+    /* -------------------------------------------------------
        STEP 4: INTERNAL VALIDATION WAIT
-       Joni's capture: one fw pass, then ~13s wait, then commit.
-       No second fw pass — for any drive era.
-       The second pass was suspected to corrupt drive state before commit.
+       Joni's capture: ~13s between normal fw and commit.
        ------------------------------------------------------- */
     {
         printf("[4/5] Waiting 13000ms for drive to validate images...\n");

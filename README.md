@@ -4,6 +4,107 @@
 
 Combined optical drive & storage research toolkit for Windows and Linux, targeting Pioneer BD-R/BD-RE optical drives. All functionality is bundled into a single binary, with the operation selected via a command-line subcommand.
 
+---
+
+## 🚀 Quick Start — Flashing Firmware
+
+This section covers the most common operations. Read the [Risk](#️-risk) section first.
+
+### Step 1 — Find your drive
+
+```
+drivekit info E
+```
+
+This shows the drive model, current firmware version, firmware date, platform (e.g. `SAT 8D31`), and kernel ID (e.g. `ID05`). The drive letter (`E`) is whatever Windows assigned — check Device Manager if unsure. On Linux use `/dev/sgX`.
+
+> **Important:** Always verify the correct drive letter before running any flash command. Flashing the wrong drive is not recoverable.
+
+### Step 2 — Get the firmware files
+
+Pioneer firmware packages contain two files:
+- **Kernel** — a small file (e.g. `S8D31050.104`, typically ~70 KB)
+- **Normal** — the main firmware body (e.g. `S8D31051.104`, typically ~1.8 MB)
+
+The filename convention is `S<platform><type><version>`:
+- `S8D31` = platform SAT 8D31
+- `050` = Kernel file, `051` = Normal file
+- `104` = firmware version 1.04
+
+Firmware files are not distributed with DriveKit — source them from Pioneer's official updater packages or community archives.
+
+### Step 3 — Flash
+
+```
+drivekit flash E --file S8D31050.104 --file2 S8D31051.104
+```
+
+DriveKit auto-detects the drive era, firmware era, and selects the correct flash protocol. You will be asked to confirm before anything is written.
+
+**Downgrade with UHD patch** (POST→PRE, keeps UHD capability):
+```
+drivekit flash E --file S8D31050.104 --file2 S8D31051.104 --patch
+```
+
+Use `--patch` when downgrading a UHD-capable drive to pre-cutoff firmware. It flips the generation marker byte in the kernel so UHD playback remains enabled.
+
+**Drive already in kernel mode** (stuck showing firmware `0000`):
+```
+drivekit flash E --file S8D31050.104 --file2 S8D31051.104 --nounlock
+```
+
+Use `--nounlock` when the drive is already in kernel/service mode from a previous failed flash. DriveKit skips the unlock step and flashes directly. Make sure the kernel file matches the kernel ID the drive is running (check with `drivekit info`).
+
+### Step 4 — Wait
+
+After the commit trigger is sent and the drive responds GOOD, **do not touch the drive for at least 20 seconds**. The drive is performing its internal reflash. Interrupting power at this point can brick the drive.
+
+When the LED stops blinking, power-cycle the drive (unplug and replug USB, or restart the PC for internal drives), then run `drivekit info E` again to confirm the new firmware version.
+
+---
+
+## Protocol Auto-Detection
+
+DriveKit selects the flash protocol automatically based on two things:
+
+| Drive era | Target firmware era | Protocol used |
+|-----------|-------------------|---------------|
+| PRE-cutoff | PRE-cutoff | Single-pass (kernel + normal) |
+| PRE-cutoff | POST-cutoff | 4-transfer upgrade layout |
+| POST-cutoff | PRE-cutoff | 3-chunk flat kernel + downgrade layout |
+| POST-cutoff | POST-cutoff | 4-transfer upgrade layout |
+
+**Drive era** is detected by probing `READ BUFFER 0xB0` — pre-cutoff drives respond, post-cutoff drives return an error.
+
+**Firmware era** is detected by decrypting the first 12 DWORDs of the Normal firmware body and checking byte `[0x28]` — `0x01` = post-cutoff (new layout), `0xFF` = pre-cutoff (old layout). This is more reliable than the date string in the header.
+
+The cutoff date is **2022-12-27** — firmware generated before this date uses the old protocol; firmware after uses the new layout.
+
+---
+
+## Troubleshooting
+
+**Drive shows firmware `0000` / stuck in kernel mode**
+
+The drive entered kernel mode (e.g. after a failed flash or unlock) and didn't return. Use `--nounlock` to flash directly without a second unlock attempt. Make sure you use a kernel file whose Kernel Version matches what the drive reports — a mismatched kernel ID causes a silent failure where the drive stays in `0000`.
+
+**Flash completes but firmware version didn't change**
+
+The commit trigger returned GOOD but the drive's internal flash rejected the write. Most common causes:
+- Wrong kernel ID for this drive (check the kernel header's `Kernel Version` field)
+- Wrong flash protocol for the drive/firmware combination (DriveKit auto-detects, but `--nounlock` bypasses the drive era probe — double-check the drive era in this case)
+- Power interrupted during the internal reflash window
+
+**`04/4C/02` error (HARDWARE ERROR / LOGICAL UNIT FAILED SELF-CONFIGURATION)**
+
+The drive rejected the commit. Usually means wrong protocol was used for the drive/firmware combination. If you used `flashfw` instead of `flash`, switch to `flash` — `flashfw` does not implement the 4-transfer new layout needed for post-cutoff firmware.
+
+**PRE→PRE cross-family warning**
+
+If you see a warning about PRE→PRE cross-family flash (different SAT platform on drive vs firmware), the flash will still proceed. This path is untested. If the drive ends up in kernel mode, power-cycle and retry with a firmware file that matches the drive's platform.
+
+---
+
 **November 2026 milestones:**
 - DriveKit successfully performed a **pre-cutoff → post-cutoff upgrade** on a **Pioneer BDR-XD07U (SAT 8D31 / ID05)**: 1.04 → 1.06, using the new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.06.
 - DriveKit successfully performed a **post-cutoff → pre-cutoff downgrade**: post-cutoff firmware → 1.04 (patched kernel, `--patch`). Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.04.

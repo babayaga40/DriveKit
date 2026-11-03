@@ -5051,11 +5051,10 @@ static void print_help(void)
     printf("  unlock        Pioneer service mode unlock (auto session token)\n");
     printf("  hwdump        Enable 0xB0 dump on both pre/post-cutoff drives\n");
     printf("                  Dumps H8S/2600 kernel code to hwdump_b0.bin\n");
-    printf("  flash         AUTO-DETECT pre/post-cutoff and flash (RECOMMENDED)\n");
-    printf("                  --file kernel.bin --file2 normal.bin\n");
-    printf("  flashfw       Legacy flash command (use 'flash' instead)\n");
-    printf("  crossflash    Post-cutoff downgrade/crossflash (direct, no auto-detect)\n");
-    printf("                  --file kernel.bin --file2 normal.bin [--key 0xAA475E15]\n");
+    printf("  flash         Flash firmware (all eras/families, auto-detects protocol)\n");
+    printf("                  --file kernel.bin --file2 normal.bin [--key 0xKEY]\n");
+    printf("                  [--nounlock]  skip unlock (drive already in kernel mode)\n");
+    printf("  flashfw       Recovery flash for kernel-mode drives (use 'flash' instead)\n");
     printf("  flashinfo     Show flash-relevant drive info (model string, key, platform)\n");
     printf("  xordiff       XOR two encrypted firmware files to find version bytes\n");
     printf("                  --file fw_new.bin --file2 fw_old.bin\n");

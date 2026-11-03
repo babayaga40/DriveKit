@@ -5597,21 +5597,28 @@ static int cmd_flashfw(void)
                     fw2_ver[k] = (char)fw_prepass[0x90+k];
                 fw2_ver[k] = 0;
             }
+            /* Generated Date: display only */
+            char fw_date[12] = {0};
             UCHAR *gd = (UCHAR*)memmem_win(fw_prepass, scan, "Generated Date", 14);
             if (gd) {
                 UCHAR *col = (UCHAR*)memchr(gd, ':', 32);
                 if (col) {
-                    char fw_date[12] = {0};
                     col += 2;
                     for (k = 0; k < 10 && col[k] >= 0x20 && col[k] != 0x0D; k++)
                         fw_date[k] = col[k];
                     for (k = 9; k >= 0 && fw_date[k] == ' '; k--) fw_date[k] = 0;
-                    fw2_postcut = (strcmp(fw_date, "22/12/27") >= 0);
-                    printf("  Target FW: version=%s  Date=%s → %s\n",
-                           fw2_ver[0] ? fw2_ver : "?",
-                           fw_date,
-                           fw2_postcut ? "POST-CUTOFF" : "PRE-CUTOFF");
                 }
+            }
+            /* Layout discriminator: byte at plaintext offset 0x28 of decoded body.
+               Matches bdrflashpp2 sub_14006B9D0 exactly. */
+            {
+                UCHAR layout_byte = normal_fw_layout_byte(fw_prepass, (DWORD)fp_pre_sz);
+                fw2_postcut = (layout_byte == 0x01);
+                printf("  Target FW: version=%s  Date=%s  layout_byte[0x28]=0x%02X → %s\n",
+                       fw2_ver[0] ? fw2_ver : "?",
+                       fw_date[0] ? fw_date : "?",
+                       layout_byte,
+                       fw2_postcut ? "POST-CUTOFF (new layout)" : "PRE-CUTOFF (old layout)");
             }
         }
 

@@ -9856,7 +9856,7 @@ static int cmd_crossflash(void)
                Header: updater sends a transformed 0x200 bytes (session-specific?),
                but drive accepts the plain ASCII header from the file unchanged.
                Confirmed working: plain header → SCSI GOOD → commit GOOD. */
-        printf("[3/5] Kernel transfer (4-xfer upgrade layout, ID05 confirmed)...\n");
+        printf("[3/5] Kernel transfer (4-xfer upgrade layout)...\n");
         {
             SHA256_CTX sha_ctx; UCHAR sha_digest[32]; int sha_i;
             sha256_init(&sha_ctx);

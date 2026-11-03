@@ -10020,6 +10020,8 @@ static int cmd_crossflash(void)
                (char*)commit_trigger, commit_key);
         printf("      Payload hex[0x00..0x1F]: ");
         { int _pi; for (_pi=0;_pi<0x20;_pi++) printf("%02X ",commit_trigger[_pi]); printf("\n"); }
+        printf("      Sending commit trigger — drive may take up to 30s to respond...\n");
+        fflush(stdout);
         st = xf_write_buffer(0x05, 0xFF, 0x000000, commit_trigger, 0x100, "commit_trigger");
         printf("      Status: %s\n\n", st == 0 ? "GOOD" : "FAIL");
         if (st == 0) {

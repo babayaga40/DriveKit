@@ -5086,7 +5086,7 @@ static void print_help(void)
     printf("Examples:\n");
     printf("  drivekit info G\n");
     printf("  drivekit unlock G\n");
-    printf("  drivekit flashfw G --file S9330360.102 --file2 S9330361.101 --nounlock\n");
+    printf("  drivekit flash G --file S9330360.102 --file2 S9330361.101 --patch --nounlock\n");
     printf("  drivekit rawdump G --bufid 0xB0\n");
     printf("  drivekit dumpfw G --file firmware_dump.bin\n");
     printf("  drivekit sendcdb G 3B 05 FF 00 00 00 00 01 00 00\n\n");

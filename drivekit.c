@@ -7748,6 +7748,67 @@ static int normal_fw_probe_layout(const UCHAR *data, DWORD size,
 }
 
 /* -------------------------------------------------------
+   normal_fw_layout_byte() — decrypt the normal firmware body and return
+   the layout discriminator byte at plaintext offset 0x28.
+
+   This is the same byte Joni's bdrflashpp2 reads (sub_14006B9D0) to
+   decide between the "new layout" 4-xfer flat-kernel protocol and the
+   old 3-chunk protocol:
+     0x01 → new layout (post-cutoff XD series)
+     0xFF → old layout (pre-cutoff or SAT 8800/8801 family)
+
+   Returns the byte value, or 0xFF on error (conservative: treat as old).
+   ------------------------------------------------------- */
+static UCHAR normal_fw_layout_byte(const UCHAR *normal_data, DWORD normal_size)
+{
+    UCHAR  *plain = NULL;
+    DWORD   key_start = 0, ct_start = 0;
+    DWORD   ct_dwords, di;
+    UCHAR   result = 0xFF;  /* default: old layout */
+
+    if (!normal_data || normal_size < 0x10204)
+        return 0xFF;
+
+    if (!normal_fw_probe_layout(normal_data, normal_size, &key_start, &ct_start))
+        return 0xFF;
+
+    /* We only need the first 0x30 bytes of plaintext to read offset 0x28.
+       Decrypt just enough dwords (12 = 0x30 bytes). */
+    ct_dwords = (normal_size - ct_start) / 4;
+    if (ct_dwords < 12)
+        return 0xFF;
+
+    plain = (UCHAR*)malloc(12 * 4);
+    if (!plain)
+        return 0xFF;
+
+    {
+        const UCHAR *key_bytes    = normal_data + key_start;
+        const UCHAR *ct_bytes_ptr = normal_data + ct_start;
+        for (di = 0; di < 12; di++) {
+            DWORD ki = di % 16384;
+            DWORD k  = (DWORD)key_bytes[ki*4    ]
+                     | ((DWORD)key_bytes[ki*4 + 1] <<  8)
+                     | ((DWORD)key_bytes[ki*4 + 2] << 16)
+                     | ((DWORD)key_bytes[ki*4 + 3] << 24);
+            DWORD ct = (DWORD)ct_bytes_ptr[di*4    ]
+                     | ((DWORD)ct_bytes_ptr[di*4 + 1] <<  8)
+                     | ((DWORD)ct_bytes_ptr[di*4 + 2] << 16)
+                     | ((DWORD)ct_bytes_ptr[di*4 + 3] << 24);
+            DWORD pt  = ror32(ct ^ k, (int)(k & 31));
+            plain[di*4    ] = (UCHAR)(pt      );
+            plain[di*4 + 1] = (UCHAR)(pt >>  8);
+            plain[di*4 + 2] = (UCHAR)(pt >> 16);
+            plain[di*4 + 3] = (UCHAR)(pt >> 24);
+        }
+    }
+
+    result = plain[0x28];
+    free(plain);
+    return result;
+}
+
+/* -------------------------------------------------------
    scan_normal_fw_uhd() — decrypt a normal firmware envelope and check
    for the 24-byte UHD capability signature (SIG0).
 
@@ -9413,22 +9474,33 @@ static int cmd_crossflash(void)
             target_fw_version[k] = 0;
         }
 
-        /* Generated Date: text-search in header block */
+        /* Generated Date: text-search in header block (display only) */
+        char fw_date[12] = {0};
         UCHAR *gd = (UCHAR*)memmem_win(p, scan, "Generated Date", 14);
         if (gd) {
             UCHAR *col = (UCHAR*)memchr(gd, ':', 32);
             if (col) {
-                char fw_date[12] = {0};
                 col += 2;
                 for (k = 0; k < 10 && col[k] >= 0x20 && col[k] != 0x0D; k++)
                     fw_date[k] = col[k];
                 for (k = 9; k >= 0 && fw_date[k] == ' '; k--) fw_date[k] = 0;
-                target_is_postcut = (strcmp(fw_date, "22/12/27") >= 0);
-                printf("  Target FW   : version=%s  Generated Date=%s → %s\n",
-                       target_fw_version[0] ? target_fw_version : "?",
-                       fw_date,
-                       target_is_postcut ? "POST-CUTOFF" : "PRE-CUTOFF");
             }
+        }
+
+        /* Layout discriminator: byte at plaintext offset 0x28 of decoded normal body.
+           This is the exact check Joni's bdrflashpp2 uses (sub_14006B9D0):
+             0x01 → new layout (post-cutoff XD-series, 4-xfer flat-kernel protocol)
+             0xFF → old layout (pre-cutoff or SAT 8800/8801 family, 3-chunk protocol)
+           The Generated Date is NOT reliable cross-family: SAT 8800/8801 drives can
+           have Generated Dates >= 22/12/27 but still use the old protocol. */
+        {
+            UCHAR layout_byte = normal_fw_layout_byte(normal_data, normal_size);
+            target_is_postcut = (layout_byte == 0x01);
+            printf("  Target FW   : version=%s  Generated Date=%s  layout_byte[0x28]=0x%02X → %s\n",
+                   target_fw_version[0] ? target_fw_version : "?",
+                   fw_date[0] ? fw_date : "?",
+                   layout_byte,
+                   target_is_postcut ? "POST-CUTOFF (new layout)" : "PRE-CUTOFF (old layout)");
         }
     }
     printf("\n");

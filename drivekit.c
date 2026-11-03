@@ -5440,12 +5440,16 @@ static int cmd_flashfw(void)
     /* Ask user to dump firmware before flashing */
     {
         int do_dump = 0;
-        if (!g_force) {
+        if (!g_force && !g_nounlock) {
+            /* Skip dump prompt when drive is in kernel mode — firmware is 0000,
+               nothing useful to dump, and 0xF4 may not be accessible. */
             printf("  Do you want to dump current firmware before flashing? [Y/n]: ");
             fflush(stdout);
             char ans[8] = {0};
             fgets(ans, sizeof(ans), stdin);
             if (ans[0] != 'n' && ans[0] != 'N') do_dump = 1;
+        } else if (g_nounlock) {
+            printf("  Firmware dump skipped (--nounlock, drive in kernel mode)\n\n");
         }
 
         if (do_dump) {
@@ -5519,7 +5523,7 @@ static int cmd_flashfw(void)
         }
         printf("\n");
     }
-    {
+    if (!g_nounlock) {
         UCHAR cdb[10] = {0x46,0x00,0,0,0,0,0,0x01,0x00,0};
         UCHAR buf[256];
         UCHAR sense2[SENSE_SIZE];
@@ -5538,6 +5542,8 @@ static int cmd_flashfw(void)
         } else {
             printf("  No disc - OK\n\n");
         }
+    } else {
+        printf("  Disc check skipped (--nounlock, drive in kernel mode)\n\n");
     }
 
     /* Probe READ BUFFER 0xB0 to detect pre-cutoff drive.
@@ -6007,8 +6013,9 @@ static int cmd_flashfw(void)
         }
     }
 
-    /* Wait for drive ready */
-    if (!g_skip_checks) {
+    /* Wait for drive ready — skip when --nounlock: drive is in kernel mode
+       and will never pass TUR; proceeding directly is correct. */
+    if (!g_skip_checks && !g_nounlock) {
         int attempt;
         int consecutive = 0;
         printf("[0a/3] Checking drive ready...\n");

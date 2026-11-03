@@ -68,13 +68,13 @@ drivekit flash E --file S8D31050.104 --file2 S8D31051.104
 
 DriveKit auto-detects both the drive era and the firmware era, then selects the correct protocol. You will be asked to confirm before anything is written. **Eject any disc before flashing.**
 
-### Downgrade with UHD patch (POST→PRE, keeps UHD capability)
+### Downgrade from post-cutoff to pre-cutoff firmware
 
 ```
 drivekit flash E --file S8D31050.104 --file2 S8D31051.104 --patch
 ```
 
-Use `--patch` when downgrading a UHD-capable drive to pre-cutoff firmware. Without it, the drive will lose UHD playback capability after the downgrade. The patch flips a single generation marker byte in the kernel and recomputes the body checksum before sending.
+Use `--patch` when flashing pre-cutoff firmware onto a post-cutoff drive. Without it, the drive will reject the kernel. The patch flips the generation marker byte in the kernel so the drive accepts it, and recomputes the body checksum before sending.
 
 ### Recovery flash — drive stuck in kernel mode (firmware shows `0000`)
 
@@ -160,25 +160,21 @@ sudo drivekit info /dev/sg1
 
 ---
 
-## UHD Playback and the Generation Marker
+## The Generation Marker and `--patch`
 
-Pioneer post-cutoff firmware (after 2022-12-27) disables UHD playback on drives that previously supported it. The generation marker at byte `0xFE` in the decrypted kernel body controls this:
+Pioneer kernel files contain a generation marker byte at `0xFE` in the decrypted kernel body:
 
-- `0xFF` = old/pre-cutoff generation, UHD disabled
-- `0x01` = new/post-cutoff generation, UHD enabled on supported hardware
+- `0xFF` = pre-cutoff generation
+- `0x01` = post-cutoff generation
 
-When downgrading a UHD-capable drive to pre-cutoff firmware, use `--patch` to flip this byte from `0xFF` to `0x01` and re-encrypt the kernel before flashing. DriveKit also recomputes the body checksum automatically so the patched kernel passes the drive's integrity check.
-
-`--patch` has no effect on drives that don't have UHD hardware capability (e.g. BDR-XD07, which is not a UHD drive).
+When flashing pre-cutoff firmware onto a post-cutoff drive, the drive checks this marker and will reject a kernel where it doesn't match expectations. `--patch` flips this byte from `0xFF` to `0x01` and re-encrypts the kernel before sending, allowing the drive to accept the pre-cutoff firmware. DriveKit also recomputes the body checksum automatically.
 
 ---
 
-## Pre-cutoff firmware versions with UHD capability
+## Last pre-cutoff firmware versions
 
-| Drive | Last safe pre-cutoff version | Date |
-|-------|----------------------------|------|
+| Drive | Last pre-cutoff version | Date |
+|-------|------------------------|------|
 | BDR-XD08U | 1.01 | 2022-10-11 |
 | BDR-XD07U | 1.04 | 2022-05-31 |
 | BDR-XD06U | 1.11 | — |
-
-These are the last firmware versions before Pioneer's post-cutoff update. Downgrading to one of these (with `--patch`) restores UHD playback on supported hardware.

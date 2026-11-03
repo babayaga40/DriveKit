@@ -9178,8 +9178,9 @@ static int cmd_crossflash(void)
     int    st = 0;
     DWORD  i;
     int    target_is_postcut = 0;   /* 1 if target firmware Generated Date >= 22/12/27 */
-    char   target_fw_version[8] = {0}; /* version string from target firmware header e.g. "1.06" */
-    char   target_kern_id[8]    = {0}; /* kernel ID from kernel file header e.g. "ID05" */
+    char   target_fw_version[8]  = {0}; /* version string from target firmware header e.g. "1.06" */
+    char   target_kern_id[8]     = {0}; /* kernel ID from kernel file header e.g. "ID05" */
+    char   target_hw_platform[16] = {0}; /* hardware platform from normal FW offset 0xB0 e.g. "SAT 8800" */
 
     /* Build trigger payload using same auto-detect as flashfw */
     UCHAR auto_payload[256] = {0};
@@ -9488,6 +9489,13 @@ static int cmd_crossflash(void)
             target_fw_version[k] = 0;
         }
 
+        /* Hardware platform at fixed offset 0xB0 (e.g. "SAT 8800", "SAT 8801") */
+        if (normal_size > 0xB0 + 16) {
+            for (k = 0; k < 15 && p[0xB0+k] >= 0x20 && p[0xB0+k] < 0x7F; k++)
+                target_hw_platform[k] = (char)p[0xB0+k];
+            target_hw_platform[k] = 0;
+        }
+
         /* Generated Date: text-search in header block (display only) */
         char fw_date[12] = {0};
         UCHAR *gd = (UCHAR*)memmem_win(p, scan, "Generated Date", 14);
@@ -9609,6 +9617,25 @@ static int cmd_crossflash(void)
         printf("  Cross-era flash: PRE-CUTOFF drive → POST-CUTOFF firmware\n");
         printf("  Commit trigger uses unlock key=0x%08lX (confirmed by pcapng)\n", key_le);
         printf("  (BDRFlash confirmed: this combination works)\n");
+        printf("\n");
+    }
+
+    /* PRE-CUTOFF → PRE-CUTOFF cross-family warning.
+       Same-family PRE→PRE works (tested: SAT 8800 v1.54→v1.53 downgrade).
+       Cross-family PRE→PRE (e.g. SAT 8800 drive + SAT 8801 firmware) is
+       untested — Matt's offline router classifies it as SoftNo (Future adapter
+       needed).  We don't block it, but warn so the user knows what they're doing.
+       Drive platform comes from the unlock payload model string; target platform
+       from the normal firmware header at offset 0xB0. */
+    if (g_pre_cutoff && !target_is_postcut &&
+        target_hw_platform[0] && model_str[0] &&
+        strncmp(target_hw_platform, model_str, 8) != 0) {
+        printf("  WARNING: PRE-CUTOFF cross-family flash detected.\n");
+        printf("    Drive platform : %s\n", model_str);
+        printf("    Target FW      : %s\n", target_hw_platform);
+        printf("    This path is untested. Flash may fail silently.\n");
+        printf("    If drive stays in kernel mode after commit:\n");
+        printf("      power-cycle and retry with matching firmware.\n");
         printf("\n");
     }
 

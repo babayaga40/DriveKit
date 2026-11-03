@@ -127,6 +127,7 @@ static int   cmd_probef0(void);
 static int   cmd_flashfw(void);
 static int   cmd_flashfw_precut(void);
 static int   cmd_flash_legacy(void);
+static UCHAR normal_fw_layout_byte(const UCHAR *normal_data, DWORD normal_size);
 static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);   /* renamed to "flash" on CLI */
 static int   cmd_decodenormal(void);

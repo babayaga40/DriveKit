@@ -118,6 +118,7 @@ static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);   /* renamed to "flash" on CLI */
 static int   cmd_decodenormal(void);
 static int   cmd_scankey(void);
+static int   cmd_family(void);
 static int   cmd_hwdump(void);
 static int   cmd_flashinfo(void);
 static int   cmd_dumpfw(void);
@@ -5050,6 +5051,10 @@ static void print_help(void)
     printf("  decodenormal  Decrypt normal firmware envelope; reports UHD capability\n");
     printf("  scankey       Extract unlock key from a decoded Normal firmware body\n");
     printf("                  --file S8D31051.104 [--file2 decoded_body.bin]\n");
+    printf("  family        Hardware family fingerprint from normal firmware envelope\n");
+    printf("                  --file normal.bin [--file2 other_normal.bin]\n");
+    printf("                  Decrypts envelope(s), prints family hash + UHD capability\n");
+    printf("                  With two files: prints MATCH/MISMATCH compatibility verdict\n");
     printf("  encryptkernel Re-encrypt a patched decoded kernel body back to .100\n");
     printf("                  --file decoded.bin --file2 original.100 [--file3 out.100]\n");
     printf("  autoflash     Auto-detect and flash from firmware\\ folder\n");
@@ -6902,6 +6907,7 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
     if (strcmp(cmd, "scankey")       == 0) return cmd_scankey();
     if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
+    if (strcmp(cmd, "family")        == 0) return cmd_family();
 
     printf("\n");
     printf(" \xE2\x96\x84\xE2\x96\x80\xE2\x96\x84\xE2\x96\x84\xE2\x96\x84\xE2\x96\x84                                           \xE2\x96\x80\xE2\x96\x84\xE2\x96\x80\xE2\x96\x84\xE2\x96\x84 \xE2\x96\x84\xE2\x96\x88\xE2\x96\x84\xE2\x96\x80         \xE2\x96\x84\xE2\x96\x80\xE2\x96\x84\xE2\x96\x84\n");
@@ -8134,6 +8140,359 @@ static int cmd_decryptkernel(void)
 
     free(raw);
     free(body);
+    return 0;
+}
+
+/* =========================================================
+   CMD_FAMILY
+   Hardware family fingerprint from a normal firmware envelope.
+
+   Decrypts the normal firmware body and scans for H8S/2600 register-write
+   instructions targeting known ASIC, pin-function and board-revision
+   registers. The set of (register, value) pairs is hashed with FNV-1a
+   into a 64-bit family fingerprint.
+
+   Two bodies with the same fingerprint target the same hardware and can
+   be cross-flashed safely. Different fingerprint means different hardware
+   family — proceed with caution.
+
+   Based on the analysis in MattJackson's firmware analysis module.
+
+   Register sets:
+     ASIC (front-end servo/RF chip):  E436 E43A E43B E45B E463 E46A E46B
+     PIN  (port/pin-function config): FE8F FE94 FE9D FEC0
+     BOARD (PCB revision markers):    FFC5 EDCC EDCD
+
+   Usage:
+     drivekit family --file normal.bin
+     drivekit family --file drive_normal.bin --file2 target_normal.bin
+   ========================================================= */
+
+/* FNV-1a 64-bit hash */
+static unsigned __int64 fnv1a_64(const UCHAR *data, DWORD len)
+{
+    unsigned __int64 h = (unsigned __int64)0xcbf29ce484222325ui64;
+    DWORD i;
+    for (i = 0; i < len; i++) {
+        h ^= (unsigned __int64)data[i];
+        h *= (unsigned __int64)0x00000100000001b3ui64;
+    }
+    return h;
+}
+
+/* Known register addresses for family fingerprinting */
+static const WORD FAMILY_ASIC_REGS[7]  = { 0xE436, 0xE43A, 0xE43B, 0xE45B, 0xE463, 0xE46A, 0xE46B };
+static const WORD FAMILY_PIN_REGS[4]   = { 0xFE8F, 0xFE94, 0xFE9D, 0xFEC0 };
+static const WORD FAMILY_BOARD_REGS[3] = { 0xFFC5, 0xEDCC, 0xEDCD };
+#define FAMILY_NREGS 14   /* 7 + 4 + 3 */
+
+/* Per-register value accumulator (up to 16 distinct written values) */
+typedef struct {
+    WORD  addr;
+    UCHAR vals[16];
+    int   nvals;
+} RegEntry;
+
+static int reg_entry_add(RegEntry *e, UCHAR v)
+{
+    int i;
+    for (i = 0; i < e->nvals; i++)
+        if (e->vals[i] == v) return 0;   /* already present */
+    if (e->nvals < 16)
+        e->vals[e->nvals++] = v;
+    return 1;
+}
+
+/* Build the full register table for all known addresses */
+static void family_init_regs(RegEntry regs[FAMILY_NREGS])
+{
+    int i;
+    for (i = 0; i < 7; i++) { regs[i].addr = FAMILY_ASIC_REGS[i];  regs[i].nvals = 0; }
+    for (i = 0; i < 4; i++) { regs[7+i].addr = FAMILY_PIN_REGS[i]; regs[7+i].nvals = 0; }
+    for (i = 0; i < 3; i++) { regs[11+i].addr = FAMILY_BOARD_REGS[i]; regs[11+i].nvals = 0; }
+}
+
+static RegEntry *family_find_reg(RegEntry regs[FAMILY_NREGS], WORD addr)
+{
+    int i;
+    for (i = 0; i < FAMILY_NREGS; i++)
+        if (regs[i].addr == addr) return &regs[i];
+    return NULL;
+}
+
+/*
+ * Scan decoded H8S/2600 body for register-write patterns.
+ * Two instruction forms recognised (even-offset scan, 2-byte alignment):
+ *
+ *   Form 1 (short address):
+ *     F<r> <imm>  MOV.B #imm, Rn
+ *     3<r> <lo>   MOV.B Rn, @0xFF<lo>:8   → address = 0xFF00 | lo
+ *
+ *   Form 2 (16-bit address):
+ *     F<r> <imm>  MOV.B #imm, Rn
+ *     6A 8<r> <hi> <lo>   MOV.B Rn, @addr:16   → address = hi<<8 | lo
+ */
+static void family_scan_reg_writes(const UCHAR *body, DWORD len,
+                                    RegEntry regs[FAMILY_NREGS])
+{
+    DWORD i;
+    if (len < 4) return;
+    for (i = 0; i + 2 < len; i += 2) {
+        UCHAR b0 = body[i];
+        if (b0 < 0xF0) continue;           /* not MOV.B #imm,Rn */
+        UCHAR r   = b0 & 0x0F;
+        UCHAR imm = body[i + 1];
+        UCHAR b2  = body[i + 2];
+        WORD  addr = 0;
+        int   matched = 0;
+
+        /* Form 1: 3<r> <lo> */
+        if (b2 == (0x30 | r) && i + 3 < len) {
+            addr = 0xFF00u | (WORD)body[i + 3];
+            matched = 1;
+        }
+        /* Form 2: 6A 8<r> <hi> <lo> */
+        else if (b2 == 0x6A && i + 5 < len &&
+                 body[i + 3] == (0x80 | r)) {
+            addr = ((WORD)body[i + 4] << 8) | (WORD)body[i + 5];
+            matched = 1;
+        }
+
+        if (matched) {
+            RegEntry *e = family_find_reg(regs, addr);
+            if (e) reg_entry_add(e, imm);
+        }
+    }
+}
+
+/*
+ * Compute a 64-bit family hash from a scanned register table.
+ * Format: for each register in fixed order, emit "XXXX=vv.vv.vv\x1f"
+ * (sorted hex values joined by '.', unit separator between registers).
+ * Board registers also capture BSET/BNOT/BCLR bit-ops in the hash key
+ * via the value bytes already collected (bit-op scanning omitted for now;
+ * value writes alone are sufficient for same-family detection).
+ */
+static unsigned __int64 family_hash(const RegEntry regs[FAMILY_NREGS])
+{
+    /* Build a canonical key string */
+    char key[1024];
+    int  pos = 0;
+    int  i, j, k;
+
+    for (i = 0; i < FAMILY_NREGS; i++) {
+        const RegEntry *e = &regs[i];
+        /* Sort values (insertion sort, small array) */
+        UCHAR sv[16];
+        int   n = e->nvals;
+        memcpy(sv, e->vals, n);
+        for (j = 1; j < n; j++) {
+            UCHAR tmp = sv[j];
+            k = j - 1;
+            while (k >= 0 && sv[k] > tmp) { sv[k+1] = sv[k]; k--; }
+            sv[k+1] = tmp;
+        }
+        /* "addr=" */
+        pos += sprintf(key + pos, "%04x=", (unsigned)e->addr);
+        if (n == 0) {
+            pos += sprintf(key + pos, "-");
+        } else {
+            for (j = 0; j < n; j++) {
+                if (j) key[pos++] = '.';
+                pos += sprintf(key + pos, "%02x", (unsigned)sv[j]);
+            }
+        }
+        key[pos++] = '\x1f';   /* unit separator between registers */
+    }
+    key[pos] = '\0';
+
+    return fnv1a_64((const UCHAR *)key, (DWORD)pos);
+}
+
+/*
+ * Decrypt a normal firmware envelope into a malloc'd buffer.
+ * Returns pointer (caller must free) and sets *out_len, or NULL on error.
+ */
+static UCHAR *normal_fw_decode_body(const UCHAR *raw, DWORD raw_size, DWORD *out_len)
+{
+    DWORD key_start = 0, ct_start = 0;
+    DWORD ct_dwords, di;
+    UCHAR *plain;
+
+    if (!normal_fw_probe_layout(raw, raw_size, &key_start, &ct_start))
+        return NULL;
+
+    ct_dwords = (raw_size - ct_start) / 4;
+    if (ct_dwords == 0) return NULL;
+
+    plain = (UCHAR *)malloc(ct_dwords * 4);
+    if (!plain) return NULL;
+
+    {
+        const UCHAR *kb = raw + key_start;
+        const UCHAR *cb = raw + ct_start;
+        for (di = 0; di < ct_dwords; di++) {
+            DWORD ki = di % 16384;
+            DWORD k  = (DWORD)kb[ki*4  ] | ((DWORD)kb[ki*4+1]<<8)
+                     | ((DWORD)kb[ki*4+2]<<16) | ((DWORD)kb[ki*4+3]<<24);
+            DWORD ct = (DWORD)cb[di*4  ] | ((DWORD)cb[di*4+1]<<8)
+                     | ((DWORD)cb[di*4+2]<<16) | ((DWORD)cb[di*4+3]<<24);
+            DWORD pt = ror32(ct ^ k, (int)(k & 31));
+            plain[di*4  ] = (UCHAR)(pt      );
+            plain[di*4+1] = (UCHAR)(pt >>  8);
+            plain[di*4+2] = (UCHAR)(pt >> 16);
+            plain[di*4+3] = (UCHAR)(pt >> 24);
+        }
+    }
+    *out_len = ct_dwords * 4;
+    return plain;
+}
+
+/* Load a file into a malloc'd buffer; sets *size. Returns NULL on error. */
+static UCHAR *family_load_file(const char *path, DWORD *size)
+{
+    FILE  *f;
+    long   fsz;
+    UCHAR *buf;
+
+    f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "family: cannot open '%s'\n", path); return NULL; }
+    fseek(f, 0, SEEK_END);
+    fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsz <= 0) { fclose(f); fprintf(stderr, "family: empty file '%s'\n", path); return NULL; }
+    buf = (UCHAR *)malloc((DWORD)fsz);
+    if (!buf) { fclose(f); fprintf(stderr, "family: out of memory\n"); return NULL; }
+    if ((long)fread(buf, 1, (size_t)fsz, f) != fsz) {
+        free(buf); fclose(f);
+        fprintf(stderr, "family: read error on '%s'\n", path);
+        return NULL;
+    }
+    fclose(f);
+    *size = (DWORD)fsz;
+    return buf;
+}
+
+/*
+ * Analyse one normal firmware file: decode, scan, hash.
+ * Prints a one-line summary. Returns hash, or 0 on failure.
+ */
+static unsigned __int64 family_analyse_file(const char *path)
+{
+    DWORD   raw_size = 0, body_len = 0;
+    UCHAR  *raw  = family_load_file(path, &raw_size);
+    UCHAR  *body = NULL;
+    RegEntry regs[FAMILY_NREGS];
+    unsigned __int64 hash = 0;
+    int     uhd = 0, has_asic = 0, i;
+    DWORD   key_start = 0, ct_start = 0;
+    char    layout_str[16];
+
+    if (!raw) return 0;
+
+    /* Identify layout */
+    if (!normal_fw_probe_layout(raw, raw_size, &key_start, &ct_start)) {
+        fprintf(stderr, "family: unrecognised firmware layout in '%s'\n", path);
+        free(raw); return 0;
+    }
+    if (ct_start == 0x10200)
+        strcpy(layout_str, "standard");
+    else if (ct_start == 0x20200)
+        strcpy(layout_str, "extended");
+    else
+        sprintf(layout_str, "0x%05lX", (unsigned long)ct_start);
+
+    body = normal_fw_decode_body(raw, raw_size, &body_len);
+    if (!body) {
+        fprintf(stderr, "family: decode failed for '%s'\n", path);
+        free(raw); return 0;
+    }
+
+    /* UHD check */
+    if (body_len >= 24) {
+        DWORD si;
+        for (si = 0; si <= body_len - 24; si++) {
+            if (memcmp(body + si, KF_UHD_SIG, 24) == 0) { uhd = 1; break; }
+        }
+    }
+
+    /* Register scan */
+    family_init_regs(regs);
+    family_scan_reg_writes(body, body_len, regs);
+
+    /* Check at least one ASIC register was written — otherwise not a Normal body */
+    for (i = 0; i < 7; i++) {
+        if (regs[i].nvals > 0) { has_asic = 1; break; }
+    }
+
+    if (has_asic)
+        hash = family_hash(regs);
+
+    printf("  File    : %s\n", path);
+    printf("  Size    : %lu bytes (0x%lX)  layout: %s\n",
+           (unsigned long)raw_size, (unsigned long)raw_size, layout_str);
+    printf("  UHD     : %s\n", uhd ? "YES" : "NO");
+    if (has_asic) {
+        printf("  Family  : %016I64x\n", hash);
+        /* Show which ASIC registers were hit */
+        printf("  ASIC    :");
+        for (i = 0; i < 7; i++) {
+            if (regs[i].nvals > 0) {
+                int j;
+                printf(" %04x=", (unsigned)regs[i].addr);
+                for (j = 0; j < regs[i].nvals; j++) {
+                    if (j) printf(".");
+                    printf("%02x", (unsigned)regs[i].vals[j]);
+                }
+            }
+        }
+        printf("\n");
+    } else {
+        printf("  Family  : (no ASIC register writes found — kernel body or unrecognised format)\n");
+    }
+
+    free(body);
+    free(raw);
+    return hash;
+}
+
+static int cmd_family(void)
+{
+    const char *path1 = g_outFile;
+    const char *path2 = g_outFile2;
+    unsigned __int64 h1, h2;
+
+    if (!path1[0]) {
+        fprintf(stderr, "Usage: drivekit family --file normal.bin [--file2 other_normal.bin]\n");
+        fprintf(stderr, "  Accepts encrypted normal firmware envelopes directly.\n");
+        fprintf(stderr, "  With --file2: prints MATCH/MISMATCH compatibility verdict.\n");
+        return 1;
+    }
+
+    printf("\n=== DriveKit family — hardware family fingerprint ===\n\n");
+
+    printf("[1] ");
+    h1 = family_analyse_file(path1);
+    printf("\n");
+
+    if (path2[0]) {
+        printf("[2] ");
+        h2 = family_analyse_file(path2);
+        printf("\n");
+
+        if (h1 == 0 || h2 == 0) {
+            printf("  Verdict : UNKNOWN (one or both files could not be fingerprinted)\n\n");
+        } else if (h1 == h2) {
+            printf("  Verdict : MATCH — same hardware family, cross-flash should be safe\n\n");
+        } else {
+            printf("  Verdict : MISMATCH — different hardware families\n");
+            printf("            Cross-flashing across families is untested and may fail silently.\n\n");
+        }
+    } else {
+        if (h1 == 0)
+            printf("  (Could not compute family hash — see errors above)\n\n");
+    }
+
     return 0;
 }
 

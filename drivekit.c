@@ -1,42 +1,28 @@
 /*
- * drivekit.c  —  v15
- * Combined optical drive & storage research toolkit.
- * All tools in one binary, selected via command line arguments.
+ * DriveKit v1.0
+ * Optical Drive Research Toolkit
  *
- * v15 changes (2026-10-28):
- *   - cmd_flashfw: implement BDRFlash two-pass normal-FW protocol for
- *     pre-cutoff → post-cutoff cross-era flash (confirmed by USBPcap):
- *       pass1 (fwsize-0x10000) before kernel, pass2 (full) after kernel
- *   - cmd_flashfw: remove tkey substitution at commit trigger — for pre-cutoff
- *     drives, commit key = unlock key for BOTH same-era and cross-era.
- *     tkey hypothesis was WRONG; root cause of 04/4C/02 was wrong pass order.
- *   - cmd_crossflash: same commit-key fix.
- *   - 04/4C/02 error message updated to reflect correct diagnosis.
+ * Copyright (c) 2026 Eivind Schjerven
  *
- * Compile: cl.exe drivekit.c
- * Run as Administrator.
+ * An open-source optical drive & storage research toolkit, currently
+ * developed for Windows, with Linux support planned.
  *
- * Usage:
- *   drivekit <command> <drive_letter> [options]
+ * Primarily targeting Pioneer BD-R/BD-RE optical drives.
  *
- * Commands:
- *   inquiry          Read drive firmware version and identity
- *   hwdump           Dump H8S/2600 kernel from RAM via 0xB0
- *   probef0          Probe READ BUFFER IDs 0xF0-0xFF
- *   rawdump          Raw READ BUFFER dump (use --bufid 0xF4 etc)
- *   unlock           Pioneer RS8801 service mode unlock
- *   probevendor      Probe vendor-specific opcodes 0xC0-0xFF
+ * All functionality is bundled into a single binary, with operations
+ * selected via command-line subcommands.
  *
- * Options:
- *   --bufid 0xF4     Buffer ID for rawdump (default 0xF4)
- *   --file  name     Input/output filename override
- *   --help           Show this help
+ * Licensed under the MIT License. See LICENSE for the full license text.
  *
- * Examples:
- *   drivekit inquiry E
- *   drivekit rawdump E --bufid 0xFE
- *   drivekit probef0 E
- *   drivekit unlock E
+ * Anyone may use, study, modify, distribute, and incorporate this code
+ * into their own projects, including commercial projects, without
+ * requesting permission, subject to the MIT License terms.
+ *
+ * Build (Windows): cl.exe drivekit.c
+ * Run with Administrator privileges.
+ *
+ * For commands, usage instructions, research findings, and contributor
+ * credits, see README.md.
  */
 
 #include <windows.h>

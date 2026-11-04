@@ -442,21 +442,80 @@ drivekit decodenormal --file S8D31051.104 --file2 decoded_body.bin
 
 ---
 
-## KernelFront Cipher
+## Firmware Encryption & Decryption — KernelFront and Normal
 
-Pioneer kernel files (e.g. `S9331050.100`) use a XOR/rotate cipher over the H8S/2600 payload (reverse engineered by MattJackson):
+Pioneer KernelFront and Normal firmware envelopes use a related **32-bit XOR/rotate cipher**. DriveKit implements both in `decryptkernel` and `decodenormal`. The embedded key table is part of each firmware file; this is separate from the rolling XOR mechanism discussed in the hardware research above. The KernelFront cipher research and decryption work are credited to **MattJackson**.
 
-```
-file[0x000:0x200]    — 512-byte ASCII envelope header
-file[0x200:0x1200]   — 1024 × LE DWORD key table
-file[0x1200:0x11200] — 65536-byte encrypted payload (16384 dwords)
+### The common cipher
 
-decode(ciphertext, key) = ROR32(ciphertext ^ key, key & 31)
-```
+Let \(C_i\) be ciphertext word \(i\), \(P_i\) the corresponding plaintext word, and \(K_i\) the selected 32-bit key. Here, \(\oplus\) means bitwise XOR, and \(\operatorname{ROR}_{32}\) rotates a 32-bit value to the right:
 
-Key index wraps: `key = keytable[i % 1024]`
+$$
+\boxed{P_i = \operatorname{ROR}_{32}\left(C_i \oplus K_i,\; K_i \bmod 32\right)}
+$$
 
-Use `decryptkernel` to produce a flat binary suitable for loading in IDA Pro as H8S/2600 code.
+Only the lowest five key bits determine the rotation count:
+
+$$
+r_i = K_i \mathbin{\&} 0x1F
+$$
+
+The inverse transformation, used to re-encrypt a modified plaintext word, is:
+
+$$
+\boxed{C_i = \operatorname{ROL}_{32}(P_i, r_i) \oplus K_i}
+$$
+
+All key-table entries and encrypted words are read as **little-endian 32-bit integers**. The resulting plaintext words are written back as little-endian bytes. `ROR` and `ROL` are *bit rotations*, not ordinary shifts: bits that leave one end wrap around to the other.
+
+### KernelFront file layout
+
+| File region (end exclusive) | Size | Purpose |
+|---|---:|---|
+| `0x000–0x200` | `0x200` (512 bytes) | ASCII envelope header |
+| `0x200–0x1200` | `0x1000` (4 KiB) | 1,024 little-endian 32-bit keys |
+| `0x1200–0x11200` | `0x10000` (64 KiB) | Encrypted kernel payload |
+
+The kernel's 1,024-entry key table wraps around as the 16,384 ciphertext words are decoded:
+
+$$
+K_i = T[i \bmod 1024]
+$$
+
+$$
+\boxed{P_i = \operatorname{ROR}_{32}\left(C_i \oplus T[i \bmod 1024],\; T[i \bmod 1024] \mathbin{\&} 31\right)}
+$$
+
+`decryptkernel` outputs the decoded 64 KiB kernel body for H8S/2600 analysis in tools such as IDA Pro. **That raw decoded body is not itself a flashable KernelFront envelope.** The flash path must preserve or reconstruct the expected encrypted file format and its integrity fields.
+
+### Normal firmware file layouts
+
+Normal firmware uses the same per-word XOR/rotate operation but a **16,384-entry key table** (64 KiB). DriveKit recognizes two observed envelope layouts:
+
+| Region | Standard layout | Extended layout |
+|---|---|---|
+| Header / preceding data | `0x000–0x200` | `0x000–0x10200` |
+| Key table | `0x200–0x10200` | `0x10200–0x20200` |
+| Encrypted body begins | `0x10200` | `0x20200` |
+| Key count | 16,384 | 16,384 |
+
+For either recognized layout:
+
+$$
+K_i = T[i \bmod 16384]
+$$
+
+$$
+\boxed{P_i = \operatorname{ROR}_{32}\left(C_i \oplus T[i \bmod 16384],\; T[i \bmod 16384] \mathbin{\&} 31\right)}
+$$
+
+DriveKit's `normal_fw_probe_layout()` tries the standard offsets first and then the extended offsets. It decrypts the first **two 32-bit words** at each candidate ciphertext offset and checks for the eight-byte plaintext signature `PIONEER ` (including the trailing space). If neither layout matches, `decodenormal` reports an unknown layout rather than guessing.
+
+The decoded Normal body can be examined for firmware structures and update-entry code; it is also the input required by the offline `scankey` command. The key table used for **file decryption** must not be confused with the separate **unlock/commit key** recovered by `scankey`.
+
+### Why this matters
+
+An encrypted firmware image cannot be directly interpreted as H8S/2600 instructions. Decoding the envelope makes it possible to study instruction sequences, version-check logic, and firmware update handlers. **Successful decryption does not imply that a modified image is safe to flash:** kernel markers, checksums, envelope structure, and drive-specific flashing protocols still matter.
 
 ---
 

@@ -118,6 +118,7 @@ static int   cmd_autoflash(void);
 static int   cmd_crossflash(void);   /* renamed to "flash" on CLI */
 static int   cmd_decodenormal(void);
 static int   cmd_scankey(void);
+static int   cmd_b0key(void);
 static int   cmd_family(void);
 static int   cmd_hwdump(void);
 static int   cmd_flashinfo(void);
@@ -5050,6 +5051,7 @@ static void print_help(void)
     printf("                  --file kernel.100 [--patch] [--file2 out.bin]\n");
     printf("  decodenormal  Decrypt normal firmware envelope; reports UHD capability\n");
     printf("  scankey       Extract unlock key from a decoded Normal firmware body\n");
+  printf("  b0key         [EXPERIMENTAL] Read unlock key from 0xB0 at hardcoded offset\n");
     printf("                  --file S8D31051.104 [--file2 decoded_body.bin]\n");
     printf("  family        Hardware family fingerprint from normal firmware envelope\n");
     printf("                  --file normal.bin [--file2 other_normal.bin]\n");
@@ -6906,6 +6908,7 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
     if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
     if (strcmp(cmd, "scankey")       == 0) return cmd_scankey();
+    if (strcmp(cmd, "b0key")         == 0) return cmd_b0key();
     if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
     if (strcmp(cmd, "family")        == 0) return cmd_family();
 
@@ -8639,6 +8642,85 @@ static int cmd_decodenormal(void)
 /* =========================================================
    CMD_ENCRYPTKERNEL
    =========================================================
+   cmd_b0key — experimental: read unlock key directly from 0xB0 at hardcoded offset
+   =========================================================
+   RESEARCH TOOL — standalone, does not affect other commands.
+   Reads 64 bytes from 0xB0 at offset B0KEY_PROBE_OFFSET, prints a hex
+   dump, and reports the 4 key bytes at B0KEY_KEY_OFFSET_IN_BUF.
+
+   Known offsets (8801/ID58, fw 1.53, confirmed Nov 2026):
+     Normal body start in B0 dump : 0x310000
+     Key relative to Normal body  : 0x3BCE6
+     Absolute B0 offset           : 0x34BCE6
+
+   These offsets are NOT universal — run on each new platform to verify.
+   ========================================================= */
+
+#define B0KEY_PROBE_OFFSET    0x34BCE0UL   /* 6 bytes before key bytes */
+#define B0KEY_BUF_SIZE        64
+#define B0KEY_KEY_IN_BUF      6            /* key starts 6 bytes into the buffer */
+
+static int cmd_b0key(void)
+{
+    UCHAR buf[B0KEY_BUF_SIZE];
+    UCHAR sense[32];
+    DWORD i;
+
+    printf("=== B0KEY — experimental 0xB0 key probe ===\n\n");
+    printf("  Probe offset : 0x%08lX\n", B0KEY_PROBE_OFFSET);
+    printf("  Read size    : %u bytes\n\n", B0KEY_BUF_SIZE);
+
+    memset(buf, 0xFF, sizeof buf);
+    memset(sense, 0, sizeof sense);
+
+    if (rb_data(0xB0, B0KEY_PROBE_OFFSET, buf, B0KEY_BUF_SIZE, sense)) {
+        fprintf(stderr, "  FAILED: rb_data(0xB0, 0x%08lX) sense=%02X/%02X/%02X\n",
+                B0KEY_PROBE_OFFSET, sense[2]&0x0F, sense[12], sense[13]);
+        fprintf(stderr, "  Drive may not be in kernel mode, or offset is out of range.\n");
+        return 1;
+    }
+
+    printf("  Raw bytes at probe offset:\n  ");
+    for (i = 0; i < B0KEY_BUF_SIZE; i++) {
+        printf("%02X ", buf[i]);
+        if ((i & 0xF) == 0xF) printf("\n  ");
+    }
+    printf("\n");
+
+    /* Extract and display key candidate */
+    UCHAR *kp = buf + B0KEY_KEY_IN_BUF;
+    DWORD le = (DWORD)kp[0]
+             | ((DWORD)kp[1] <<  8)
+             | ((DWORD)kp[2] << 16)
+             | ((DWORD)kp[3] << 24);
+
+    printf("  Key candidate at buf[%u..%u] (offset 0x%08lX):\n",
+           B0KEY_KEY_IN_BUF, B0KEY_KEY_IN_BUF + 3,
+           B0KEY_PROBE_OFFSET + B0KEY_KEY_IN_BUF);
+    printf("    Wire order : %02X %02X %02X %02X\n",
+           kp[0], kp[1], kp[2], kp[3]);
+    printf("    LE DWORD   : 0x%08lX\n\n", (unsigned long)le);
+
+    if (le == 0x6123789A) {
+        printf("  CAUTION: candidate matches acceptance-signature constant.\n");
+        printf("           Known false-extraction value — offset may be wrong for this platform.\n");
+    } else {
+        printf("  NOTE: This is a raw read at a hardcoded offset.\n");
+        printf("        Verify with scankey on a decoded Normal body before trusting.\n");
+    }
+
+    /* Cross-check against key table if drive is identified */
+    DWORD known = pioneer_key_lookup(g_driveID, NULL);
+    if (known && known == le)
+        printf("  Cross-check: matches key-table entry 0x%08lX  OK\n", (unsigned long)known);
+    else if (known && known != le)
+        printf("  Cross-check: differs from key-table entry 0x%08lX\n", (unsigned long)known);
+
+    printf("\n=== B0KEY DONE ===\n");
+    return 0;
+}
+
+/* =========================================================
    cmd_scankey — offline unlock key extractor
    Port of MattJackson's content-derived keyed-handler recognition
    algorithm from his Rust Pioneer firmware library.

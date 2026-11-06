@@ -3485,7 +3485,7 @@ static const PIONEER_KEY pioneer_keys[] =
     { 0x8801, "GENE", 0xF2125032 },
     { 0x8801, "ID36", 0xAA6C0AF0 },
     { 0x8801, "ID43", 0xDF302B98 },
-    { 0x8801, "ID58", 0x6123789A },  /* confirmed working Nov 2026: 8800/ID60→8801/ID58 cross-family flash used 0x6123789A (running fw key); scankey extracted 0xA4926CD1 from S8801581.153 — unconfirmed, may be native 8801 key */
+    { 0x8801, "ID58", 0xA4926CD1 },  /* confirmed working Nov 2026: native 8801/ID58 key, hardware-validated on BDR-211M (Asus BDR-209M rebadge); scankey extracted from S8801581.153, single clean match */
     { 0x8801, "ID60", 0x6123789A },  /* universal key — matching 0x8800/ID60 correction; 0x5CF2E094 was false scankey extraction */
     { 0x8801, "ID72", 0x91957AFA },
     { 0x8801, "ID75", 0xF6B55F31 },  /* from UnlockKeys.hpp reference */

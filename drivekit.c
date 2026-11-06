@@ -5076,8 +5076,9 @@ static void print_help(void)
     printf("  scankey       Extract unlock key from a decoded Normal firmware body\n");
     printf("  b0key         [EXPERIMENTAL] Read unlock key from 0xB0 at hardcoded offset\n");
     printf("  b0probe       [EXPERIMENTAL] Sample 0xB0 at key addresses — address-space diagnostic\n");
-    printf("  b0scankey     [EXPERIMENTAL] Read Normal from 0xB0, scan for unlock key\n");
-    printf("                  --file S8D31051.104 [--file2 decoded_body.bin]\n");
+    printf("  b0scankey     Read Normal from live 0xB0 stream, extract unlock key\n");
+    printf("  b0dumpfw      Extract Kernel + Normal firmware from live 0xB0 stream\n");
+    printf("                  Outputs: pioneer_<model>_<kernID>_<platID>_<fwrev>_{kernel,normal,raw}.bin\n");
     printf("  family        Hardware family fingerprint from normal firmware envelope\n");
     printf("                  --file normal.bin [--file2 other_normal.bin]\n");
     printf("                  Decrypts envelope(s), prints family hash + UHD capability\n");

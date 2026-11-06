@@ -9189,19 +9189,23 @@ static int cmd_b0dumpfw(void)
         UCHAR inqcdb[6]={0x12,0,0,0,64,0};
         send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
         if (inqst == 0) {
-            /* Product ID: bytes 16-31, skip leading spaces, collapse runs of
-               spaces to single underscore, trim trailing underscores */
-            int pi, plen=0; int in_space=1;
-            for(pi=0;pi<16;pi++) {
-                char c=(char)inq[16+pi];
-                if(c==' ') {
-                    if(!in_space && plen>0) { dfw_model[plen++]='_'; in_space=1; }
-                } else if(c>=' '&&c<='~') {
-                    dfw_model[plen++]=c; in_space=0;
+            /* Product ID: bytes 16-31. Take only the LAST whitespace-separated
+               word (e.g. "BD-RW   BDR-XD07U" -> "BDR-XD07U") */
+            {
+                char full[17]={0}; int pi,flen=0,in_sp=1;
+                for(pi=0;pi<16;pi++){
+                    char c=(char)inq[16+pi];
+                    if(c==' '){ if(!in_sp){full[flen++]=' ';in_sp=1;} }
+                    else if(c>=' '&&c<='~'){ full[flen++]=c; in_sp=0; }
                 }
+                while(flen>0&&full[flen-1]==' ') full[--flen]='\0';
+                full[flen]='\0';
+                /* find last space and take everything after it */
+                char *last=full; int i;
+                for(i=0;i<flen;i++) if(full[i]==' ') last=full+i+1;
+                strncpy(dfw_model, last, sizeof(dfw_model)-1);
+                dfw_model[sizeof(dfw_model)-1]='\0';
             }
-            dfw_model[plen]='\0';
-            while(plen>0&&dfw_model[plen-1]=='_') dfw_model[--plen]='\0';
 
             /* Firmware revision: bytes 32-35 */
             int fi;
@@ -9236,11 +9240,13 @@ static int cmd_b0dumpfw(void)
                 }
             }
         }
-        /* Platform ID from g_driveID e.g. ID58 */
+        /* Platform ID from g_driveID as plain 4-digit hex e.g. 8D31 */
         if (g_driveID != 0)
-            snprintf(dfw_platid, sizeof(dfw_platid), "ID%02X", (unsigned)g_driveID);
+            snprintf(dfw_platid, sizeof(dfw_platid), "%04X", (unsigned)g_driveID);
+        else
+            strncpy(dfw_platid, "0000", sizeof(dfw_platid));
 
-        /* Build prefix: pioneer_BDR-XD07U_8D31_ID58_1.06 */
+        /* Build prefix: pioneer_BDR-XD07U_ID05_8D31_1.06 */
         snprintf(dfw_prefix, sizeof(dfw_prefix), "pioneer_%s_%s_%s_%s",
                  dfw_model,
                  g_kernelID[0] ? g_kernelID : "XXXX",

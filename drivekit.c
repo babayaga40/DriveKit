@@ -9090,6 +9090,13 @@ static int cmd_b0scankey(void)
                 fread(buf, 1, scanBytes, rf);
                 fclose(rf);
 
+                /* Capture model string — first 16 bytes of Normal body */
+                char b0sk_model[17] = {0};
+                { int mi; for(mi=0;mi<16&&mi<(int)scanBytes;mi++) {
+                    char c=(char)buf[mi];
+                    b0sk_model[mi]=(c>=' '&&c<='~')?c:'.';
+                } }
+
                 printf("  Normal[0..15]: ");
                 { int hi; for(hi=0;hi<16&&hi<(int)scanBytes;hi++) printf("%02X ",buf[hi]); }
                 printf("  (%s)\n\n", (memcmp(buf,"PIONEER ",8)==0) ? "PIONEER OK" : "not PIONEER");
@@ -9105,6 +9112,7 @@ static int cmd_b0scankey(void)
                     printf("  +------------------------------------------+\n");
                     printf("  |  B0SCANKEY RESULT                        |\n");
                     printf("  +------------------------------------------+\n");
+                    printf("  Model identifier (payload[0..15]): %s\n", b0sk_model);
                     printf("  Keyed handler matches        : %zu\n", count);
                     printf("  Key bytes offset in Normal   : 0x%zX\n", m.key_offset);
                     printf("  Reject branch variant        : %u-byte\n", m.reject_length);
@@ -9370,13 +9378,17 @@ static int cmd_b0dumpfw(void)
             {
                 FILE *rf = fopen(fname_raw,"rb");
                 FILE *wf = fopen(fname_normal,"wb");
-                UCHAR hdr[8]={0};
-                if (rf) { fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); fread(hdr,1,8,rf); rewind(rf); fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); }
+                UCHAR hdr[16]={0};
+                char dfw_modelid[17]={0};
+                if (rf) { fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); fread(hdr,1,16,rf); rewind(rf); fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); }
+                /* Model identifier = first 16 bytes of Normal body */
+                { int mi; for(mi=0;mi<16;mi++) { char c=(char)hdr[mi]; dfw_modelid[mi]=(c>=' '&&c<='~')?c:'.'; } }
                 if (memcmp(hdr,"PIONEER ",8) != 0) {
                     printf("    WARNING: Normal header is %02X %02X %02X %02X %02X %02X %02X %02X — not 'PIONEER '\n",
                            hdr[0],hdr[1],hdr[2],hdr[3],hdr[4],hdr[5],hdr[6],hdr[7]);
                 } else {
                     printf("    Header: PIONEER  OK\n");
+                    printf("    Model identifier (payload[0..15]): %s\n", dfw_modelid);
                 }
                 if (rf && wf) {
                     UCHAR tbuf[0x1000]; DWORD rem = B0DUMPFW_NORMAL_SIZE;

@@ -8988,17 +8988,62 @@ static int cmd_b0scankey(void)
 
     printf("=== B0SCANKEY — 0xB0 live key extraction ===\n\n");
 
-    int is_pre_cutoff = 1;
+    int  is_pre_cutoff = 1;
+    char b0sk_physmodel[17] = "unknown";   /* physical drive: last word of INQUIRY product */
+    char b0sk_fwrev[5]      = "0000";      /* firmware revision bytes 32-35               */
+    char b0sk_platid[8]     = "0000";      /* platform ID as 4-digit hex e.g. 8D31        */
     {
         UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
         UCHAR inqcdb[6]={0x12,0,0,0,64,0};
         send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
-        if (inqst == 0 && inq[0x25] >= 0x20) {
-            char date[9]={0}; int di;
-            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
-                date[di]=inq[0x25+di];
-            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        if (inqst == 0) {
+            /* Product ID: take last whitespace-separated word (strips "BD-RW" prefix) */
+            {
+                char full[17]={0}; int pi,flen=0,in_sp=1;
+                for(pi=0;pi<16;pi++){
+                    char c=(char)inq[16+pi];
+                    if(c==' '){ if(!in_sp){full[flen++]=' ';in_sp=1;} }
+                    else if(c>=' '&&c<='~'){ full[flen++]=c; in_sp=0; }
+                }
+                while(flen>0&&full[flen-1]==' ') full[--flen]='\0';
+                full[flen]='\0';
+                char *last=full; int i;
+                for(i=0;i<flen;i++) if(full[i]==' ') last=full+i+1;
+                strncpy(b0sk_physmodel, last, sizeof(b0sk_physmodel)-1);
+                b0sk_physmodel[sizeof(b0sk_physmodel)-1]='\0';
+            }
+            /* Firmware revision: bytes 32-35 */
+            { int fi; for(fi=0;fi<4;fi++) {
+                char c=(char)inq[32+fi];
+                b0sk_fwrev[fi]=(c>=' '&&c<='~')?c:'_';
+            } b0sk_fwrev[4]='\0'; }
+            /* Pre/post-cutoff from date field */
+            if (inq[0x25] >= 0x20) {
+                char date[9]={0}; int di;
+                for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                    date[di]=inq[0x25+di];
+                is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+            }
         }
+        /* Read 0xF1 for platform ID and kernel ID if not already populated */
+        if (g_driveID == 0 || !g_kernelID[0]) {
+            UCHAR f1buf[0x30]={0}; UCHAR f1sense[SENSE_SIZE]={0};
+            if (rb_data(0xF1, 0, f1buf, 0x30, f1sense) == 0) {
+                char plat[16]={0}; int k;
+                for(k=0;k<12&&f1buf[0x10+k]>=0x20&&f1buf[0x10+k]<0x7F;k++)
+                    plat[k]=(char)f1buf[0x10+k];
+                for(k=0;k<4&&f1buf[0x18+k]>=0x20&&f1buf[0x18+k]<0x7F;k++)
+                    g_kernelID[k]=(char)f1buf[0x18+k];
+                if (g_driveID == 0) {
+                    const char *p=plat;
+                    while(*p&&(*p<'0'||*p>'9')) p++;
+                    if(*p) g_driveID=(WORD)strtol(p,NULL,16);
+                }
+            }
+        }
+        if (g_driveID != 0)
+            snprintf(b0sk_platid, sizeof(b0sk_platid), "%04X", (unsigned)g_driveID);
+
         printf("  Generation: %s\n\n",
                is_pre_cutoff ? "PRE-CUTOFF  (offset 0x00AAAA, 0xB0 from 0x100000)"
                              : "POST-CUTOFF (offset 0xA5AAAA, 0xB0 from 0x100000)");
@@ -9109,24 +9154,31 @@ static int cmd_b0scankey(void)
                 if (result == 1) {
                     DWORD le = (DWORD)m.key[0] | ((DWORD)m.key[1]<<8)
                              | ((DWORD)m.key[2]<<16) | ((DWORD)m.key[3]<<24);
-                    printf("  +------------------------------------------+\n");
-                    printf("  |  B0SCANKEY RESULT                        |\n");
-                    printf("  +------------------------------------------+\n");
-                    printf("  Model identifier (payload[0..15]): %s\n", b0sk_model);
-                    printf("  Keyed handler matches        : %zu\n", count);
-                    printf("  Key bytes offset in Normal   : 0x%zX\n", m.key_offset);
-                    printf("  Reject branch variant        : %u-byte\n", m.reject_length);
-                    printf("  Unlock key (wire order)      : %02X %02X %02X %02X\n",
+                    DWORD known = pioneer_key_lookup(g_driveID, NULL);
+                    printf("\n");
+                    printf("  +--------------------------------------------------+\n");
+                    printf("  |  B0SCANKEY — LIVE FIRMWARE IDENTIFICATION        |\n");
+                    printf("  +--------------------------------------------------+\n");
+                    printf("  Physical drive                : %s\n",   b0sk_physmodel);
+                    printf("  Internal model identifier     : %s\n",   b0sk_model);
+                    printf("  Internal model source         : Normal +0x000000\n");
+                    printf("  Platform                      : SAT %s\n", b0sk_platid);
+                    printf("  Kernel ID                     : %s\n",   g_kernelID[0] ? g_kernelID : "(not read)");
+                    printf("  Firmware revision             : %s\n\n", b0sk_fwrev);
+                    printf("  Keyed handler matches         : %zu\n",  count);
+                    printf("  Key bytes offset in Normal    : 0x%zX\n", m.key_offset);
+                    printf("  Reject branch variant         : %u-byte\n", m.reject_length);
+                    printf("  Unlock key (wire order)       : %02X %02X %02X %02X\n",
                            m.key[0], m.key[1], m.key[2], m.key[3]);
-                    printf("  Unlock key (LE DWORD)        : 0x%08lX\n\n", (unsigned long)le);
+                    printf("  Unlock key (LE DWORD)         : 0x%08lX\n\n", (unsigned long)le);
                     if (le == 0x6123789A) {
                         printf("  CAUTION: matches acceptance-signature constant.\n");
-                    } else {
-                        DWORD known = pioneer_key_lookup(g_driveID, NULL);
-                        if (known && known == le)
-                            printf("  Cross-check: matches key-table entry  OK\n");
-                        else if (known && known != le)
-                            printf("  Cross-check: differs from key-table 0x%08lX\n", (unsigned long)known);
+                    } else if (known && known == le) {
+                        printf("  Cross-check                   : OK\n");
+                        printf("  Key-table value               : 0x%08lX\n", (unsigned long)known);
+                    } else if (known && known != le) {
+                        printf("  Cross-check                   : MISMATCH\n");
+                        printf("  Key-table value               : 0x%08lX\n", (unsigned long)known);
                     }
                 } else if (result == 0) {
                     fprintf(stderr, "  No keyed handler found (0x%X bytes scanned).\n", scanBytes);

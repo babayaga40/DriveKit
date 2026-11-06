@@ -9041,7 +9041,7 @@ static int cmd_b0scankey(void)
                 FILE *fp = fopen("b0scankey_dump.bin", "wb");
                 DWORD b0offset = b0_start;
                 DWORD total = 0;
-                printf("  0xB0 ACCESSIBLE! Streaming to b0scankey_dump.bin (cap 3.5MB)...\n");
+                printf("  0xB0 ACCESSIBLE! Streaming to b0scankey_dump.bin...\n");
                 printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
                        b0buf[0],b0buf[1],b0buf[2],b0buf[3],
                        b0buf[4],b0buf[5],b0buf[6],b0buf[7]);
@@ -9061,7 +9061,7 @@ static int cmd_b0scankey(void)
                     if (cst != 0) break;
                     if (fp) fwrite(chunk, 1, CHUNK_SIZE, fp);
                     total += CHUNK_SIZE;
-                    if (total >= 0x380000UL) {
+                    if (total >= 0x360000UL) {
                         printf("\n  Reached cap — stopping stream.\n");
                         break;
                     }

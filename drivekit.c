@@ -9177,21 +9177,61 @@ static int cmd_b0dumpfw(void)
 
     printf("=== B0DUMPFW — live Kernel + Normal firmware extraction ===\n\n");
 
-    /* Detect pre/post-cutoff for WRITE BUFFER offset */
-    int is_pre_cutoff = 1;
+    /* INQUIRY: detect pre/post-cutoff, capture model + firmware revision.
+       Platform ID comes from g_driveID (set by open_drive / 0xF1 read). */
+    int  is_pre_cutoff = 1;
+    char dfw_model[17]  = "unknown";   /* product ID, trimmed, spaces→underscore */
+    char dfw_fwrev[5]   = "0000";      /* firmware revision bytes 32-35          */
+    char dfw_platid[8]  = "ID00";      /* IDxx from g_driveID e.g. ID58          */
+    char dfw_prefix[96] = "pioneer";   /* pioneer_<model>_<kernid>_<platid>_<fwrev> */
     {
         UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
         UCHAR inqcdb[6]={0x12,0,0,0,64,0};
         send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
-        if (inqst == 0 && inq[0x25] >= 0x20) {
-            char date[9]={0}; int di;
-            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
-                date[di]=inq[0x25+di];
-            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        if (inqst == 0) {
+            /* Product ID: bytes 16-31, spaces → underscore, trim trailing '_' */
+            int pi, plen=0;
+            for(pi=0;pi<16;pi++) {
+                char c=(char)inq[16+pi];
+                if(c>=' '&&c<='~') dfw_model[plen++]=(c==' '?'_':c);
+            }
+            dfw_model[plen]='\0';
+            while(plen>0&&dfw_model[plen-1]=='_') dfw_model[--plen]='\0';
+
+            /* Firmware revision: bytes 32-35 */
+            int fi;
+            for(fi=0;fi<4;fi++) {
+                char c=(char)inq[32+fi];
+                dfw_fwrev[fi]=(c>=' '&&c<='~')?c:'_';
+            }
+            dfw_fwrev[4]='\0';
+
+            /* Date for pre/post-cutoff */
+            if (inq[0x25] >= 0x20) {
+                char date[9]={0}; int di;
+                for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                    date[di]=inq[0x25+di];
+                is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+            }
         }
+        /* Platform ID from g_driveID (populated by open_drive/0xF1) */
+        if (g_driveID != 0)
+            snprintf(dfw_platid, sizeof(dfw_platid), "ID%02X", (unsigned)g_driveID);
+
+        /* Build prefix: pioneer_BDR-XD07U_8D31_ID58_1.06 */
+        snprintf(dfw_prefix, sizeof(dfw_prefix), "pioneer_%s_%s_%s_%s",
+                 dfw_model,
+                 g_kernelID[0] ? g_kernelID : "XXXX",
+                 dfw_platid, dfw_fwrev);
+
+        printf("  Drive    : %s\n", dfw_model);
+        printf("  Kernel ID: %s\n", g_kernelID[0] ? g_kernelID : "(not read)");
+        printf("  Platform : %s\n", dfw_platid);
+        printf("  FW rev   : %s\n", dfw_fwrev);
         printf("  Generation: %s\n\n",
                is_pre_cutoff ? "PRE-CUTOFF  (offset 0x00AAAA)"
                              : "POST-CUTOFF (offset 0xA5AAAA)");
+        printf("  Output prefix: %s\n\n", dfw_prefix);
     }
 
     UCHAR cdb[12] = {0x3B,0x02,0x41,
@@ -9234,11 +9274,17 @@ static int cmd_b0dumpfw(void)
                 return 1;
             }
 
-            printf("  0xB0 open! Streaming %.1f MB to b0dumpfw_raw.bin...\n",
-                   (double)B0DUMPFW_CAP / (1024.0*1024.0));
+            char fname_raw[96], fname_kernel[96], fname_normal[96], fname_info[96];
+            snprintf(fname_raw,    sizeof(fname_raw),    "%s_raw.bin",    dfw_prefix);
+            snprintf(fname_kernel, sizeof(fname_kernel), "%s_kernel.bin", dfw_prefix);
+            snprintf(fname_normal, sizeof(fname_normal), "%s_normal.bin", dfw_prefix);
+            snprintf(fname_info,   sizeof(fname_info),   "%s_info.txt",   dfw_prefix);
+
+            printf("  0xB0 open! Streaming %.1f MB to %s...\n",
+                   (double)B0DUMPFW_CAP / (1024.0*1024.0), fname_raw);
             fflush(stdout);
 
-            FILE *fp = fopen("b0dumpfw_raw.bin", "wb");
+            FILE *fp = fopen(fname_raw, "wb");
             DWORD b0offset = b0_start;
             DWORD total = 0;
             if (fp) fwrite(b0buf, 1, B0DUMPFW_CHUNK, fp);
@@ -9263,7 +9309,7 @@ static int cmd_b0dumpfw(void)
                 fflush(stdout);
             }
             if (fp) fclose(fp);
-            printf("  Raw dump: b0dumpfw_raw.bin (%u bytes)\n\n", total);
+            printf("  Raw dump: %s (%u bytes)\n\n", fname_raw, total);
 
             if (total < B0DUMPFW_NORMAL_OFF + 16) {
                 fprintf(stderr,"  Stream too short — firmware regions not reached.\n");
@@ -9271,11 +9317,11 @@ static int cmd_b0dumpfw(void)
             }
 
             /* Carve Kernel */
-            printf("  Extracting kernel.bin  (0x%06lX bytes from offset 0x%06lX)...\n",
-                   (unsigned long)B0DUMPFW_KERNEL_SIZE, (unsigned long)B0DUMPFW_KERNEL_OFF);
+            printf("  Extracting %s  (0x%06lX bytes from offset 0x%06lX)...\n",
+                   fname_kernel, (unsigned long)B0DUMPFW_KERNEL_SIZE, (unsigned long)B0DUMPFW_KERNEL_OFF);
             {
-                FILE *rf = fopen("b0dumpfw_raw.bin","rb");
-                FILE *wf = fopen("kernel.bin","wb");
+                FILE *rf = fopen(fname_raw,"rb");
+                FILE *wf = fopen(fname_kernel,"wb");
                 if (rf && wf) {
                     UCHAR tbuf[0x1000]; DWORD rem = B0DUMPFW_KERNEL_SIZE;
                     fseek(rf,(long)B0DUMPFW_KERNEL_OFF,SEEK_SET);
@@ -9286,16 +9332,15 @@ static int cmd_b0dumpfw(void)
                 }
                 if (rf) fclose(rf);
                 if (wf) fclose(wf);
-                printf("    kernel.bin written.\n");
+                printf("    written.\n");
             }
 
             /* Carve Normal */
-            printf("  Extracting normal.bin  (0x%06lX bytes from offset 0x%06lX)...\n",
-                   (unsigned long)B0DUMPFW_NORMAL_SIZE, (unsigned long)B0DUMPFW_NORMAL_OFF);
+            printf("  Extracting %s  (0x%06lX bytes from offset 0x%06lX)...\n",
+                   fname_normal, (unsigned long)B0DUMPFW_NORMAL_SIZE, (unsigned long)B0DUMPFW_NORMAL_OFF);
             {
-                /* Validate header first */
-                FILE *rf = fopen("b0dumpfw_raw.bin","rb");
-                FILE *wf = fopen("normal.bin","wb");
+                FILE *rf = fopen(fname_raw,"rb");
+                FILE *wf = fopen(fname_normal,"wb");
                 UCHAR hdr[8]={0};
                 if (rf) { fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); fread(hdr,1,8,rf); rewind(rf); fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); }
                 if (memcmp(hdr,"PIONEER ",8) != 0) {
@@ -9313,17 +9358,39 @@ static int cmd_b0dumpfw(void)
                 }
                 if (rf) fclose(rf);
                 if (wf) fclose(wf);
-                printf("    normal.bin written.\n");
+                printf("    written.\n");
+            }
+
+            /* Write sidecar info file */
+            {
+                FILE *inf = fopen(fname_info, "w");
+                if (inf) {
+                    fprintf(inf, "B0DUMPFW capture\n");
+                    fprintf(inf, "Drive    : %s\n", dfw_model);
+                    fprintf(inf, "Kernel ID: %s\n", g_kernelID[0] ? g_kernelID : "(not read)");
+                    fprintf(inf, "Platform : %s\n", dfw_platid);
+                    fprintf(inf, "FW rev   : %s\n", dfw_fwrev);
+                    fprintf(inf, "Generation: %s\n", is_pre_cutoff ? "PRE-CUTOFF" : "POST-CUTOFF");
+                    fprintf(inf, "\n");
+                    fprintf(inf, "Raw dump : %s  (%u bytes)\n", fname_raw, total);
+                    fprintf(inf, "Kernel   : %s  (%lu bytes, live B0 0x400000)\n",
+                            fname_kernel, (unsigned long)B0DUMPFW_KERNEL_SIZE);
+                    fprintf(inf, "Normal   : %s  (%lu bytes, live B0 0x410000)\n",
+                            fname_normal, (unsigned long)B0DUMPFW_NORMAL_SIZE);
+                    fclose(inf);
+                    printf("  Sidecar  : %s\n", fname_info);
+                }
             }
 
             printf("\n  +--------------------------------------------+\n");
             printf("  |  B0DUMPFW RESULT                           |\n");
             printf("  +--------------------------------------------+\n");
-            printf("  kernel.bin   %lu KiB  (live B0 0x400000)\n",
-                   (unsigned long)(B0DUMPFW_KERNEL_SIZE/1024));
-            printf("  normal.bin   %lu KiB  (live B0 0x410000)\n",
-                   (unsigned long)(B0DUMPFW_NORMAL_SIZE/1024));
-            printf("  b0dumpfw_raw.bin  %u bytes  (full sequential dump)\n\n", total);
+            printf("  %s\n    %lu KiB  (live B0 0x400000)\n",
+                   fname_kernel, (unsigned long)(B0DUMPFW_KERNEL_SIZE/1024));
+            printf("  %s\n    %lu KiB  (live B0 0x410000)\n",
+                   fname_normal, (unsigned long)(B0DUMPFW_NORMAL_SIZE/1024));
+            printf("  %s\n    %u bytes  (full sequential dump)\n\n",
+                   fname_raw, total);
         }
     } else {
         printf("  WRITE BUFFER 0x41 FAILED (key=%02X ASC=%02X)\n\n",

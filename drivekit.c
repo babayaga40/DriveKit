@@ -8972,7 +8972,7 @@ static int cmd_b0probe(void)
    b0scankey_dump.bin, then scan the whole file for the key pattern.
    This avoids any gap between the enable sequence and reading. */
 #define B0SCANKEY_B0_BASE         0x100000UL   /* 0xB0 stream starts here              */
-#define B0SCANKEY_CHUNK           CHUNK_SIZE   /* 2 KB — drive's actual max transfer   */
+#define B0SCANKEY_CHUNK           0x8000       /* 32 KB — larger transfers for speed   */
 
 static int cmd_b0scankey(void)
 {
@@ -9029,13 +9029,13 @@ static int cmd_b0scankey(void)
                       SCSI_IOCTL_DATA_IN, f4sense, &f4st);
         }
         {
-            UCHAR b0buf[CHUNK_SIZE] = {0};
+            UCHAR b0buf[B0SCANKEY_CHUNK] = {0};
             UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
                 (UCHAR)(b0_start>>16),(UCHAR)(b0_start>>8),(UCHAR)(b0_start),
-                0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+                0,(UCHAR)(B0SCANKEY_CHUNK>>8),(UCHAR)(B0SCANKEY_CHUNK),0};
             UCHAR b0sense[SENSE_SIZE] = {0};
             int   b0st = 0;
-            send_scsi(g_hDrive, b0cdb, 10, b0buf, CHUNK_SIZE,
+            send_scsi(g_hDrive, b0cdb, 10, b0buf, B0SCANKEY_CHUNK,
                       SCSI_IOCTL_DATA_IN, b0sense, &b0st);
             if (b0st == 0) {
                 FILE *fp = fopen("b0scankey_dump.bin", "wb");
@@ -9046,21 +9046,21 @@ static int cmd_b0scankey(void)
                        b0buf[0],b0buf[1],b0buf[2],b0buf[3],
                        b0buf[4],b0buf[5],b0buf[6],b0buf[7]);
                 fflush(stdout);
-                if (fp) fwrite(b0buf, 1, CHUNK_SIZE, fp);
-                total += CHUNK_SIZE;
+                if (fp) fwrite(b0buf, 1, B0SCANKEY_CHUNK, fp);
+                total += B0SCANKEY_CHUNK;
                 while (1) {
-                    UCHAR chunk[CHUNK_SIZE] = {0};
+                    UCHAR chunk[B0SCANKEY_CHUNK] = {0};
                     UCHAR csense[SENSE_SIZE] = {0};
                     int   cst = 0;
-                    b0offset += CHUNK_SIZE;
+                    b0offset += B0SCANKEY_CHUNK;
                     UCHAR ccdb[10] = {0x3C,0x02,0xB0,
                         (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
-                        0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
-                    send_scsi(g_hDrive, ccdb, 10, chunk, CHUNK_SIZE,
+                        0,(UCHAR)(B0SCANKEY_CHUNK>>8),(UCHAR)(B0SCANKEY_CHUNK),0};
+                    send_scsi(g_hDrive, ccdb, 10, chunk, B0SCANKEY_CHUNK,
                               SCSI_IOCTL_DATA_IN, csense, &cst);
                     if (cst != 0) break;
-                    if (fp) fwrite(chunk, 1, CHUNK_SIZE, fp);
-                    total += CHUNK_SIZE;
+                    if (fp) fwrite(chunk, 1, B0SCANKEY_CHUNK, fp);
+                    total += B0SCANKEY_CHUNK;
                     if (total >= 0x360000UL) {
                         printf("\n  Reached cap — stopping stream.\n");
                         break;

@@ -8656,27 +8656,84 @@ static int cmd_decodenormal(void)
    These offsets are NOT universal — run on each new platform to verify.
    ========================================================= */
 
-#define B0KEY_PROBE_OFFSET    0x34BCE0UL   /* 6 bytes before key bytes */
+/* B0KEY address layout:
+   0xB0 dump starts at address 0x100000 (b0_start in hwdump).
+   File offset 0x34BCE6 (key in dump) = 0xB0 address 0x100000 + 0x34BCE6 = 0x44BCE6.
+   Probe 6 bytes before key: 0x44BCE0. */
+#define B0KEY_B0_START        0x100000UL
+#define B0KEY_FILE_KEY_OFF    0x34BCE6UL   /* key offset within dump file   */
+#define B0KEY_ABS_PROBE       (B0KEY_B0_START + B0KEY_FILE_KEY_OFF - 6)  /* 0x44BCE0 */
 #define B0KEY_BUF_SIZE        64
 #define B0KEY_KEY_IN_BUF      6            /* key starts 6 bytes into the buffer */
 
 static int cmd_b0key(void)
 {
     UCHAR buf[B0KEY_BUF_SIZE];
-    UCHAR sense[32];
+    UCHAR sense[SENSE_SIZE];
     DWORD i;
+    int   st = 0;
 
     printf("=== B0KEY — experimental 0xB0 key probe ===\n\n");
-    printf("  Probe offset : 0x%08lX\n", B0KEY_PROBE_OFFSET);
+
+    /* Detect pre vs post-cutoff */
+    int is_pre_cutoff = 1;
+    {
+        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        if (inqst == 0 && inq[0x25] >= 0x20) {
+            char date[9]={0}; int di;
+            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                date[di]=inq[0x25+di];
+            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        }
+        printf("  Generation   : %s\n",
+               is_pre_cutoff ? "PRE-CUTOFF" : "POST-CUTOFF");
+    }
+
+    /* Enable 0xB0: GET EVENT STATUS x4, WRITE BUFFER 0x41, READ BUFFER 0xF4 */
+    printf("  Enabling 0xB0 access...\n");
+    {
+        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
+        int m;
+        for (m = 0; m < 4; m++) {
+            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
+            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
+            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
+        }
+    }
+    {
+        UCHAR payload[1] = {0};
+        UCHAR wbcdb[12] = {0x3B,0x02,0x41,
+                           (UCHAR)(is_pre_cutoff ? 0x00 : 0xA5),0xAA,0xAA,
+                           0,0,0,0,0,0};
+        send_scsi(g_hDrive, wbcdb, 12, payload, 0,
+                  SCSI_IOCTL_DATA_OUT, sense, &st);
+        if (st != 0)
+            printf("  WRITE BUFFER 0x41: status=%d (continuing anyway)\n", st);
+    }
+    {
+        UCHAR f4buf[0xA4]={0};
+        UCHAR f4cdb[10]={0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
+        UCHAR f4sense[SENSE_SIZE]={0}; int f4st=0;
+        send_scsi(g_hDrive,f4cdb,10,f4buf,0xA4,SCSI_IOCTL_DATA_IN,f4sense,&f4st);
+    }
+
+    /* Now probe the key offset */
+    DWORD probe = B0KEY_ABS_PROBE;
+    printf("  Probe offset : 0x%08lX  (file offset 0x%08lX + b0_start 0x%06lX - 6)\n",
+           (unsigned long)probe,
+           (unsigned long)B0KEY_FILE_KEY_OFF,
+           (unsigned long)B0KEY_B0_START);
     printf("  Read size    : %u bytes\n\n", B0KEY_BUF_SIZE);
 
     memset(buf, 0xFF, sizeof buf);
     memset(sense, 0, sizeof sense);
 
-    if (rb_data(0xB0, B0KEY_PROBE_OFFSET, buf, B0KEY_BUF_SIZE, sense)) {
+    if (rb_data(0xB0, probe, buf, B0KEY_BUF_SIZE, sense)) {
         fprintf(stderr, "  FAILED: rb_data(0xB0, 0x%08lX) sense=%02X/%02X/%02X\n",
-                B0KEY_PROBE_OFFSET, sense[2]&0x0F, sense[12], sense[13]);
-        fprintf(stderr, "  Drive may not be in kernel mode, or offset is out of range.\n");
+                (unsigned long)probe, sense[2]&0x0F, sense[12], sense[13]);
+        fprintf(stderr, "  0xB0 may not have opened, or offset is wrong for this platform.\n");
         return 1;
     }
 
@@ -8694,9 +8751,9 @@ static int cmd_b0key(void)
              | ((DWORD)kp[2] << 16)
              | ((DWORD)kp[3] << 24);
 
-    printf("  Key candidate at buf[%u..%u] (offset 0x%08lX):\n",
+    printf("  Key candidate at buf[%u..%u] (0xB0 address 0x%08lX):\n",
            B0KEY_KEY_IN_BUF, B0KEY_KEY_IN_BUF + 3,
-           B0KEY_PROBE_OFFSET + B0KEY_KEY_IN_BUF);
+           (unsigned long)(B0KEY_ABS_PROBE + B0KEY_KEY_IN_BUF));
     printf("    Wire order : %02X %02X %02X %02X\n",
            kp[0], kp[1], kp[2], kp[3]);
     printf("    LE DWORD   : 0x%08lX\n\n", (unsigned long)le);

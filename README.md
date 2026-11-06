@@ -1,6 +1,6 @@
 # DriveKit v1.0
 ### Optical Drive Research Toolkit
-**by BabaYaga / Razor 1911 (c) 2026**
+**by cPix / Razor 1911 (c) 2026**
 
 Combined optical drive & storage research toolkit for Windows and Linux, targeting Pioneer BD-R/BD-RE optical drives. All functionality is bundled into a single binary, with the operation selected via a command-line subcommand.
 
@@ -17,7 +17,7 @@ New to DriveKit? See **[USERGUIDE.md](USERGUIDE.md)** for step-by-step flashing 
 - DriveKit successfully performed a **post-cutoff → pre-cutoff downgrade**: post-cutoff firmware → 1.04 (patched kernel, `--patch`). Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.04.
 - DriveKit successfully performed a **post-cutoff → post-cutoff same-era flash**: 1.06 → 1.05 using the same new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.05.
 - Added **`scankey`**, an offline scanner that extracts the update-entry unlock key directly from decoded Normal firmware. It recovered the known XD07 key and flagged a conflicting entry for `S8800601.153`.
-- Added **`b0scankey`**, a live key extractor that reads Normal firmware directly from the running drive via `0xB0` and extracts the unlock key without needing a firmware file. Confirmed on pre-cutoff and post-cutoff BDR-XD07U and BDR-BDS7. Takes ~30 seconds.
+- Added **`b0scankey`**, a live key extractor that reads Normal firmware directly from the running drive via `0xB0` and extracts the unlock key without needing a firmware file. Tested on pre-cutoff and post-cutoff BDR-XD07U. The firmware may identify itself as `PIONEER BDR-BDS7`, an internal protocol model string shared by multiple physical drive models—not a separate tested drive. Takes ~30 seconds.
 - Added **`b0dumpfw`**, a live firmware extractor that streams `0xB0`, carves out Kernel (64 KiB) and Normal (~1.8 MB) at their confirmed offsets, and writes named files (`pioneer_<model>_<kernelID>_<platformID>_<fwrev>_kernel.bin` etc.) plus a sidecar info file.
 
 All three results are verified on tested hardware; not a claim of universal compatibility.
@@ -365,7 +365,7 @@ Extract the **update-entry unlock key** from a *decoded* Pioneer Normal firmware
 .\drivekit scankey --file S8800601.153_decoded.bin
 ```
 
-**XD07 Normal 1.06 — recovered key agrees with the known working ID05 key:**
+**XD07 Normal 1.06 — offline `scankey` example (the key also appears in a known working ID05 flash context):**
 
 ```text
 Keyed handler matches        : 1
@@ -375,10 +375,10 @@ Key bytes offset             : 0x3BFEC
 Reject branch variant        : 10-byte
 Unlock key (wire order)      : B1 27 8A FF
 Unlock key (LE DWORD)        : 0xFF8A27B1
-Cross-check: matches key-table entry  : OK
+Cross-check: matches key-table entry  : OK  (offline example; table/context dependent)
 ```
 
-**`S8800601.153` — discrepancy detected:**
+**`S8800601.153` — historical false-positive investigation (resolved by hardware testing):**
 
 ```text
 scankey: S8800601.153_decoded.bin  (1858816 bytes = 0x1C5D00)
@@ -395,7 +395,7 @@ WARNING: extracted key 0x5CF2E094 differs from key-table entry 0x6123789A
          Verify against a known-good capture before flashing.
 ```
 
-The scanner identifies a recognizable **keyed update-entry handler** in the decoded firmware, not an arbitrary four-byte match. The extracted key is distinct from the cipher key used to decode Normal firmware. A single unambiguous match is strong static evidence of the embedded comparison value, but does not establish that the target drive accepts a particular unlock/commit payload. **Do not automatically flash using a newly extracted key without checking the descriptor, protocol, and known-good captures.** A missing key-table entry is different from a mismatch.
+The scanner searches for a recognizable **update-entry handler pattern**, not an arbitrary four-byte match. The extracted value is distinct from the cipher key used to decode Normal firmware. **The example above was subsequently shown to be a false positive:** hardware testing rejected `0x5CF2E094` and accepted the known `0x6123789A` key on the tested SAT 8800/ID60 drive. A single pattern match is useful static evidence, **not proof of the correct operational unlock/commit key**. Do not flash using a newly extracted value without verifying the descriptor, protocol, and known-good captures. A missing key-table entry is different from a mismatch.
 
 ### flash command (recommended)
 
@@ -472,25 +472,15 @@ Pioneer KernelFront and Normal firmware envelopes use a related **32-bit XOR/rot
 
 ### The common cipher
 
-Let \(C_i\) be ciphertext word \(i\), \(P_i\) the corresponding plaintext word, and \(K_i\) the selected 32-bit key. Here, \(\oplus\) means bitwise XOR, and \(\operatorname{ROR}_{32}\) rotates a 32-bit value to the right:
+Let `C[i]` be ciphertext word `i`, `P[i]` the corresponding plaintext word, and `K[i]` the selected 32-bit key. `XOR` is bitwise exclusive OR; `ROR32` and `ROL32` rotate a 32-bit word, wrapping shifted-out bits around to the opposite end.
 
-$$
-\boxed{P_i = \operatorname{ROR}_{32}\left(C_i \oplus K_i,\; K_i \bmod 32\right)}
-$$
+```text
+r[i] = K[i] & 0x1F
+P[i] = ROR32(C[i] XOR K[i], r[i])
+C[i] = ROL32(P[i], r[i]) XOR K[i]
+```
 
-Only the lowest five key bits determine the rotation count:
-
-$$
-r_i = K_i \mathbin{\&} 0x1F
-$$
-
-The inverse transformation, used to re-encrypt a modified plaintext word, is:
-
-$$
-\boxed{C_i = \operatorname{ROL}_{32}(P_i, r_i) \oplus K_i}
-$$
-
-All key-table entries and encrypted words are read as **little-endian 32-bit integers**. The resulting plaintext words are written back as little-endian bytes. `ROR` and `ROL` are *bit rotations*, not ordinary shifts: bits that leave one end wrap around to the other.
+Only the lowest five key bits determine the rotation count. All key-table entries and encrypted words are read as **little-endian 32-bit integers**. Plaintext words are written back as little-endian bytes.
 
 ### KernelFront file layout
 
@@ -502,13 +492,10 @@ All key-table entries and encrypted words are read as **little-endian 32-bit int
 
 The kernel's 1,024-entry key table wraps around as the 16,384 ciphertext words are decoded:
 
-$$
-K_i = T[i \bmod 1024]
-$$
-
-$$
-\boxed{P_i = \operatorname{ROR}_{32}\left(C_i \oplus T[i \bmod 1024],\; T[i \bmod 1024] \mathbin{\&} 31\right)}
-$$
+```text
+K[i] = T[i % 1024]
+P[i] = ROR32(C[i] XOR K[i], K[i] & 31)
+```
 
 `decryptkernel` outputs the decoded 64 KiB kernel body for H8S/2600 analysis in tools such as IDA Pro. **That raw decoded body is not itself a flashable KernelFront envelope.** The flash path must preserve or reconstruct the expected encrypted file format and its integrity fields.
 
@@ -525,13 +512,10 @@ Normal firmware uses the same per-word XOR/rotate operation but a **16,384-entry
 
 For either recognized layout:
 
-$$
-K_i = T[i \bmod 16384]
-$$
-
-$$
-\boxed{P_i = \operatorname{ROR}_{32}\left(C_i \oplus T[i \bmod 16384],\; T[i \bmod 16384] \mathbin{\&} 31\right)}
-$$
+```text
+K[i] = T[i % 16384]
+P[i] = ROR32(C[i] XOR K[i], K[i] & 31)
+```
 
 DriveKit's `normal_fw_probe_layout()` tries the standard offsets first and then the extended offsets. It decrypts the first **two 32-bit words** at each candidate ciphertext offset and checks for the eight-byte plaintext signature `PIONEER ` (including the trailing space). If neither layout matches, `decodenormal` reports an unknown layout rather than guessing.
 
@@ -591,7 +575,7 @@ year letter (N=2022, O=2023, P=2024...)
 | `0x41` | H8S/2600 kernel dump enable — zero-length WRITE BUFFER (12-byte CDB). Pre-cutoff: offset `0x00AAAA`. Post-cutoff: offset `0xA5AAAA`. Drive requires power cycle between attempts |
 | `0x92` | Drive config + factory calibration |
 | `0xA0` | Model string + unlock key (post-cutoff) / capability data (pre-cutoff) |
-| `0xB0` | H8S/2600 kernel code running in RAM — decrypted, ready for disassembly. After `hwdump`/`b0dumpfw`: read sequentially from offset `0x100000` in chunks (2KB for `hwdump`, 32KB for `b0dumpfw`/`b0scankey`). Pre-cutoff: 8.7MB dump. Post-cutoff: 7.5MB dump. **0xB0 is a sequential stream — cannot seek; must always start at 0x100000.** |
+| `0xB0` | Live firmware/memory stream containing decrypted Kernel and Normal on tested drives. Sequential capture begins at live offset `0x100000`; Kernel at `0x400000`, Normal at `0x410000`. `hwdump` uses 2 KiB chunks; `b0dumpfw`/`b0scankey` use 32 KiB chunks. **Treat as a sequential stream; do not assume arbitrary seeking works.** See [Live Firmware Extraction](#live-firmware-extraction-b0scankey--b0dumpfw). |
 | `0xF1` | Drive identity: serial, platform, kernel ID, firmware version |
 | `0xF4` | NAND flash contents — readable without unlock on post-cutoff drives. MakeMKV reads in sequential `0xA4` chunks |
 | `0xFE` | Kernel/token write target (crossflash protocol) |
@@ -605,16 +589,39 @@ year letter (N=2022, O=2023, P=2024...)
 
 These commands use the same `0xB0` enable sequence as `hwdump` to read firmware directly from the running drive — no firmware file required. Both work on pre-cutoff and post-cutoff drives; the WRITE BUFFER offset (`0x00AAAA` or `0xA5AAAA`) is auto-detected from the INQUIRY date.
 
-### Confirmed 0xB0 firmware layout (pre-cutoff and post-cutoff, verified on BDR-XD07U SAT 8D31/ID05)
+### Confirmed 0xB0 firmware layout (tested pre-cutoff and post-cutoff BDR-XD07U SAT 8D31/ID05)
 
 | Region | Dump file offset | Live B0 address | Size |
 |--------|-----------------|-----------------|------|
 | Kernel | `0x300000` | `0x400000` | `0x010000` (64 KiB) |
 | Normal firmware | `0x310000` | `0x410000` | `0x1C9E00` (~1.8 MB) |
 
-The Normal firmware body in the 0xB0 stream is **already plaintext** — it starts with `PIONEER ` and matches the decoded Normal firmware output of `decodenormal`. No decryption is needed.
+#### Address map: live B0 vs. raw dump offsets
 
-The key extracted by `b0scankey` is at Normal body offset `0x3BCE6` (pre-cutoff) or `0x3BFEC` (post-cutoff) in the tested BDR-XD07U/BDR-BDS7 drives.
+The sequential capture starts at **live B0 address `0x100000`**, which becomes **file offset `0x000000`** in the raw dump. Therefore, for this capture layout:
+
+```text
+live B0 address = raw dump file offset + 0x100000
+raw dump offset = live B0 address - 0x100000
+
+Raw dump offset      Live B0 address       Observed region
+----------------     ----------------      -------------------------------
+0x000000             0x100000              Start of sequential B0 capture
+    |                    |
+    |  0x300000 bytes    |                   Earlier region (not fully mapped)
+    v                    v
+0x300000             0x400000              Kernel begins
+    |                    |                   0x010000 bytes (64 KiB)
+0x310000             0x410000              Normal firmware begins
+    |                    |                   0x1C9E00 bytes (1,875,456)
+0x4D9E00             0x5D9E00              End of Normal (exclusive)
+```
+
+The **end addresses are exclusive**. The raw dump offset `0x4D9E00` and live address `0x5D9E00` refer to the same boundary, but in different coordinate systems. These offsets are confirmed on the tested SAT 8D31/ID05 firmware; they are not yet established for every Pioneer family.
+
+The Normal firmware body in the 0xB0 stream is **already plaintext** — it starts with `PIONEER ` and has the same decoded representation as `decodenormal` output. No additional decryption is needed. This does **not** imply that every live capture is byte-for-byte identical to a separately decoded update image: runtime-dependent bytes may differ, and pre-cutoff and post-cutoff firmware bodies are not necessarily identical.
+
+Observed `b0scankey` key-byte offsets in tested BDR-XD07U firmware are Normal-relative `0x3BCE6` (pre-cutoff) and `0x3BFEC` (post-cutoff). These are firmware-specific observations, not universal offsets. `PIONEER BDR-BDS7` is an **internal model identifier used in unlock/commit payloads**, not another physical drive.
 
 ### `b0probe`
 
@@ -626,7 +633,7 @@ drivekit b0probe E
 
 ### `b0scankey`
 
-Streams 0xB0 from `0x100000` to `0x360000` (just past the key location), scans the Normal region at offset `0x310000` for the update-entry unlock key using the same algorithm as `scankey`, and prints the result. No firmware file needed.
+Reads the sequential 0xB0 stream beginning at live address `0x100000`, through the Normal firmware key-handler region, then scans the Normal body beginning at **raw dump offset** `0x310000` (live B0 address `0x410000`) using the same algorithm as `scankey`. The documented `0x360000` stream boundary is a **raw dump offset** (live B0 `0x460000`), not a live B0 address. No pre-existing firmware file is needed.
 
 ```
 drivekit b0scankey E
@@ -637,20 +644,24 @@ Output example (post-cutoff BDR-XD07U 1.06):
 Generation: POST-CUTOFF (offset 0xA5AAAA, 0xB0 from 0x100000)
 WRITE BUFFER 0x41 offset=0xA5AAAA: GOOD
 0xB0 ACCESSIBLE! Streaming to b0scankey_dump.bin...
-Normal[0..15]: 50 49 4F 4E 45 45 52 20 ...  (PIONEER OK)
+Normal[0..15]: 50 49 4F 4E 45 45 52 20 42 44 52 2D 42 44 53 37  (PIONEER OK)
+Model identifier (Normal +0x000000): PIONEER BDR-BDS7
 
 Keyed handler matches        : 1
 Key bytes offset in Normal   : 0x3BFEC
 Reject branch variant        : 10-byte
 Unlock key (wire order)      : B1 27 8A FF
 Unlock key (LE DWORD)        : 0xFF8A27B1
+Cross-check: differs from key-table 0x6123789A
 ```
 
-Takes ~30 seconds (32KB chunks, ~0.36MB streamed).
+The identifier above is read from the **first 16 bytes of the decrypted Normal body** (Normal-relative `0x000000`, raw B0 dump `0x310000`, live B0 address `0x410000`). It is used as bytes `0x00–0x0F` of the relevant trigger payload; the payload offset is **not** a firmware address. On the supplied XD07U 1.06 images, the same ASCII identifier also occurs at Kernel-relative offsets `0x6476` and `0x648C` (raw B0 offsets `0x306476` and `0x30648C`; live B0 addresses `0x406476` and `0x40648C`). These offsets are observed for this image only. For unfamiliar firmware, inspect the actual extracted bytes and distinguish firmware-derived identifiers from `g_mdl_map` fallbacks. The reported key-table mismatch is informational: a firmware-derived candidate and a table entry can serve different protocol contexts; a match or mismatch alone does not establish unlock/commit validity.
+
+Observed runtime: ~30 seconds using 32 KiB chunks. A capture through raw offset `0x360000` transfers approximately **3.38 MiB** (`0x360000` bytes) from the drive; the portion of Normal examined by the scanner is smaller. Runtime depends on the drive and USB/SCSI bridge.
 
 ### `b0dumpfw`
 
-Streams 0xB0 from `0x100000` to `0x4D9E00` (full Normal region), carves out Kernel and Normal into separate files named after the drive's identity, and writes a sidecar info file.
+Streams 0xB0 starting at **live address** `0x100000` through **raw dump offset** `0x4D9E00` (equivalent live address `0x5D9E00`, the exclusive end of Normal), carves out Kernel and Normal into separate files named after the drive's identity, and writes a sidecar info file. The stream may extend beyond the minimum required end when read in whole chunks.
 
 ```
 drivekit b0dumpfw E
@@ -666,12 +677,15 @@ pioneer_BDR-XD07U_ID05_8D31_1.06_info.txt              (sidecar: model, kernel I
 
 The `_normal.bin` output can be fed directly to `scankey` without first running `decodenormal`.
 
+**Important — research images, not flash packages:** `b0dumpfw` extracts **decrypted, in-memory Kernel and Normal bodies**, not the encrypted KernelFront/Normal update envelopes expected by the flashing protocol. Despite the `.bin` extension, these outputs must **not** be passed directly to `flash`/`crossflash` as firmware packages. Flashable files require the appropriate envelope, encryption, integrity fields, and drive-specific protocol.
+
 Takes ~90 seconds (32KB chunks, ~5MB streamed).
 
-**Confirmed working (November 2026):**
-- Pre-cutoff BDR-XD07U SAT 8D31/ID05 — `PIONEER OK`, key `0xA4926CD1` at `0x3BCE6`
-- Post-cutoff BDR-XD07U SAT 8D31/ID05 (post-flash) — `PIONEER OK`, key `0xFF8A27B1` at `0x3BFEC`
-- Post-cutoff BDR-BDS7 — `PIONEER OK`, key `0xFF8A27B1` at `0x3BFEC`
+**Observed on physical BDR-XD07U hardware (November 2026):**
+- Pre-cutoff BDR-XD07U (SAT 8D31/ID05): decrypted Normal header recognized; `b0scankey` reported key candidate `0xA4926CD1` at Normal-relative `0x3BCE6`.
+- Post-cutoff BDR-XD07U (SAT 8D31/ID05, firmware 1.06 after flashing): decrypted Normal header `PIONEER BDR-BDS7` recognized; live `b0scankey` reported key candidate `0xFF8A27B1` at Normal-relative `0x3BFEC`.
+
+**Do not count `BDR-BDS7` as a third tested drive.** It is the internal protocol model identifier carried by the firmware and used for unlock/commit payloads; multiple physical drive models can use it. `PIONEER OK` means the header was recognized, **not** that a key was independently validated by an unlock or flash test.
 
 ---
 
@@ -712,24 +726,24 @@ length = 0x000000  ← zero length write
 
 **Critical discovery:** `A5 AA AA` is the BUFFER OFFSET in the CDB, NOT the payload data. Zero-length write to a specific offset acts as the unlock trigger.
 
-### Full sequence (must execute back to back, ~5ms window):
+### Full sequence (execute consecutively; exact timing constraints not established):
 
 **Post-cutoff:**
 ```
 1. GET EVENT STATUS x4 (masks: 0x5A, 0x58, 0x50, 0x40)
 2. WRITE BUFFER 12-byte CDB: 3B 02 41 A5 AA AA 00 00 00 00 00 00  (offset 0xA5AAAA)
-3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 08 00  (F4 trigger read)
-4. READ BUFFER  10-byte CDB: 3C 02 B0 50 00 00 00 00 08 00  (H8S/2600 from 0x500000)
-   → Keep reading sequential 0x800 chunks until 0x880800
+3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 A4 00  (F4 trigger read, 0xA4 bytes)
+4. READ BUFFER  10-byte CDB: 3C 02 B0 10 00 00 00 00 08 00  (live B0 0x100000)
+    → Continue sequential 0x800-byte reads; total length depends on the dump command
 ```
 
 **Pre-cutoff:**
 ```
 1. GET EVENT STATUS x4 (masks: 0x5A, 0x58, 0x50, 0x40)
 2. WRITE BUFFER 12-byte CDB: 3B 02 41 00 AA AA 00 00 00 00 00 00  (offset 0x00AAAA)
-3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 08 00  (F4 trigger read)
+3. READ BUFFER  10-byte CDB: 3C 02 F4 83 94 B4 00 00 A4 00  (F4 trigger read, 0xA4 bytes)
 4. READ BUFFER  10-byte CDB: 3C 02 B0 10 00 00 00 00 08 00  (H8S/2600 from 0x100000)
-   → Keep reading sequential 0x800 chunks until 0x880800
+    → Continue sequential 0x800-byte reads; total length depends on the dump command
 ```
 
 **Note:** Drive requires full power cycle between `hwdump` attempts.
@@ -737,11 +751,11 @@ DriveKit auto-detects pre/post-cutoff via INQUIRY date and uses the correct sequ
 
 ### Result
 
-After this sequence, `READ BUFFER 0xB0` returns decrypted H8S/2600 assembly code from the running kernel:
-- **Post-cutoff**: 7.5MB (`0x780800` bytes) — reads from `0x500000`, stops at `0x880800`
-- **Pre-cutoff**: 8.7MB — reads from `0x100000`, stops at `0x880800`
+After this sequence, `READ BUFFER 0xB0` can expose a **decrypted live memory/firmware stream**, including Kernel and Normal at the verified offsets above. In the working BDR-XD07U captures, the stream starts at **live B0 `0x100000`** for both generations; a raw dump of `0x780800` bytes spans live addresses `0x100000` through `0x880800` (end exclusive). This corresponds to approximately **7.50 MiB of captured data**; it does not mean the entire stream consists only of Kernel code.
 
-Chunk size: `0x800` bytes (2KB). Drive requires **power cycle** between `hwdump` attempts.
+The original post-cutoff `0x500000` start address in earlier capture notes is retained here as a **historical observation**, not the current confirmed BDR-XD07U extraction start. The older claimed 8.7 MB pre-cutoff size is likewise not a universal size: dump length depends on the command and capture parameters.
+
+`hwdump` reads in `0x800`-byte (2 KiB) chunks. The tested enable sequence includes a `0xA4`-byte F4 read before B0 reads. Power cycling between repeated `hwdump` attempts is recommended based on observed behavior; exact timing and reset requirements across all hardware remain under investigation.
 
 This dump has been sent to MrPenguin for H8S/2600 disassembly analysis to find the version check that blocks pre-cutoff downgrade.
 
@@ -784,6 +798,16 @@ Response[0x0C] = AACS version (e.g. 0x1B = version 27)
 
 DriveKit displays this as `AACS ver` in drive information.
 
+
+## Debugging folklore: `open_drive()`
+
+A memorable lesson from developing the live `0xB0` research commands: before investigating SCSI timing, buffer offsets, or mysterious all-zero dumps, verify that the command actually opened the drive handle. Early `b0probe`/`b0scankey` dispatch paths accidentally ran before `open_drive()`, making failed I/O look like a much more exotic firmware mystery. The dispatch order was corrected.
+
+> **Six hours of debugging. Six megabytes of zeros. Forty-seven theories about SCSI. One missing function: `open_drive();`**
+
+This is a developer anecdote, **not** a DriveKit CLI command or an extra step users need to perform.
+
+---
 
 ## Credits
 

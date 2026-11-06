@@ -9189,11 +9189,16 @@ static int cmd_b0dumpfw(void)
         UCHAR inqcdb[6]={0x12,0,0,0,64,0};
         send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
         if (inqst == 0) {
-            /* Product ID: bytes 16-31, spaces → underscore, trim trailing '_' */
-            int pi, plen=0;
+            /* Product ID: bytes 16-31, skip leading spaces, collapse runs of
+               spaces to single underscore, trim trailing underscores */
+            int pi, plen=0; int in_space=1;
             for(pi=0;pi<16;pi++) {
                 char c=(char)inq[16+pi];
-                if(c>=' '&&c<='~') dfw_model[plen++]=(c==' '?'_':c);
+                if(c==' ') {
+                    if(!in_space && plen>0) { dfw_model[plen++]='_'; in_space=1; }
+                } else if(c>=' '&&c<='~') {
+                    dfw_model[plen++]=c; in_space=0;
+                }
             }
             dfw_model[plen]='\0';
             while(plen>0&&dfw_model[plen-1]=='_') dfw_model[--plen]='\0';
@@ -9214,7 +9219,24 @@ static int cmd_b0dumpfw(void)
                 is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
             }
         }
-        /* Platform ID from g_driveID (populated by open_drive/0xF1) */
+        /* Read 0xF1 for platform ID and kernel ID if not already populated */
+        if (g_driveID == 0 || !g_kernelID[0]) {
+            UCHAR f1buf[0x30]={0}; UCHAR f1sense[SENSE_SIZE]={0};
+            if (rb_data(0xF1, 0, f1buf, 0x30, f1sense) == 0) {
+                char plat[16]={0}; int k;
+                for(k=0;k<12&&f1buf[0x10+k]>=0x20&&f1buf[0x10+k]<0x7F;k++)
+                    plat[k]=(char)f1buf[0x10+k];
+                for(k=0;k<4&&f1buf[0x18+k]>=0x20&&f1buf[0x18+k]<0x7F;k++)
+                    g_kernelID[k]=(char)f1buf[0x18+k];
+                /* Extract hex platform ID from string e.g. "SAT 9331ID05" -> 0x9331 */
+                if (g_driveID == 0) {
+                    const char *p=plat;
+                    while(*p&&(*p<'0'||*p>'9')) p++;
+                    if(*p) g_driveID=(WORD)strtol(p,NULL,16);
+                }
+            }
+        }
+        /* Platform ID from g_driveID e.g. ID58 */
         if (g_driveID != 0)
             snprintf(dfw_platid, sizeof(dfw_platid), "ID%02X", (unsigned)g_driveID);
 

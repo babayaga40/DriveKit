@@ -140,6 +140,7 @@ static int   cmd_scankey(void);
 static int   cmd_b0key(void);
 static int   cmd_b0probe(void);
 static int   cmd_b0scankey(void);
+static int   cmd_b0dumpfw(void);
 static int   sk_find_key(const UCHAR *body, size_t size, SK_MATCH *found, size_t *count);
 static int   cmd_family(void);
 static int   cmd_hwdump(void);
@@ -7179,6 +7180,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "hwdump")      == 0) ret = cmd_hwdump();
     else if (strcmp(cmd, "b0probe")     == 0) ret = cmd_b0probe();
     else if (strcmp(cmd, "b0scankey")   == 0) ret = cmd_b0scankey();
+    else if (strcmp(cmd, "b0dumpfw")    == 0) ret = cmd_b0dumpfw();
     else if (strcmp(cmd, "kernelmode")  == 0) {
         /* Send BDRFlash-style kernel mode trigger:
            WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
@@ -9138,6 +9140,198 @@ static int cmd_b0scankey(void)
     }
 
     printf("\n=== B0SCANKEY DONE ===\n");
+    return 0;
+}
+
+/* =========================================================
+   cmd_b0dumpfw — extract Kernel + Normal firmware from live 0xB0 stream
+   =========================================================
+   Streams 0xB0 from 0x100000 sequentially (same enable sequence as hwdump),
+   then carves out the two firmware regions at their confirmed offsets and
+   writes them to separate files:
+
+     kernel.bin   — 64 KiB  — dump offset 0x300000, live B0 0x400000
+     normal.bin   — ~1.8 MB — dump offset 0x310000, live B0 0x410000
+
+   Sizes confirmed from HWDUMP vs decrypted Pioneer firmware reference:
+     Kernel:  0x010000 bytes  (0x300000–0x30FFFF)
+     Normal:  0x1C9E00 bytes  (0x310000–0x4D9DFF)
+
+   The 0xB0 body is ALREADY PLAINTEXT — no decryption needed.
+   Normal begins with "PIONEER " (validated on output).
+   ========================================================= */
+
+#define B0DUMPFW_B0_BASE      0x100000UL
+#define B0DUMPFW_CHUNK        0x8000UL        /* 32 KB — matches b0scankey          */
+#define B0DUMPFW_KERNEL_OFF   0x300000UL      /* dump file offset                   */
+#define B0DUMPFW_KERNEL_SIZE  0x010000UL      /* 64 KiB                             */
+#define B0DUMPFW_NORMAL_OFF   0x310000UL      /* dump file offset                   */
+#define B0DUMPFW_NORMAL_SIZE  0x1C9E00UL      /* 1,875,456 bytes                    */
+#define B0DUMPFW_CAP         (B0DUMPFW_NORMAL_OFF + B0DUMPFW_NORMAL_SIZE)  /* 0x4D9E00 */
+
+static int cmd_b0dumpfw(void)
+{
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR payload[1] = {0};
+    int   st = 0;
+
+    printf("=== B0DUMPFW — live Kernel + Normal firmware extraction ===\n\n");
+
+    /* Detect pre/post-cutoff for WRITE BUFFER offset */
+    int is_pre_cutoff = 1;
+    {
+        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        if (inqst == 0 && inq[0x25] >= 0x20) {
+            char date[9]={0}; int di;
+            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                date[di]=inq[0x25+di];
+            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        }
+        printf("  Generation: %s\n\n",
+               is_pre_cutoff ? "PRE-CUTOFF  (offset 0x00AAAA)"
+                             : "POST-CUTOFF (offset 0xA5AAAA)");
+    }
+
+    UCHAR cdb[12] = {0x3B,0x02,0x41,
+                     (UCHAR)(is_pre_cutoff ? 0x00 : 0xA5),0xAA,0xAA,
+                     0,0,0,0,0,0};
+    DWORD b0_start = B0DUMPFW_B0_BASE;
+
+    /* GET EVENT STATUS x4 */
+    {
+        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
+        int m;
+        for (m = 0; m < 4; m++) {
+            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
+            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
+            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
+        }
+    }
+    send_scsi(g_hDrive, cdb, 12, payload, 0, SCSI_IOCTL_DATA_OUT, sense, &st);
+
+    if (st == 0) {
+        printf("  WRITE BUFFER 0x41: GOOD\n");
+        /* READ BUFFER 0xF4 */
+        {
+            UCHAR f4buf[0xA4]={0}; UCHAR f4cdb[10]={0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
+            UCHAR f4sense[SENSE_SIZE]={0}; int f4st=0;
+            send_scsi(g_hDrive,f4cdb,10,f4buf,0xA4,SCSI_IOCTL_DATA_IN,f4sense,&f4st);
+        }
+
+        /* First chunk */
+        {
+            UCHAR b0buf[B0DUMPFW_CHUNK] = {0};
+            UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
+                (UCHAR)(b0_start>>16),(UCHAR)(b0_start>>8),(UCHAR)(b0_start),
+                0,(UCHAR)(B0DUMPFW_CHUNK>>8),(UCHAR)(B0DUMPFW_CHUNK),0};
+            UCHAR b0sense[SENSE_SIZE]={0}; int b0st=0;
+            send_scsi(g_hDrive,b0cdb,10,b0buf,B0DUMPFW_CHUNK,SCSI_IOCTL_DATA_IN,b0sense,&b0st);
+
+            if (b0st != 0) {
+                printf("  0xB0 locked (key=%02X ASC=%02X)\n",b0sense[2]&0x0F,b0sense[12]);
+                return 1;
+            }
+
+            printf("  0xB0 open! Streaming %.1f MB to b0dumpfw_raw.bin...\n",
+                   (double)B0DUMPFW_CAP / (1024.0*1024.0));
+            fflush(stdout);
+
+            FILE *fp = fopen("b0dumpfw_raw.bin", "wb");
+            DWORD b0offset = b0_start;
+            DWORD total = 0;
+            if (fp) fwrite(b0buf, 1, B0DUMPFW_CHUNK, fp);
+            total += B0DUMPFW_CHUNK;
+
+            while (1) {
+                UCHAR chunk[B0DUMPFW_CHUNK] = {0};
+                UCHAR csense[SENSE_SIZE]={0}; int cst=0;
+                b0offset += B0DUMPFW_CHUNK;
+                UCHAR ccdb[10] = {0x3C,0x02,0xB0,
+                    (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+                    0,(UCHAR)(B0DUMPFW_CHUNK>>8),(UCHAR)(B0DUMPFW_CHUNK),0};
+                send_scsi(g_hDrive,ccdb,10,chunk,B0DUMPFW_CHUNK,SCSI_IOCTL_DATA_IN,csense,&cst);
+                if (cst != 0) { printf("\n  SCSI error at offset 0x%06X — stopping.\n",b0offset); break; }
+                if (fp) fwrite(chunk, 1, B0DUMPFW_CHUNK, fp);
+                total += B0DUMPFW_CHUNK;
+                if (total >= B0DUMPFW_CAP) {
+                    printf("\n  Cap reached (0x%06X bytes).\n", total);
+                    break;
+                }
+                printf("\r  Streamed 0x%06X / 0x%06lX bytes...", total, (unsigned long)B0DUMPFW_CAP);
+                fflush(stdout);
+            }
+            if (fp) fclose(fp);
+            printf("  Raw dump: b0dumpfw_raw.bin (%u bytes)\n\n", total);
+
+            if (total < B0DUMPFW_NORMAL_OFF + 16) {
+                fprintf(stderr,"  Stream too short — firmware regions not reached.\n");
+                return 1;
+            }
+
+            /* Carve Kernel */
+            printf("  Extracting kernel.bin  (0x%06lX bytes from offset 0x%06lX)...\n",
+                   (unsigned long)B0DUMPFW_KERNEL_SIZE, (unsigned long)B0DUMPFW_KERNEL_OFF);
+            {
+                FILE *rf = fopen("b0dumpfw_raw.bin","rb");
+                FILE *wf = fopen("kernel.bin","wb");
+                if (rf && wf) {
+                    UCHAR tbuf[0x1000]; DWORD rem = B0DUMPFW_KERNEL_SIZE;
+                    fseek(rf,(long)B0DUMPFW_KERNEL_OFF,SEEK_SET);
+                    while (rem > 0) {
+                        DWORD n = rem < sizeof(tbuf) ? rem : (DWORD)sizeof(tbuf);
+                        fread(tbuf,1,n,rf); fwrite(tbuf,1,n,wf); rem -= n;
+                    }
+                }
+                if (rf) fclose(rf);
+                if (wf) fclose(wf);
+                printf("    kernel.bin written.\n");
+            }
+
+            /* Carve Normal */
+            printf("  Extracting normal.bin  (0x%06lX bytes from offset 0x%06lX)...\n",
+                   (unsigned long)B0DUMPFW_NORMAL_SIZE, (unsigned long)B0DUMPFW_NORMAL_OFF);
+            {
+                /* Validate header first */
+                FILE *rf = fopen("b0dumpfw_raw.bin","rb");
+                FILE *wf = fopen("normal.bin","wb");
+                UCHAR hdr[8]={0};
+                if (rf) { fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); fread(hdr,1,8,rf); rewind(rf); fseek(rf,(long)B0DUMPFW_NORMAL_OFF,SEEK_SET); }
+                if (memcmp(hdr,"PIONEER ",8) != 0) {
+                    printf("    WARNING: Normal header is %02X %02X %02X %02X %02X %02X %02X %02X — not 'PIONEER '\n",
+                           hdr[0],hdr[1],hdr[2],hdr[3],hdr[4],hdr[5],hdr[6],hdr[7]);
+                } else {
+                    printf("    Header: PIONEER  OK\n");
+                }
+                if (rf && wf) {
+                    UCHAR tbuf[0x1000]; DWORD rem = B0DUMPFW_NORMAL_SIZE;
+                    while (rem > 0) {
+                        DWORD n = rem < sizeof(tbuf) ? rem : (DWORD)sizeof(tbuf);
+                        fread(tbuf,1,n,rf); fwrite(tbuf,1,n,wf); rem -= n;
+                    }
+                }
+                if (rf) fclose(rf);
+                if (wf) fclose(wf);
+                printf("    normal.bin written.\n");
+            }
+
+            printf("\n  +--------------------------------------------+\n");
+            printf("  |  B0DUMPFW RESULT                           |\n");
+            printf("  +--------------------------------------------+\n");
+            printf("  kernel.bin   %lu KiB  (live B0 0x400000)\n",
+                   (unsigned long)(B0DUMPFW_KERNEL_SIZE/1024));
+            printf("  normal.bin   %lu KiB  (live B0 0x410000)\n",
+                   (unsigned long)(B0DUMPFW_NORMAL_SIZE/1024));
+            printf("  b0dumpfw_raw.bin  %u bytes  (full sequential dump)\n\n", total);
+        }
+    } else {
+        printf("  WRITE BUFFER 0x41 FAILED (key=%02X ASC=%02X)\n\n",
+               sense[2]&0x0F, sense[12]);
+        return 1;
+    }
+
+    printf("=== B0DUMPFW DONE ===\n");
     return 0;
 }
 

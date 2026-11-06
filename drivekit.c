@@ -3485,7 +3485,7 @@ static const PIONEER_KEY pioneer_keys[] =
     { 0x8801, "GENE", 0xF2125032 },
     { 0x8801, "ID36", 0xAA6C0AF0 },
     { 0x8801, "ID43", 0xDF302B98 },
-    { 0x8801, "ID58", 0xA4926CD1 },
+    { 0x8801, "ID58", 0x6123789A },  /* confirmed working Nov 2026: 8800/ID60→8801/ID58 cross-family flash used 0x6123789A (running fw key); scankey extracted 0xA4926CD1 from S8801581.153 — unconfirmed, may be native 8801 key */
     { 0x8801, "ID60", 0x6123789A },  /* universal key — matching 0x8800/ID60 correction; 0x5CF2E094 was false scankey extraction */
     { 0x8801, "ID72", 0x91957AFA },
     { 0x8801, "ID75", 0xF6B55F31 },  /* from UnlockKeys.hpp reference */
@@ -8756,6 +8756,14 @@ static int cmd_scankey(void)
                m.key[0], m.key[1], m.key[2], m.key[3]);
         printf("  Unlock key (LE DWORD)        : 0x%08lX\n", (unsigned long)le);
         printf("\n");
+        /* Detect known false-extraction pattern: extracted key matches acceptance-signature constant */
+        if (le == 0x6123789A) {
+            printf("  CAUTION: extracted key 0x%08lX matches the Pioneer acceptance-signature constant.\n",
+                   (unsigned long)le);
+            printf("           This is a known false-extraction pattern — scankey hit the signature\n");
+            printf("           constant (9A 78 23 61) instead of the actual key-comparison branch.\n");
+            printf("           Extracted key is NOT valid. Use key-table entry or hardware capture.\n");
+        }
         /* Cross-check against known key table */
         DWORD known = pioneer_key_lookup(g_driveID, NULL);
         if (known && known != le) {

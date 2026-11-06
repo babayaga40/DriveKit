@@ -245,7 +245,17 @@ Note: WRITE BUFFER offsets ≠ file offsets; they are not proven physical NAND a
 - Unlock/commit key: `0xFF8A27B1` (`B1 27 8A FF` on wire)
 - Commit returned **GOOD**; subsequent `drivekit info` and INQUIRY independently reported **firmware 1.04**, date `22/05/31`.
 
-**PRE→PRE cross-family flash — first confirmed (November 2026, DriveKit verified):**
+**PRE→PRE cross-family flash — second confirmed, 8800→8801 (November 2026, DriveKit verified):**
+- Drive: BD-RW BDR-211M (SAT 8800/ID60, firmware 1.53, pre-cutoff) — originally Asus-rebranded BDR-209M (SAT 8801/ID58), crossflashed to 8800 years prior
+- Confirmed: flash of `S8801580.153` + `S8801581.153` (SAT 8801/ID58) using `drivekit flash --key 0x6123789A`
+- Unlock key used: `0x6123789A` — the **running firmware's** key (8800/ID60), not the target firmware's key
+- Family hashes: MISMATCH (8800 `1339e33fc7d35411` vs 8801 `cbf023475900b8f1`) — but ASIC registers identical on both; difference is in PIN/BOARD registers only
+- AACS version advanced: 0x13 → 0x1B after flash
+- Commit returned **GOOD**; `drivekit info` confirmed **Platform: SAT 8801ID58**, UHD: Yes
+- Disc tray (previously stuck) resumed normal operation after flash to native platform
+- Note: official Pioneer updaters and bdrflash both refused this drive; DriveKit completed it
+
+**PRE→PRE cross-family flash — first confirmed, 8800→8800 same-family (November 2026, DriveKit verified):**
 - Drive: BD-RW BDR-211M (SAT 8800/ID60, firmware 1.53, pre-cutoff)
 - Confirmed: flash of `S8800600.153` + `S8800601.153` onto drive using `drivekit crossflash`
 - Key: `0x6123789A` (universal) — table previously had false `0x5CF2E094` from scankey false extraction; corrected

@@ -69,7 +69,7 @@ DriveKit stores keys as little-endian DWORD values (`0x6123789A`) which produce 
 
 **Firmware-derived update-entry key detection (`scankey`):** The scanner examines *decoded Normal firmware* for a recognized H8S/2600 acceptance-handler instruction pattern, follows its branch displacement to a key-comparison instruction, and extracts the embedded four-byte key. The recognition method is based on MattJackson's content-derived receiver-control analysis. This is **not** the Normal firmware decryption key. The extracted bytes are reported in wire order and as a little-endian DWORD. The scanner requires an unambiguous keyed-handler match; a matching pattern does not by itself prove a flash protocol is safe for the target drive. See [scankey command](#scankey-command).
 
-**Important key-table audit:** On decoded `S8800601.153`, `scankey` found `94 E0 F2 5C` (LE DWORD `0x5CF2E094`), while the existing table selected `0x6123789A`. This is a **discrepancy**, not yet a hardware-validated replacement for that drive/protocol. The old value corresponds to the fixed four-byte immediate `9A 78 23 61` within the acceptance signature; this makes accidental extraction of that signature constant a plausible explanation worth auditing, but does not invalidate all other previously successful uses of `0x6123789A`. Verify against a known-good capture before flashing.
+**Key-table audit result (resolved Nov 2026):** On decoded `S8800601.153`, `scankey` extracted `94 E0 F2 5C` (LE DWORD `0x5CF2E094`), conflicting with the table value `0x6123789A`. Hardware test on BDR-211M (SAT 8800/ID60) confirmed `0x5CF2E094` was rejected by the drive; `0x6123789A` succeeded and the drive flashed to UHD: Yes. The extraction was a false positive — `scankey` hit the fixed acceptance-signature constant (`9A 78 23 61` = `0x6123789A` LE) rather than the actual key-comparison branch. Key table corrected; `0x6123789A` confirmed universal for SAT 8800/ID60.
 
 **Pre vs post-cutoff detection:** DriveKit probes ordinary `READ BUFFER 0xB0` access before the special `hwdump` trigger sequence:
 - Returns data → **pre-cutoff** drive (before 2022-12-27) — H8S/2600 code visible
@@ -244,6 +244,15 @@ Note: WRITE BUFFER offsets ≠ file offsets; they are not proven physical NAND a
 - Protocol: flat three-chunk kernel → one full Normal pass → immediate commit
 - Unlock/commit key: `0xFF8A27B1` (`B1 27 8A FF` on wire)
 - Commit returned **GOOD**; subsequent `drivekit info` and INQUIRY independently reported **firmware 1.04**, date `22/05/31`.
+
+**PRE→PRE cross-family flash — first confirmed (November 2026, DriveKit verified):**
+- Drive: BD-RW BDR-211M (SAT 8800/ID60, firmware 1.53, pre-cutoff)
+- Confirmed: flash of `S8800600.153` + `S8800601.153` onto drive using `drivekit crossflash`
+- Key: `0x6123789A` (universal) — table previously had false `0x5CF2E094` from scankey false extraction; corrected
+- Protocol: flat three-chunk kernel → full Normal (pre-cutoff path) → immediate commit
+- PRE-CUTOFF cross-family warning fired (advisory, not blocking) — drive completed flash successfully
+- Commit returned **GOOD**; subsequent `drivekit info` reported **UHD: Yes**
+- Note: `0x5CF2E094` was silently rejected by drive hardware — confirmed false scankey extraction of acceptance-signature constant
 
 
 ---
@@ -579,7 +588,7 @@ year letter (N=2022, O=2023, P=2024...)
 
 ## Pending Research
 
-- **Audit unlock-key table entries with `scankey`:** investigate the `S8800601.153` mismatch (`0x5CF2E094` extracted vs `0x6123789A` in the table); validate new keys against captures/hardware and check for accidental use of the fixed acceptance-signature immediate.
+- ~~**Audit unlock-key table entries with `scankey`:** investigate the `S8800601.153` mismatch (`0x5CF2E094` extracted vs `0x6123789A` in the table)~~ **RESOLVED (Nov 2026):** Hardware test on BDR-211M (SAT 8800/ID60) confirmed `0x5CF2E094` rejected by drive; `0x6123789A` (universal) accepted and flash succeeded. `scankey` hit the fixed acceptance-signature constant (`9A 78 23 61`) rather than the actual key comparison — classic false extraction. Key table corrected; `0x6123789A` remains the universal key for 0x8800/ID60.
 - **Generalize the verified post→pre downgrade** beyond the tested BDR-XD07U SAT 8D31 / ID05 and 1.04 kernel; validate marker/checksum locations and transfer behavior for other kernel families before claiming support.
 - **Standalone `decryptkernel --patch` verification:** ensure it patches decoded **byte** offset `0xFE`, not DWORD index `0xFE`; distinguish decoded 64 KiB output from the encrypted `0x11200`-byte flashable kernel.
 - **H8S/2600 version-check analysis:** continue studying pre/post-cutoff `hwdump` captures to understand the underlying validation logic rather than relying only on observed protocol behavior.

@@ -3470,7 +3470,7 @@ static const PIONEER_KEY pioneer_keys[] =
     /* platform 0x8800 */
     { 0x8800, "ID86", 0xD02A0432 },
     { 0x8800, "ID43", 0xDF302B98 },
-    { 0x8800, "ID60", 0x5CF2E094 },
+    { 0x8800, "ID60", 0x6123789A },  /* universal key — confirmed working BDR-211M Nov 2026; scankey gave 0x5CF2E094 (false extraction) */
     { 0x8800, "ID72", 0x91957AFA },
     { 0x8800, "ID36", 0xAA6C0AF0 },
     { 0x8800, "ID76", 0x4636CE34 },
@@ -3486,7 +3486,7 @@ static const PIONEER_KEY pioneer_keys[] =
     { 0x8801, "ID36", 0xAA6C0AF0 },
     { 0x8801, "ID43", 0xDF302B98 },
     { 0x8801, "ID58", 0xA4926CD1 },
-    { 0x8801, "ID60", 0x5CF2E094 },
+    { 0x8801, "ID60", 0x6123789A },  /* universal key — matching 0x8800/ID60 correction; 0x5CF2E094 was false scankey extraction */
     { 0x8801, "ID72", 0x91957AFA },
     { 0x8801, "ID75", 0xF6B55F31 },  /* from UnlockKeys.hpp reference */
     { 0x8801, "ID76", 0x4636CE34 },

@@ -178,3 +178,106 @@ When flashing pre-cutoff firmware onto a post-cutoff drive, the drive checks thi
 | BDR-XD08U | 1.01 | 2022-10-11 |
 | BDR-XD07U | 1.04 | 2022-05-31 |
 | BDR-XD06U | 1.11 | — |
+
+---
+
+## Live Firmware Extraction — `b0probe` / `b0scankey` / `b0dumpfw`
+
+These three commands read firmware directly from the running drive via `READ BUFFER 0xB0`. No firmware file is needed. They work on both pre-cutoff and post-cutoff drives — the correct enable sequence (`0x00AAAA` or `0xA5AAAA`) is auto-detected from the INQUIRY date.
+
+> **Note:** The drive requires a full power cycle between repeated `0xB0` enable attempts. If a command fails with a SCSI error on the second run, unplug and replug the drive first.
+
+---
+
+### `b0probe` — quick access check
+
+```
+drivekit b0probe E
+```
+
+Runs the enable sequence and reads the first chunk to confirm whether `0xB0` is accessible. Fast (~2 seconds). Use this first if you're not sure the drive will respond, or after a power cycle to confirm the drive is ready.
+
+Expected output on success:
+```
+Generation: POST-CUTOFF (offset 0xA5AAAA, 0xB0 from 0x100000)
+WRITE BUFFER 0x41 offset=0xA5AAAA: GOOD
+0xB0 ACCESSIBLE!
+Base[0..7]: 7A 07 00 00 04 00 07 80
+```
+
+---
+
+### `b0scankey` — live unlock key extraction
+
+```
+drivekit b0scankey E
+```
+
+Streams `0xB0` from live address `0x100000` through the Normal firmware region, then scans the Normal body for the update-entry unlock key — the same algorithm as the offline `scankey` command, but reading straight from the drive.
+
+The result box identifies the drive fully from live data alone:
+
+```
+  +--------------------------------------------------+
+  |  B0SCANKEY — LIVE FIRMWARE IDENTIFICATION        |
+  +--------------------------------------------------+
+  Physical drive                : BDR-XD07U
+  Internal model identifier     : PIONEER BDR-BDS7
+  Internal model source         : Normal +0x000000
+  Platform                      : SAT 8D31
+  Kernel ID                     : ID05
+  Firmware revision             : 1.06
+
+  Keyed handler matches         : 1
+  Key bytes offset in Normal    : 0x3BFEC
+  Reject branch variant         : 10-byte
+  Unlock key (wire order)       : B1 27 8A FF
+  Unlock key (LE DWORD)         : 0xFF8A27B1
+
+  Cross-check                   : MISMATCH
+  Key-table value               : 0x6123789A
+```
+
+**What to look for:**
+
+- **Physical drive** — model from INQUIRY (last word, e.g. `BDR-XD07U`).
+- **Internal model identifier** — first 16 bytes of the decrypted Normal body. This is the string used in bytes `0x00–0x0F` of the unlock/commit trigger payload. `PIONEER BDR-BDS7` is an internal protocol identifier shared by multiple physical models — not a separate drive.
+- **Platform / Kernel ID** — from `READ BUFFER 0xF1`. Useful for identifying an unknown drive.
+- **Unlock key** — the key embedded in the firmware's update-entry handler. This is a firmware-derived candidate; a **Cross-check: MISMATCH** means it differs from the internal key table. The table may be outdated or the drive may use a drive-specific key. Verify against a known-good capture before flashing on a new model.
+- **Cross-check: OK** — key matches the internal table. High confidence.
+
+Takes ~30 seconds. Saves a raw dump to `b0scankey_dump.bin`.
+
+---
+
+### `b0dumpfw` — live firmware file extraction
+
+```
+drivekit b0dumpfw E
+```
+
+Streams `0xB0` from live address `0x100000` through the full Normal firmware region, then carves out the Kernel (64 KiB) and Normal (~1.8 MB) at their confirmed offsets and writes named output files:
+
+```
+pioneer_BDR-XD07U_ID05_8D31_1.06_kernel.bin    64 KiB
+pioneer_BDR-XD07U_ID05_8D31_1.06_normal.bin    ~1.8 MB
+pioneer_BDR-XD07U_ID05_8D31_1.06_raw.bin       ~5 MB  (full sequential dump)
+pioneer_BDR-XD07U_ID05_8D31_1.06_info.txt      sidecar: identity, file sizes
+```
+
+The filename is built from live drive data — model, kernel ID, platform, and firmware revision — so each dump is self-labelled.
+
+Takes ~90 seconds. The Normal output (`_normal.bin`) can be fed directly to `scankey` without running `decodenormal` first, since the `0xB0` stream is already decrypted.
+
+> ⚠️ **These are research images, not flash packages.** The extracted Kernel and Normal are decrypted, in-memory bodies. They are **not** the encrypted KernelFront/Normal update envelopes the flashing protocol expects. Do not pass them to `flash`/`crossflash`.
+
+---
+
+### Confirmed layout (tested BDR-XD07U SAT 8D31/ID05)
+
+| Region | Raw dump offset | Live B0 address | Size |
+|--------|----------------|-----------------|------|
+| Kernel | `0x300000` | `0x400000` | 64 KiB (`0x010000`) |
+| Normal | `0x310000` | `0x410000` | ~1.8 MB (`0x1C9E00`) |
+
+The sequential capture starts at live B0 `0x100000` = raw dump offset `0x000000`. These offsets are confirmed on the tested SAT 8D31/ID05 hardware; other Pioneer families have not yet been verified.

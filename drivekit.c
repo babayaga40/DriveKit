@@ -8712,28 +8712,35 @@ static int cmd_b0key(void)
         if (st != 0)
             printf("  WRITE BUFFER 0x41: status=%d (continuing anyway)\n", st);
     }
+    /* READ BUFFER 0xF4 then immediately 0xB0 — timing critical, ~5ms window */
     {
         UCHAR f4buf[0xA4]={0};
         UCHAR f4cdb[10]={0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
         UCHAR f4sense[SENSE_SIZE]={0}; int f4st=0;
         send_scsi(g_hDrive,f4cdb,10,f4buf,0xA4,SCSI_IOCTL_DATA_IN,f4sense,&f4st);
     }
-
-    /* Now probe the key offset */
+    /* Probe immediately — inline CDB, no rb_data wrapper to minimise latency */
     DWORD probe = B0KEY_ABS_PROBE;
+    {
+        UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
+            (UCHAR)(probe>>16),(UCHAR)(probe>>8),(UCHAR)(probe),
+            0,(UCHAR)(B0KEY_BUF_SIZE>>8),(UCHAR)(B0KEY_BUF_SIZE),0};
+        memset(buf, 0xFF, B0KEY_BUF_SIZE);
+        memset(sense, 0, SENSE_SIZE);
+        send_scsi(g_hDrive, b0cdb, 10, buf, B0KEY_BUF_SIZE,
+                  SCSI_IOCTL_DATA_IN, sense, &st);
+    }
+
     printf("  Probe offset : 0x%08lX  (file offset 0x%08lX + b0_start 0x%06lX - 6)\n",
            (unsigned long)probe,
            (unsigned long)B0KEY_FILE_KEY_OFF,
            (unsigned long)B0KEY_B0_START);
     printf("  Read size    : %u bytes\n\n", B0KEY_BUF_SIZE);
 
-    memset(buf, 0xFF, sizeof buf);
-    memset(sense, 0, sizeof sense);
-
-    if (rb_data(0xB0, probe, buf, B0KEY_BUF_SIZE, sense)) {
-        fprintf(stderr, "  FAILED: rb_data(0xB0, 0x%08lX) sense=%02X/%02X/%02X\n",
+    if (st != 0) {
+        fprintf(stderr, "  FAILED: READ BUFFER 0xB0 at 0x%08lX sense=%02X/%02X/%02X\n",
                 (unsigned long)probe, sense[2]&0x0F, sense[12], sense[13]);
-        fprintf(stderr, "  0xB0 may not have opened, or offset is wrong for this platform.\n");
+        fprintf(stderr, "  0xB0 window may have closed, or offset is wrong for this platform.\n");
         return 1;
     }
 

@@ -97,6 +97,25 @@ typedef struct {
 
 
 /* =========================================================
+   SK_MATCH — key-scanner result type (used by cmd_b0scankey / cmd_b0key)
+   ========================================================= */
+#define SK_ACCEPT_LEN 8u
+#define SK_KEY_LEN    4u
+
+static const UCHAR sk_accept_compare[7] = {
+    0x7A, 0x20, 0x9A, 0x78, 0x23, 0x61, 0x47
+};
+static const UCHAR sk_key_compare[2] = { 0x7A, 0x20 };
+
+typedef struct {
+    size_t accept_offset;
+    size_t compare_offset;
+    size_t key_offset;
+    unsigned reject_length;
+    UCHAR key[SK_KEY_LEN];
+} SK_MATCH;
+
+/* =========================================================
    FORWARD DECLARATIONS
    ========================================================= */
 static void  build_pioneer_payload(UCHAR *payload, DWORD key);
@@ -119,6 +138,9 @@ static int   cmd_crossflash(void);   /* renamed to "flash" on CLI */
 static int   cmd_decodenormal(void);
 static int   cmd_scankey(void);
 static int   cmd_b0key(void);
+static int   cmd_b0probe(void);
+static int   cmd_b0scankey(void);
+static int   sk_find_key(const UCHAR *body, size_t size, SK_MATCH *found, size_t *count);
 static int   cmd_family(void);
 static int   cmd_hwdump(void);
 static int   cmd_flashinfo(void);
@@ -5051,7 +5073,9 @@ static void print_help(void)
     printf("                  --file kernel.100 [--patch] [--file2 out.bin]\n");
     printf("  decodenormal  Decrypt normal firmware envelope; reports UHD capability\n");
     printf("  scankey       Extract unlock key from a decoded Normal firmware body\n");
-  printf("  b0key         [EXPERIMENTAL] Read unlock key from 0xB0 at hardcoded offset\n");
+    printf("  b0key         [EXPERIMENTAL] Read unlock key from 0xB0 at hardcoded offset\n");
+    printf("  b0probe       [EXPERIMENTAL] Sample 0xB0 at key addresses — address-space diagnostic\n");
+    printf("  b0scankey     [EXPERIMENTAL] Read Normal from 0xB0, scan for unlock key\n");
     printf("                  --file S8D31051.104 [--file2 decoded_body.bin]\n");
     printf("  family        Hardware family fingerprint from normal firmware envelope\n");
     printf("                  --file normal.bin [--file2 other_normal.bin]\n");
@@ -7152,7 +7176,9 @@ int main(int argc, char *argv[])
         }
     }
     else if (strcmp(cmd, "e5test")      == 0) ret = cmd_e5test();
-    else if (strcmp(cmd, "hwdump")  == 0) ret = cmd_hwdump();
+    else if (strcmp(cmd, "hwdump")      == 0) ret = cmd_hwdump();
+    else if (strcmp(cmd, "b0probe")     == 0) ret = cmd_b0probe();
+    else if (strcmp(cmd, "b0scankey")   == 0) ret = cmd_b0scankey();
     else if (strcmp(cmd, "kernelmode")  == 0) {
         /* Send BDRFlash-style kernel mode trigger:
            WRITE BUFFER mode=0x04 bufID=0xFF len=0x100
@@ -8639,6 +8665,7 @@ static int cmd_decodenormal(void)
     return 0;
 }
 
+/* --- key scanner (ported from MattJackson's Rust algorithm) ------------- */
 /* =========================================================
    CMD_ENCRYPTKERNEL
    =========================================================
@@ -8785,6 +8812,336 @@ static int cmd_b0key(void)
 }
 
 /* =========================================================
+   cmd_b0probe — small diagnostic samples at key addresses around 0xB0
+   =========================================================
+   Fires the full enable sequence then reads 32 bytes at each of several
+   probe addresses, using a 0xA5 sentinel so we can distinguish
+   "drive returned data" from "buffer was never populated".
+   ========================================================= */
+static int cmd_b0probe(void)
+{
+    UCHAR sense[SENSE_SIZE];
+    int   st = 0;
+    int   is_pre_cutoff = 1;
+
+    printf("=== B0PROBE — 0xB0 address-space diagnostic ===\n\n");
+
+    /* Detect pre/post-cutoff */
+    {
+        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        if (inqst == 0 && inq[0x25] >= 0x20) {
+            char date[9]={0}; int di;
+            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                date[di]=inq[0x25+di];
+            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        }
+        printf("  Generation : %s\n\n", is_pre_cutoff ? "PRE-CUTOFF" : "POST-CUTOFF");
+    }
+
+    /* Probe addresses — covering base, kernel, normal, key */
+    static const struct { DWORD addr; const char *label; } probes[] = {
+        { 0x100000UL, "base (dump file offset 0x000000)" },
+        { 0x300000UL, "expect: zeros/gap before kernel"  },
+        { 0x400000UL, "kernel start (dump file 0x300000)"},
+        { 0x408000UL, "kernel+0x8000"                   },
+        { 0x410000UL, "Normal start (dump file 0x310000)"},
+        { 0x418000UL, "Normal+0x8000"                   },
+        { 0x440000UL, "Normal+0x30000"                  },
+        { 0x448000UL, "Normal+0x38000 (near key 0x3BCE6)"},
+    };
+    int nprobes = (int)(sizeof(probes)/sizeof(probes[0]));
+
+    /* Enable sequence — mirrors hwdump exactly, checking each step */
+    printf("  Enabling 0xB0 access...\n");
+    {
+        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
+        int m;
+        for (m = 0; m < 4; m++) {
+            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
+            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
+            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
+            printf("  GET EVENT STATUS mask=0x%02X : %s\n", masks[m], esst==0?"OK":"FAIL");
+        }
+    }
+    int wb_ok = 0;
+    {
+        UCHAR payload[1]={0};
+        UCHAR wbcdb[12]={0x3B,0x02,0x41,
+                         (UCHAR)(is_pre_cutoff ? 0x00 : 0xA5),0xAA,0xAA,
+                         0,0,0,0,0,0};
+        UCHAR wbsense[SENSE_SIZE]={0}; int wbst=0;
+        send_scsi(g_hDrive,wbcdb,12,payload,0,SCSI_IOCTL_DATA_OUT,wbsense,&wbst);
+        wb_ok = (wbst == 0);
+        printf("  WRITE BUFFER 0x41 : %s", wb_ok ? "OK" : "FAILED");
+        if (!wb_ok) printf("  sense=%02X/%02X/%02X", wbsense[2]&0x0F, wbsense[12], wbsense[13]);
+        printf("\n");
+        if (!wb_ok) {
+            printf("  Enable sequence failed — 0xB0 will not be accessible.\n");
+            return 1;
+        }
+    }
+    {
+        UCHAR f4buf[0xA4]={0};
+        UCHAR f4cdb[10]={0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
+        UCHAR f4sense[SENSE_SIZE]={0}; int f4st=0;
+        send_scsi(g_hDrive,f4cdb,10,f4buf,0xA4,SCSI_IOCTL_DATA_IN,f4sense,&f4st);
+        printf("  READ BUFFER 0xF4  : %s", f4st==0?"OK":"FAILED");
+        if (f4st) printf("  sense=%02X/%02X/%02X", f4sense[2]&0x0F, f4sense[12], f4sense[13]);
+        printf("\n\n");
+    }
+
+    /* Probe each address sequentially — walk forward from base */
+    printf("  Probing (sequential walk from 0x100000):\n");
+    printf("  %-52s  %-9s  %s\n", "Address / label", "Status", "First 16 bytes");
+    printf("  %s\n", "----------------------------------------------------------------------");
+
+    DWORD cur = 0x100000UL;
+    int   i;
+    for (i = 0; i < nprobes; i++) {
+        DWORD target = probes[i].addr;
+        /* Walk forward to target, discarding 2KB at a time (drive max transfer) */
+        while (cur < target) {
+            UCHAR skip[CHUNK_SIZE]; UCHAR ss[SENSE_SIZE]={0}; int sst=0;
+            UCHAR sc[10]={0x3C,0x02,0xB0,
+                (UCHAR)(cur>>16),(UCHAR)(cur>>8),(UCHAR)(cur),
+                0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+            send_scsi(g_hDrive,sc,10,skip,CHUNK_SIZE,SCSI_IOCTL_DATA_IN,ss,&sst);
+            if (sst) {
+                printf("  Walk failed at 0x%06lX  sense=%02X/%02X/%02X\n",
+                       (unsigned long)cur, ss[2]&0x0F, ss[12], ss[13]);
+            }
+            cur += (DWORD)CHUNK_SIZE;
+        }
+        /* Read one chunk (2KB) at target — use drive's native transfer size */
+        UCHAR buf[CHUNK_SIZE]; memset(buf, 0xA5, sizeof(buf));
+        UCHAR cdb[10]={0x3C,0x02,0xB0,
+            (UCHAR)(target>>16),(UCHAR)(target>>8),(UCHAR)(target),
+            0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+        memset(sense,0,SENSE_SIZE);
+        send_scsi(g_hDrive,cdb,10,buf,CHUNK_SIZE,SCSI_IOCTL_DATA_IN,sense,&st);
+        cur = target + (DWORD)CHUNK_SIZE;
+
+        /* Classify result */
+        int all_a5=1, all_00=1, all_ff=1, j;
+        for(j=0;j<32;j++){
+            if(buf[j]!=0xA5) all_a5=0;
+            if(buf[j]!=0x00) all_00=0;
+            if(buf[j]!=0xFF) all_ff=0;
+        }
+        const char *verdict = st!=0 ? "FAILED" : all_a5 ? "SENTINEL(not written)" :
+                              all_ff ? "all-FF" : all_00 ? "all-00" : "DATA";
+
+        printf("  0x%06lX  %-40s  %-21s  ",
+               (unsigned long)target, probes[i].label,
+               st!=0 ? "sense" : verdict);
+        if (st != 0)
+            printf("sense=%02X/%02X/%02X", sense[2]&0x0F, sense[12], sense[13]);
+        else
+            for(j=0;j<16;j++) printf("%02X ", buf[j]);
+        printf("\n");
+        fflush(stdout);
+    }
+
+    printf("\nExpected at 0x410000: 50 49 4F 4E 45 45 52 20  (PIONEER )\n");
+    printf("Expected at 0x44BCE6: D1 6C 92 A4               (key 0xA4926CD1)\n");
+    printf("\n=== B0PROBE DONE ===\n");
+    return 0;
+}
+
+/* =========================================================
+   cmd_b0scankey — read Normal firmware from 0xB0, decrypt, extract unlock key
+   =========================================================
+   RESEARCH TOOL — standalone, does not affect other commands.
+
+   Enables 0xB0 access, reads the Normal firmware envelope from NAND,
+   decrypts it inline, and runs sk_find_key() to extract the unlock key —
+   all without needing a firmware file on disk.
+
+   Normal firmware location in 0xB0 address space:
+     0xB0 starts at 0x100000; Normal at dump file offset 0x310000
+     → 0xB0 live address 0x410000.
+   The Normal body in 0xB0 is ALREADY PLAINTEXT (confirmed: starts with
+   "PIONEER ", matches Matt's reference file except 8 runtime-patched bytes).
+   No decryption needed — read raw and scan directly.
+   Key sits at body offset 0x3BCE6 (confirmed 8801/ID58 fw 1.53).
+   ========================================================= */
+
+/* b0scankey: stream the FULL 0xB0 dump in one shot (same as hwdump), write to
+   b0scankey_dump.bin, then scan the whole file for the key pattern.
+   This avoids any gap between the enable sequence and reading. */
+#define B0SCANKEY_B0_BASE         0x100000UL   /* 0xB0 stream starts here              */
+#define B0SCANKEY_CHUNK           CHUNK_SIZE   /* 2 KB — drive's actual max transfer   */
+
+static int cmd_b0scankey(void)
+{
+    /* Verbatim copy of cmd_hwdump's enable+stream sequence.
+       Only difference: writes to b0scankey_dump.bin, stops at 6MB cap,
+       then scans the Normal region for the unlock key. */
+    UCHAR sense[SENSE_SIZE] = {0};
+    UCHAR payload[1] = {0};
+    int   st = 0;
+
+    printf("=== B0SCANKEY — 0xB0 live key extraction ===\n\n");
+
+    int is_pre_cutoff = 1;
+    {
+        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        if (inqst == 0 && inq[0x25] >= 0x20) {
+            char date[9]={0}; int di;
+            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                date[di]=inq[0x25+di];
+            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
+        }
+        printf("  Generation: %s\n\n",
+               is_pre_cutoff ? "PRE-CUTOFF  (offset 0x00AAAA, 0xB0 from 0x100000)"
+                             : "POST-CUTOFF (offset 0xA5AAAA, 0xB0 from 0x100000)");
+    }
+
+    UCHAR cdb[12] = {0x3B,0x02,0x41,
+                     (UCHAR)(is_pre_cutoff ? 0x00 : 0xA5),0xAA,0xAA,
+                     0,0,0,0,0,0};
+    DWORD b0_start = 0x100000;
+
+    {
+        UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
+        int m;
+        for (m = 0; m < 4; m++) {
+            UCHAR esbuf[8]={0}; UCHAR escdb[10]={0x4A,0x01,0,0,masks[m],0,0,0,0x08,0};
+            UCHAR essense[SENSE_SIZE]={0}; int esst=0;
+            send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
+        }
+    }
+    send_scsi(g_hDrive, cdb, 12, payload, 0, SCSI_IOCTL_DATA_OUT, sense, &st);
+
+    if (st == 0) {
+        printf("  WRITE BUFFER 0x41 offset=%s: GOOD\n",
+               is_pre_cutoff ? "0x00AAAA" : "0xA5AAAA");
+        {
+            UCHAR f4buf[0xA4] = {0};
+            UCHAR f4cdb[10] = {0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
+            UCHAR f4sense[SENSE_SIZE] = {0};
+            int   f4st = 0;
+            send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4,
+                      SCSI_IOCTL_DATA_IN, f4sense, &f4st);
+        }
+        {
+            UCHAR b0buf[CHUNK_SIZE] = {0};
+            UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
+                (UCHAR)(b0_start>>16),(UCHAR)(b0_start>>8),(UCHAR)(b0_start),
+                0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+            UCHAR b0sense[SENSE_SIZE] = {0};
+            int   b0st = 0;
+            send_scsi(g_hDrive, b0cdb, 10, b0buf, CHUNK_SIZE,
+                      SCSI_IOCTL_DATA_IN, b0sense, &b0st);
+            if (b0st == 0) {
+                FILE *fp = fopen("b0scankey_dump.bin", "wb");
+                DWORD b0offset = b0_start;
+                DWORD total = 0;
+                printf("  0xB0 ACCESSIBLE! Streaming to b0scankey_dump.bin (cap 6MB)...\n");
+                printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                       b0buf[0],b0buf[1],b0buf[2],b0buf[3],
+                       b0buf[4],b0buf[5],b0buf[6],b0buf[7]);
+                fflush(stdout);
+                if (fp) fwrite(b0buf, 1, CHUNK_SIZE, fp);
+                total += CHUNK_SIZE;
+                while (1) {
+                    UCHAR chunk[CHUNK_SIZE] = {0};
+                    UCHAR csense[SENSE_SIZE] = {0};
+                    int   cst = 0;
+                    b0offset += CHUNK_SIZE;
+                    UCHAR ccdb[10] = {0x3C,0x02,0xB0,
+                        (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+                        0,(UCHAR)(CHUNK_SIZE>>8),(UCHAR)(CHUNK_SIZE),0};
+                    send_scsi(g_hDrive, ccdb, 10, chunk, CHUNK_SIZE,
+                              SCSI_IOCTL_DATA_IN, csense, &cst);
+                    if (cst != 0) break;
+                    if (fp) fwrite(chunk, 1, CHUNK_SIZE, fp);
+                    total += CHUNK_SIZE;
+                    if (total >= 0x380000UL) {
+                        printf("\n  Reached cap — stopping stream.\n");
+                        break;
+                    }
+                    printf("\r  Dumped 0x%06X bytes...", total);
+                    fflush(stdout);
+                }
+                if (fp) fclose(fp);
+                printf("\n  Total dumped: 0x%06X bytes to b0scankey_dump.bin\n\n", total);
+
+                /* Scan Normal region at file offset 0x310000 */
+                if (total < 0x310004UL) {
+                    fprintf(stderr, "  Dump too short — Normal region not reached.\n");
+                    return 1;
+                }
+                printf("  Scanning Normal region for key pattern...\n");
+                FILE *rf = fopen("b0scankey_dump.bin", "rb");
+                if (!rf) { fprintf(stderr, "  Cannot re-open dump\n"); return 1; }
+                fseek(rf, 0x310000L, SEEK_SET);
+                DWORD scanBytes = (total - 0x310000UL < 0x50000UL)
+                                ? (total - 0x310000UL) : 0x50000UL;
+                UCHAR *buf = (UCHAR*)malloc(scanBytes);
+                if (!buf) { fclose(rf); fprintf(stderr, "  Out of memory\n"); return 1; }
+                fread(buf, 1, scanBytes, rf);
+                fclose(rf);
+
+                printf("  Normal[0..15]: ");
+                { int hi; for(hi=0;hi<16&&hi<(int)scanBytes;hi++) printf("%02X ",buf[hi]); }
+                printf("  (%s)\n\n", (memcmp(buf,"PIONEER ",8)==0) ? "PIONEER OK" : "not PIONEER");
+
+                SK_MATCH m = {0};
+                size_t count = 0;
+                int result = sk_find_key(buf, (size_t)scanBytes, &m, &count);
+                free(buf);
+
+                if (result == 1) {
+                    DWORD le = (DWORD)m.key[0] | ((DWORD)m.key[1]<<8)
+                             | ((DWORD)m.key[2]<<16) | ((DWORD)m.key[3]<<24);
+                    printf("  +------------------------------------------+\n");
+                    printf("  |  B0SCANKEY RESULT                        |\n");
+                    printf("  +------------------------------------------+\n");
+                    printf("  Keyed handler matches        : %zu\n", count);
+                    printf("  Key bytes offset in Normal   : 0x%zX\n", m.key_offset);
+                    printf("  Reject branch variant        : %u-byte\n", m.reject_length);
+                    printf("  Unlock key (wire order)      : %02X %02X %02X %02X\n",
+                           m.key[0], m.key[1], m.key[2], m.key[3]);
+                    printf("  Unlock key (LE DWORD)        : 0x%08lX\n\n", (unsigned long)le);
+                    if (le == 0x6123789A) {
+                        printf("  CAUTION: matches acceptance-signature constant.\n");
+                    } else {
+                        DWORD known = pioneer_key_lookup(g_driveID, NULL);
+                        if (known && known == le)
+                            printf("  Cross-check: matches key-table entry  OK\n");
+                        else if (known && known != le)
+                            printf("  Cross-check: differs from key-table 0x%08lX\n", (unsigned long)known);
+                    }
+                } else if (result == 0) {
+                    fprintf(stderr, "  No keyed handler found (0x%X bytes scanned).\n", scanBytes);
+                    fprintf(stderr, "  Dump saved — inspect b0scankey_dump.bin.\n");
+                    return 1;
+                } else {
+                    fprintf(stderr, "  Ambiguous: %zu handlers found.\n", count);
+                    return 1;
+                }
+            } else {
+                printf("  0xB0 still locked (key=%02X ASC=%02X)\n\n",
+                       b0sense[2]&0x0F, b0sense[12]);
+                return 1;
+            }
+        }
+    } else {
+        printf("  WRITE BUFFER 0x41 FAILED (key=%02X ASC=%02X)\n\n",
+               sense[2]&0x0F, sense[12]);
+        return 1;
+    }
+
+    printf("\n=== B0SCANKEY DONE ===\n");
+    return 0;
+}
+
+/* =========================================================
    cmd_scankey — offline unlock key extractor
    Port of MattJackson's content-derived keyed-handler recognition
    algorithm from his Rust Pioneer firmware library.
@@ -8795,23 +9152,6 @@ static int cmd_b0key(void)
    Usage:
      drivekit scankey --file decoded_normal_body.bin
    =========================================================
-
-/* --- key scanner (ported from MattJackson's Rust algorithm) ------------- */
-#define SK_ACCEPT_LEN 8u
-#define SK_KEY_LEN    4u
-
-static const UCHAR sk_accept_compare[7] = {
-    0x7A, 0x20, 0x9A, 0x78, 0x23, 0x61, 0x47
-};
-static const UCHAR sk_key_compare[2] = { 0x7A, 0x20 };
-
-typedef struct {
-    size_t accept_offset;
-    size_t compare_offset;
-    size_t key_offset;
-    unsigned reject_length;
-    UCHAR key[SK_KEY_LEN];
-} SK_MATCH;
 
 /* Returns 1=unique, 0=not found, -1=ambiguous */
 static int sk_find_key(const UCHAR *body, size_t size,

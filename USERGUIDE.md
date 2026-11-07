@@ -248,6 +248,8 @@ The result box identifies the drive fully from live data alone:
 
 Takes ~30 seconds. Saves a raw dump to `b0scankey_dump.bin`.
 
+> **Platform limitation — REC 8C00 (laptop slim drives):** `b0scankey` currently only recognises the SAT 8D31-style 10-byte reject-branch pattern. The REC 8C00 platform (BDR-L13SH and other slim/laptop drives, Kernel ID `ID92`) uses a single `CMP.L #imm32, ERn` instruction (`7A 2n xx xx xx xx`) instead, so the scan reports `No keyed handler found`. The key is still present in the dump — run `b0dumpfw` and feed the Normal file to `scankey --platform rec8c00`, or use the platform default from the internal key table (0x8C00 → `0x46372819`).
+
 ---
 
 ### `b0dumpfw` — live firmware file extraction

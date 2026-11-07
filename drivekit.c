@@ -5074,10 +5074,10 @@ static void print_help(void)
     printf("                  --file kernel.100 [--patch] [--file2 out.bin]\n");
     printf("  decodenormal  Decrypt normal firmware envelope; reports UHD capability\n");
     printf("  scankey       Extract unlock key from a decoded Normal firmware body\n");
-    printf("  b0key         [EXPERIMENTAL] Read unlock key from 0xB0 at hardcoded offset\n");
-    printf("  b0probe       [EXPERIMENTAL] Sample 0xB0 at key addresses — address-space diagnostic\n");
-    printf("  b0scankey     Read Normal from live 0xB0 stream, extract unlock key\n");
+    printf("  b0probe       Quick 0xB0 access probe — tests pre/post-cutoff and address layout\n");
+    printf("  b0scankey     Live key extraction — streams Normal from 0xB0, full drive ID card\n");
     printf("  b0dumpfw      Extract Kernel + Normal firmware from live 0xB0 stream\n");
+    printf("                  Outputs: pioneer_<model>_<kernID>_<platID>_<fwrev>_{kernel,normal,raw}.bin\n");
     printf("                  Outputs: pioneer_<model>_<kernID>_<platID>_<fwrev>_{kernel,normal,raw}.bin\n");
     printf("  family        Hardware family fingerprint from normal firmware envelope\n");
     printf("                  --file normal.bin [--file2 other_normal.bin]\n");

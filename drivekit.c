@@ -3182,7 +3182,7 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     case 0x8B30: return 0x08A98AF2; /* XD06U — post-cutoff key from updater.exe */
     case 0x8D30: return 0x72C07157; /* XD07  SAT8D30 — confirmed from Wireshark capture */
     case 0x8D31: return 0x72C07157; /* XD07U SAT8D31 — same platform */
-    /* BDR-L13SH REC8C00/ID92 — key from live b0dump, CMP.L at Normal+0x4567C, FW 1.11 */
+    /* BDR-L13SH REC8C00/ID92 — key from live b0dump, CMP.L at Normal+0x4657C, FW 1.11 */
     case 0x8C00: return 0x46372819;
     /* BDR-XD06U post-cutoff — key from BDR-XD06J-UHD updater.exe */
     case 0x8B31: return 0x08A98AF2;

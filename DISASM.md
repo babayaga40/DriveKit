@@ -1,6 +1,6 @@
 # DriveKit — H8S/2600 Disassembly & Firmware Investigation
 
-> **Living research record — through Stage 9.16 (2026-11-07).**  
+> **Living research record — through Stage 9.38 (2026-11-07).**  
 > Scope: offline analysis of Pioneer BDR-XD07U firmware, H8S/2600 Advanced decoder, Kernel, boot region, and B0 memory captures.  
 > **This is an evidence ledger, not a hardware register manual or proof of executed code.**
 
@@ -21,7 +21,7 @@ Every assertion must be distinguished as follows:
 
 A candidate CFG edge is **not** an executed path. A raw opcode pattern is **not** necessarily a decoded instruction. A known MMIO address is **not** an identified peripheral. A decoded call to a Kernel address is **not** proof that the call executes on hardware. Never promote indirect call targets or reachability without the required complete path and side-effect proof.
 
-**Project policy:** Keep the existing native C H8S decoder; Stage 9.13–9.16 are separate read-only audits. Do not push to GitHub before beta. Offline investigations do not issue firmware writes or flashing commands.
+**Project policy:** Keep the existing native C H8S decoder. Offline investigations do not issue firmware writes or flashing commands. **No GitHub, commits, pushes, repository creation, or remote uploads**; work with local source files and ZIP archives only.
 
 ## 2. Evidence inputs and coordinate systems
 
@@ -669,3 +669,426 @@ Labels are read-only report annotations (`FUNCTION_SYMBOL`, `CALL_TARGET_SYMBOL`
 and `SYMBOL` suffixes in graph lines). They do not change CFG discovery,
 function boundaries, decoder output, or write/flash behavior. Numeric addresses
 are always retained. Region/boundary/MMIO labels are not promoted to functions.
+
+### Stage 9.35 — read-only reference symbol inventory (2026-11-07)
+
+The existing scoped symbol loader now supports `drivekit analyze --list-symbols
+--symbol-scope SCOPE` and `drivekit analyze --symbol-lookup ADDRESS
+--symbol-scope SCOPE` without a firmware file. `--symbols PATH` and `--out
+REPORT` are optional. Inventory requires an explicit scope and rejects empty
+scopes; lookups with no result exit 1. Existing bounded CFG analysis is unchanged.
+The UD04 reference scope contains 50 entries, including Penguin-derived
+function and MMIO candidates. Matt-derived low-address register candidates
+remain in `PIONEER_REGISTER_ADDRESS_CANDIDATES`. None are automatically
+applied to B0. See `README_STAGE9_35.txt` for examples and verification.
+
+
+## Stage 9.36 — CFG-integrated H8S assembly output (2026-11-07)
+
+**IMPLEMENTED / OBSERVED:** `drivekit analyze --asm` adds `ASM_BEGIN`, `ASM_LABEL`, `ASM`, and `ASM_END` to the existing bounded CFG report. Each `ASM` line includes the reached instruction address, original instruction hex, mnemonic, and any resolved direct control-flow target and scoped target symbol. It reuses the existing native H8S decoder; it is **not** a second decoder. `--overview --asm` retains assembly while displaying summary output. The separate `drivekit disasm` command remains a linear sweep, not CFG reachability analysis.
+
+**B0 verification:** For root `0x107DF0..0x107F1E`, the report includes 92 reached instructions, 12 direct call sites, and two discovered helpers (`0x107D4A..0x107D6C` and `0x107DC6..0x107DF0`). Three graph functions, 12 graph call edges, zero unknown CFG instructions and zero out-of-bound edges in the tested candidates. Windows execution of the subsequent integrated `--asm --trace` command is **USER-VERIFIED** by the supplied Stage 9.37/9.38 reports; this does not imply a separate Windows build test was run by the author. See `README_STAGE9_36.txt`.
+
+## Stage 9.37 — Conservative human-readable hardware trace (2026-11-07)
+
+**IMPLEMENTED / OBSERVED:** `drivekit analyze --trace` adds `TRACE_BEGIN`, static `READ`, `WRITE`, `CALL`, `TEST`, `BRANCH`, and `TRACE_END` records for recognized H8S instruction forms, with `RESOLVED`, `PARTIAL`, or `UNKNOWN_INPUT` annotations. It performs bounded CFG value propagation for a limited register/instruction subset, with conservative invalidation when a value cannot be established. The first B0 report showed 34 root events, two helper events, and three helper events; these numbers are **historical Stage 9.37**, superseded by the Stage 9.38 coverage fix.
+
+Example from the B0 root:
+
+```text
+WRITE 0x107E48 [0xFF3F1000] <- 0x9F RESOLVED
+WRITE 0x107E4C [0xFF3F1008] <- 0x13 RESOLVED
+CALL 0x107E50 -> 0x107D4A
+READ 0x107E54 R0L <- [0xFF3F1018] PARTIAL
+TEST 0x107E56 R0L == 0xC2 UNKNOWN_INPUT
+BRANCH 0x107E58 BNE $+74:8 -> 0x107EA2
+```
+
+**Interpretation:** The static trace reconstructs possible memory accesses; it is **not** measured bus traffic. `0x9F` and `0xC2` are observed firmware immediates, not proof of JEDEC flash identification, SCSI CDB traffic, drive readiness, or a particular peripheral identity. See `README_STAGE9_37.txt`.
+
+## Stage 9.38 — Trace coverage repair and Windows verification (2026-11-07)
+
+**IMPLEMENTED / USER-VERIFIED ON WINDOWS:** Fixed missing trace events for direct absolute-address byte reads and writes, byte writes with unknown source values, indirect byte operands with the correct source/destination register names, and `BSET`, `BCLR`, `BLD`, `BST` for supported direct/known-indirect addresses. Hardware-derived bytes remain `UNKNOWN` instead of being fabricated. The user supplied a complete Windows `C:\Firmware` report headed `DriveKit Stage 9.38`, demonstrating the fixed events. Portable GCC regression also passed its 16 checks against the real B0 dump. See `README_STAGE9_38.txt` and `stage938_trace_regression.py`.
+
+| B0 report measurement | Stage 9.37 | Stage 9.38 |
+|---|---:|---:|
+| Root `0x107DF0` trace events | 34 | **51** |
+| Helper `0x107D4A` trace events | 2 | **5** |
+| Helper `0x107DC6` trace events | 3 | **7** |
+| CFG functions / graph call edges | 3 / 12 | **3 / 12** |
+
+Newly visible examples from the actual B0 Stage 9.38 report:
+
+```text
+BIT_SET 0x107E0A [0xFF3F100B].7
+WRITE 0x107E1C [0xFF3F1028] <- 0xE0 RESOLVED
+BIT_CLEAR 0x107E22 [0xFF3F102A].7
+READ 0x107D50 R0H <- [0xFF3F1009] PARTIAL
+WRITE 0x107D5C [0xFF3F1009] <- UNKNOWN PARTIAL
+BIT_SET 0x107D62 [0xFF3F100A].7
+BIT_READ 0x107DE4 [0xFF3F1018].0
+READ 0x107ED4 R0L <- [0xFF3F1018] PARTIAL
+WRITE 0x107ED6 [0xFF3F1010] <- UNKNOWN PARTIAL
+WRITE 0x107EDC [0xFF3F1011] <- UNKNOWN PARTIAL
+```
+
+### Reproduce the B0 analysis on Windows
+
+Run in `C:\Firmware` with `drivekit.c`, its bundled headers, `drivekit_symbols.txt`, and `hwdump_b0.bin` available:
+
+```bat
+cl.exe drivekit.c
+drivekit.exe analyze --file hwdump_b0.bin --out b0_trace_cfg.txt --base 0x100000 --entry 0x107DF0 --end 0x107F1E --overview --asm --trace --callgraph --boundaries --index --max-depth 2 --max-functions 8 --callee-window 0x100
+```
+
+Expected report markers include `SUMMARY_SYMBOLS_LOADED 18`, `SUMMARY_TRACE_EVENTS 51` in the root, `5` and `7` in the helpers, `SUMMARY_GRAPH_FUNCTIONS 3`, `SUMMARY_GRAPH_CALL_EDGES 12`, and `SUMMARY_GRAPH_LIMITED_EDGES 0`. For the portable test, compile `stage937_trace_test.c` against the included headers, generate a report using the same `analyze` arguments, and run `python stage938_trace_regression.py b0_trace_cfg.txt`. This is a regression of the observed B0 case, not general completeness certification.
+
+### Interpretation and remaining limitations
+
+- `SUMMARY_UNKNOWN 0` counts unknown **decoded CFG instructions**; it does **not** mean all trace values are known or all H8S effects are modeled.
+- `CLOSED_CANDIDATE` means closed only under the bounded static CFG model; it does not prove runtime paths, function boundaries, or interrupts.
+- `TRACE` events are static possible-path observations, **not chronological runtime transactions**; branch paths may be mutually exclusive.
+- Register/stack alias proof, full interprocedural call effects, exhaustive H8S instruction propagation, and symbolic expressions for hardware-derived values remain unimplemented or incomplete.
+- No CDB buffer or SCSI/ATAPI command stream has been identified from these traces. Do not classify `0x9F`/`0xC2` as CDB evidence without a validated buffer/handler chain.
+- The **user** verified Stage 9.38 output on Windows; the portable GCC harness and regression are separately tested. No Windows executable is bundled in this source ZIP.
+
+**Next session:** Read `START_HERE_TOMORROW.md` and `SESSION_HANDOFF_2026-11-07.md` before any further edits. Preserve the Stage 9.38 source and report as the verified baseline.
+
+## Stage 9.39 — opt-in symbolic byte provenance (portable verification, 2026-11-08)
+
+**Scope:** offline native-C bounded CFG analysis only. This stage adds `--provenance`
+while retaining the Stage 9.38 `--trace` output unchanged. Implementation is
+in `drivekit_provenance.h`, included by `drivekit_analysis.h`. The firmware
+image is never modified. The user-maintained master symbol file is used for
+labels, not as independent proof of peripheral identity.
+
+**Verified on portable GCC harness:** firmware `hwdump_b0(5).bin`, base
+`0x100000`, input size `0x780800`, master symbol scope
+`B0_HW_DUMP_0x100000`. Stage 9.38 original 16 assertions passed. Stage 9.39
+B0 provenance assertions passed, and synthetic tests covered conflicting CFG
+branch joins, unknown direct-call clobber, and full-width ER6 alias invalidation.
+The Windows MSVC build and hardware behavior were NOT verified in this run.
+
+**STATIC-PROVEN (bounded; contingent on decoder semantics):**
+
+- `0x107E7A MOV.B @ER4,R0L`; `0x107E7C OR.B #0x40,R0L`;
+  `0x107E7E MOV.B R0L,@0xFF3F1010` =>
+  `WRITE [0xFF3F1010] <- (READ8(0xFF3F1018@0x107E7A) OR 0x40)`.
+- `0x107ED4 MOV.B @ER4,R0L`; `0x107ED6 MOV.B R0L,@0xFF3F1010`
+  => `WRITE [0xFF3F1010] <- READ8(0xFF3F1018@0x107ED4)`.
+- `0x107EC2 MOV.B @ER4,R6H`; `0x107EC4 OR.B #0x02,R6H`;
+  call `0x107ED0 -> 0x107D4A`; `0x107EDC MOV.B R6H,@0xFF3F1011`
+  => `WRITE [0xFF3F1011] <- (READ8(0xFF3F1018@0x107EC2) OR 0x02)`.
+  The bounded callee check rejects R6/E6 mentions, nested calls, unsupported
+  instructions, and CFG escapes before preserving R6H.
+
+**UNKNOWN:** actual values returned by `0xFF3F1018`, peripheral identity,
+JEDEC flash identity, hardware timing, and actual executed branch paths.
+`READ8(address@instruction)` identifies a *distinct symbolic read event*, not
+an observed byte or a guarantee that a branch executes.
+
+**Implementation limits:** finite expression strings (overly complex expressions
+fall back to UNKNOWN), CFG joins retain expressions only if identical on every
+incoming path, unsupported effects conservatively invalidate provenance,
+nonverified callees clobber symbolic byte registers, and only selected H8S
+byte instructions are modelled. The callee-preservation check is bounded and
+syntactic, not a full formal proof of all implicit register effects. Symbols
+marked VERIFIED in the supplied file remain *user annotations*; the Stage 9.39
+trace does not elevate them to hardware-verified facts.
+
+**Portable verification:**
+
+```sh
+gcc -std=c11 -O2 stage932_portable_test.c -o drivekit_portable
+python3 stage939_provenance_regression.py ./drivekit_portable /path/to/hwdump_b0.bin drivekit_symbols.txt test_reports
+python3 stage938_trace_regression.py test_reports/with_provenance.txt
+```
+
+**Windows follow-up:** build `drivekit.c` with MSVC (`cl.exe drivekit.c`), then
+rerun the same B0 analysis with `--trace --provenance` and explicit
+`--symbols` / `--symbol-scope B0_HW_DUMP_0x100000`.
+
+## Stage 9.39 H1 — symbolic provenance hardening (2026-11-08)
+
+**STATIC-PROVEN (bounded portable regression):** The Stage 9.39 H1 native C
+transfer function invalidates byte expressions for register-targeted
+`BSET`/`BCLR`/`BST` operations and unknown instructions, while retaining
+tracked `R6H` for memory-targeted bit operations and `R6L`-only updates.
+Ten direct synthetic transfer tests pass. The original B0 three symbolic
+writes at `0x107E7E`, `0x107ED6`, and `0x107EDC` remain unchanged, and the
+Stage 9.38 16-check trace regression passes.
+
+**CONDITIONAL:** The bounded callee-preservation test now requires an explicit
+allowlist of recognized decoded instructions and rejects unknown operations.
+This is still not a complete proof of implicit H8S register effects or of
+arbitrary nested/indirect control flow. A later semantic-effects decoder
+should replace the text-matching heuristic.
+
+**UNKNOWN:** Windows MSVC build and Windows regression for this H1 revision;
+complex loop/CFG adversarial coverage; actual runtime hardware register
+values. The prior Stage 9.39 Windows build success does not automatically
+verify this changed revision. No firmware or hardware writes were performed.
+
+## Stage 9.39 H2 - instruction-effects increment (2026-11-08)
+
+**Scope:** offline symbolic byte-register transfer and conservative alias invalidation; no drive I/O, firmware modifications, or flashing.
+
+- Added `MOV.B RnH/RnL,RmH/RmL` symbolic-expression copying, including self/overlapping aliases. The source expression is copied before destination update; the destination ER pointer constant is invalidated.
+- Unknown source provenance propagates as unknown. Existing full-width alias writes, register bit operations, and unrecognized instruction invalidation remain conservative.
+- The implementation tracks byte expressions, **not** a complete H8S architectural state. CCR flag values, flag-based branch feasibility, memory aliasing, implicit side effects of all instruction families, and interprocedural value summaries remain unimplemented. Conditional CFG successors are not pruned using speculative flag values.
+- H2 synthetic transfer/alias/merge checks: 16/16 PASS (portable GCC). Stage 9.38 B0 trace checks: 16/16 PASS. Stage 9.39 provenance and synthetic branch/call/alias regressions: PASS. B0 target expressions at 0x107E7E, 0x107ED6, and 0x107EDC remain unchanged.
+- This is an **incremental hardening revision**, not a claim of complete instruction-effect semantics or a hardware observation. Windows MSVC H2 build not yet tested.
+
+## Stage 9.39 H3 Pass 1 — Renesas CCR instruction-effect inventory (offline)
+
+Reference: Renesas *H8S/2600 Series, H8S/2000 Series Software Manual*, Rev. 4.00 (Feb 24, 2006), instruction descriptions §§2.2.7, 2.2.14, 2.2.17, 2.2.19–2.2.20, 2.2.23, 2.2.39 and logical instructions. https://www.renesas.com/en/document/mas/h8s2600-series-h8s2000-series-software-manual?r=1052826
+
+- Added optional `--ccr-effects` to native C `analyze`. Reports decoded instruction CCR WRITE / READ / CLEAR masks and `AUDITED` or `UNKNOWN_EFFECTS`, without assigning runtime flag values.
+- Initial audited subset: MOV.B/W/L, CMP.B/W/L, AND/OR/XOR B/W/L, BSET/BCLR/BNOT, BST/BIST, BLD/BILD, BTST, selected Bcc, BRA, NOP, JMP, PUSH/POP. Classification is deliberately a subset, not an exhaustive H8S effects implementation.
+- Unreviewed instructions (including calls, RTS, arithmetic and control-register modifications) are explicitly `UNKNOWN_EFFECTS` with all flags conservatively potentially written. No branch is pruned and no flags are propagated across CFG edges in this pass.
+- **STATIC-PROVEN (bounded):** In B0, `CMP.B #H'C2:8,R0L` at 0x107E56 writes H,N,Z,V,C and following BNE at 0x107E58 reads Z. This establishes an instruction-level dependency, not the actual value of Z or which branch executes.
+- The existing TRACE and symbolic-provenance formats are unchanged unless the new option is selected. H3 pass 1 is not a live-read or flash/patch implementation.
+- Future H3 passes: (2) audited constant/unknown flag-value transfer with CFG meet, (3) guarded branch-condition reasoning and adversarial loops, (4) wider instruction coverage and cross-function effects. No automatic branch elimination before proof and tests.
+
+### Stage 9.39 H3 Pass 1 MOV audit addendum (offline, 2026-11-08)
+
+**Reference:** Renesas *H8S/2600 Series, H8S/2000 Series Software Manual*,
+Rev. 4.00 (February 24, 2006), section 2.2.39 (1)-(9), printed pages
+134-148; PUSH/POP are MOV stack forms (sections 2.2.49-50).
+
+**STATIC-PROVEN (manual CPU semantics):** `MOV.B`, `MOV.W`, and `MOV.L`
+update CCR `N` and `Z` from the **transferred value**, clear `V`, and
+preserve `C` and `H`. This includes register-to-memory stores; it is not
+restricted to register destinations. Consequently the H3 P1 `MOV` CCR
+masks are correct, including B0 stores at `0x107E7E`, `0x107ED6`, and
+`0x107EDC`. This does not establish runtime data values or CCR outcomes.
+
+**Implementation:** The H3 P1 CCR header was reformatted for readability,
+with explicit comments. No effect classification or flag-value propagation
+was changed. The new 16-case MOV/PUSH/POP test passed; existing H3 CCR
+18-case test, H2 16-case test, Stage 9.38 16-check B0 regression and
+Stage 9.39 provenance regression passed. Full B0 `--ccr-effects` report
+was byte-identical to the H3 P1 reference report.
+
+**Still unknown:** CCR values, interprocedural CCR state, and all
+`UNKNOWN_EFFECTS` classifications. Branch pruning remains disabled.
+
+## Stage 9.39 H3 Pass 2A — CCR value lattice (offline, isolated)
+
+**Scope:** Introduced `drivekit_ccr_values.h` as a standalone, readable C
+module for tracking known/unknown CCR bits, conservative instruction-effect
+invalidation, `MOV.B` flag outcomes when the transferred byte is statically
+known, equality-based CFG joins, and three-valued branch predicates.
+
+**STATIC-PROVEN (CPU semantics, subject to instruction-specific audit):**
+For `MOV.B`, `N` reflects the transferred byte's top bit, `Z` reflects whether
+it is zero, and `V` is cleared. `C` and `H` remain unchanged. The module
+requires an independently proven source byte; an unknown hardware read leaves
+`N` and `Z` unknown while still clearing `V`.
+
+**CONDITIONAL:** Branch predicate evaluation returns TRUE, FALSE, or UNDECIDED.
+A required unknown CCR bit always yields UNDECIDED. At a CFG join, a bit
+remains known only when both incoming paths know and agree on its value.
+Unknown instruction/callee effects invalidate all CCR knowledge.
+
+**Critical limitation:** This pass is a *standalone tested foundation*, not a
+CFG-integrated flag-value analysis. `drivekit_analysis.h` and CLI output are
+unchanged. No branch pruning, no runtime value claims, no new hardware access.
+Instruction-specific flag transfers beyond `MOV.B` require separate review.
+
+**Portable tests:** 30/30 new CCR value-lattice checks, 18/18 CCR effect
+checks, 16/16 MOV audit checks, 16/16 H2 instruction-effect checks, 16/16
+Stage 9.38 B0 trace checks, and Stage 9.39 B0 symbolic provenance and
+synthetic regressions passed. Windows MSVC verification is pending.
+
+### Stage 9.39 H3 Pass 2B: conservative CCR CFG integration
+
+Added `drivekit_ccr_cfg.h` and an opt-in `CCR_CFG_BEGIN` section under
+`--ccr-effects`. Forward fixed-point propagation uses intersection joins
+of known CCR facts, retains both edges of every conditional branch, and
+invalidates flags on unknown instructions/calls. Only immediate `MOV.B`
+constants can establish N/Z values; all memory-derived inputs stay unknown.
+The report is diagnostic and does not change TRACE, provenance or CFG reach.
+Portable B0 TRACE regression passed (16/16); portable CCR tests passed
+(30/30 values, 18/18 effects, 16/16 MOV audit, 16/16 H2 effects).
+Windows native compilation remains to be verified by the user.
+
+### Stage 9.39 H3 CFG correctness audit (post Pass 2B)
+
+The Pass 2B `SUMMARY_CCR_CFG_JOINS` counter counted **only information-changing joins**, not every incoming edge to an already reached instruction. On the B0 root the new `SUMMARY_CCR_CFG_MERGE_ATTEMPTS` counter records six such edges, but none loses further known CCR facts (`JOINS 0`). This is not evidence of missing edges. The new `SUMMARY_CCR_CFG_REVISITS` counter counts actual instruction reprocessing after a changed incoming state.
+
+Synthetic encoded H8S tests now cover a constant MOV followed by a provably false conditional (both syntactic successors still retained), a diamond merge, a loop, and conflicting `Z` facts merging to unknown. The synthetic tests are separate from the B0 regression and do not infer hardware register values. Existing trace and provenance output are unchanged. No branch pruning is implemented.
+
+### Stage 9.39 H3 CFG branch-report classification correction
+
+The CCR CFG report previously identified conditional branches by a broad `B` mnemonic prefix plus a CCR read. This incorrectly reported the bit-store instruction `BST` as `CCR_BRANCH`. Reporting now uses an explicit set of 14 conditional branch mnemonics; bit operations `BST`, `BLD`, `BSET`, `BCLR`, and related mnemonics are excluded. This is a report-only correction: no changes to syntactic CFG successors, reachability, or branch pruning. The B0 root report now contains six undecided conditional branches rather than eight (the two false `BST` entries are removed). Portable checks: 27/27 classification, 5/5 synthetic CFG, 16/16 Stage 9.38 B0 TRACE regression; root CFG worklist exhaustion remains zero. Native Windows MSVC verification is pending.
+
+### Stage 9.39 H3 Pass 3 — proven zero idiom and limited R6L facts
+
+The CCR CFG transfer recognizes `SUB.B Rx,Rx` as a zero-result idiom,
+with C/V/N/H clear and Z set. A deliberately narrow R6L known-byte
+state supports `MOV.B` immediate to R6L, zeroing R6L, and `BLD #bit,R6L`
+carry derivation. Unreviewed operations and calls kill R6L facts, while
+joins retain facts only when all incoming states agree. No branch is
+pruned. The B0 root worklist revisits nodes when known facts are lost
+at merges; this is convergence behavior, not execution tracing.
+
+### Stage 9.39 H3 Pass 4: R6L increment and immediate comparison
+
+A bounded CCR/R6L transfer now propagates proven R6L values through
+`INC.B R6L` and evaluates `CMP.B #H'xx:8,R6L` with byte-width
+subtraction flags (C, H, N, Z, V). The CMP does not change R6L.
+Unsupported operations and calls still invalidate R6L; joins retain
+only agreeing values. No CFG edges are pruned. B0 root branches at
+`0x107E9E` and `0x107EFC` remain UNDECIDED because no sound unique
+R6L value survives to them under current bounded, path-insensitive
+model. Synthetic tests cover both BHI/BLS directions and invalidation.
+
+### Stage 9.39 H3 Pass 5 — instruction effects and safe call boundaries (offline, 2026-11-08)
+
+**STATIC-PROVEN (bounded, modeled semantics):** Per Renesas H8S/2600 Software Manual Rev. 4.00 sections 2.2.32, 2.2.36, 2.2.63, and 2.2.65, the inventory now classifies `INC.B/W/L` as writing N/Z/V, `SUB.B/W/L` as writing C/V/Z/N/H, and `STM.L`/`LDM.L` as preserving CCR. In the narrow CFG transfer, `INC.B R6L` retains known C/H and control bits even when the operand is unknown. `STM.L` preserves known R6L; `LDM.L` invalidates R6L if its register list includes ER6. This is not a stack-alias or restoration proof.
+
+**OBSERVED (portable GCC):** Root `0x107DF0..0x107F1E` has 79 audited and 13 unknown instruction effects (previously 73 and 19). CFG fixed-point counters remain 108 processed, 107 updates, 16 joins, 22 merge attempts, 16 revisits, 6 undecided, 0 exhausted. The loop branches `0x107E9E BHI` and `0x107EFC BLS` remain undecided. The new 13-case Pass 5 test, earlier portable tests, and Stage 9.38 TRACE regression pass. MSVC Pass 5 remains pending.
+
+**UNKNOWN:** Nested callee effects and stack aliasing remain unmodeled. All calls conservatively invalidate tracked CCR and R6L; no branch edge is pruned and no firmware/hardware writes are performed.
+
+### Stage 9.39 H3 Pass 6 — B0 exact-match helper contracts
+
+The CFG analyzer recognizes the **complete decoded bodies** of the B0
+helpers at `0x107D4A` and `0x107DC6` before applying any call summary.
+The first preserves caller C and H, and establishes N=0 and V=0 on
+return; the second establishes C=0, N=0, V=0 on return. Both preserve
+R6L, and their may-write and live-in register sets are reported in
+`HELPER_SUMMARY` lines. These are **static return-path contracts**, not
+observed hardware behavior, and make no guarantee that a polling loop
+terminates. Unknown or modified bodies fail closed to conservative
+call invalidation. All candidate CFG edges are retained. See
+`README_H3_PASS6.txt` for scope, regression results, and Windows commands.
+
+### Stage 9.39 H3 Pass 7 — R6L fixed-point evidence (diagnostic-only, 2026-11-08)
+
+**Purpose:** Explain R6L loss before changing precision. `--ccr-effects`
+now emits `R6L_IN` at every reached instruction, plus four kinds of
+*observed abstract worklist event*: `ESTABLISHED_BY_TRANSFER`,
+`INVALIDATED_BY_TRANSFER`, `JOIN_DISTINCT_KNOWN_VALUES`, and
+`JOIN_KNOWN_AND_UNKNOWN`. These events are recorded during fixed-point
+iteration, so a witnessed intermediate event is **not necessarily the
+cause of the final input state**. A missing event proves nothing about
+unknown-value provenance. These lines are **not runtime traces**.
+
+**OBSERVED (portable B0 root):** `SUB.B R6L,R6L` at `0x107E5A` and
+`0x107EA2` establishes zero. The present whitelist transfer invalidates
+R6L at `0x107E66` and `0x107EAE` (`MOV.B #immediate,R0L`), despite those
+instructions not writing R6L. This is a **model precision limitation**,
+not evidence that firmware changes R6L there. `JOIN_KNOWN_AND_UNKNOWN`
+was witnessed at `0x107E5C`, `0x107E5E`, `0x107E66`, `0x107EA4`,
+`0x107EA6`, and `0x107EAE`; no distinct-known-value join was witnessed.
+The incoming R6L states at `0x107E9A`, `0x107E9E`, `0x107EF8`, and
+`0x107EFC` remain UNKNOWN. Both BHI/BLS branches remain UNDECIDED.
+
+**UNCHANGED SOLVER:** 146 processed, 145 updates, 54 joins, 62 merge
+attempts, 54 revisits, six undecided, zero exhausted. Pass 7 changes
+reporting only, not CCR transfer, R6L transfer, joins, helper contracts,
+branch pruning, reachability, TRACE or provenance. It is not a register
+alias proof, hardware observation or assertion of polling-loop termination.
+
+**NEXT REVIEW CANDIDATE (not implemented):** Narrow the R6L invalidation
+whitelist for operations demonstrably targeting unrelated registers,
+with byte-alias tests, before pursuing any loop branch precision.
+See `README_H3_PASS7.txt` for Windows verification commands.
+
+**Documentation reconciliation:** The Pass 5 paragraph above describes
+Pass 5 *at that stage*: its statement that all calls kill facts was
+superseded by Pass 6's exact-match B0 helper contracts. Pass 7 does not
+change those contracts. The original `open_drive()` debugging anecdote
+remains part of the project history; it is not an analyzer prerequisite.
+
+### Stage 9.39 H3 Pass 8 — targeted R6L destination/alias precision (2026-11-08)
+
+**STATIC-PROVEN (modeled semantics):** `MOV.B` writes to byte registers
+other than R6L (including R6H) and plain memory destinations do not
+modify R6L. The analyzer now retains an established R6L fact across
+these writes, and across self-subtraction of a different byte register.
+`MOV.B` to R6L invalidates the old fact unless a supported immediate
+sets the new value. LDM restoring ER7 alone is not an ER6 alias; LDM
+restoring ER6 still invalidates R6L. Unrecognized operations and
+potential auto-update addressing stay fail-closed. This is **not** a
+general register-value or stack-alias proof.
+
+**OBSERVED (portable GCC B0 root):** The spurious
+`INVALIDATED_BY_TRANSFER` events at `0x107E66` and `0x107EAE`
+(`MOV.B #immediate,R0L`) disappear. Worklist counts become 184
+processed, 183 updates, 92 information-changing joins, 103 merge
+attempts, 92 revisits, six undecided, zero exhausted. The two loop
+entry values at `0x107E9A` and `0x107EF8` remain UNKNOWN, as do the
+BHI/BLS predicates. Retained facts cause more abstract worklist activity;
+that is not evidence of extra runtime execution. Both branch successors
+remain represented. Fifteen targeted alias/transfer checks and existing
+Pass 4–6 portable test programs pass. Native MSVC is pending.
+
+**Scope:** The helper exact-match contracts, generic CCR effect inventory,
+TRACE, provenance, and read-only behavior are unchanged. Pass 7's
+`R6L_EVENT` diagnostics remain available, but intermediate events must
+not be mistaken for complete explanations of final fixed-point states.
+See `README_H3_PASS8.txt` for exact checkpoint commands. The original
+`open_drive()` anecdote remains part of the documentation history.
+
+### Stage 9.39 H3 Pass 9 — complete bounded R6L flow ledger
+
+The new `R6L_FLOW` record reports the final fixed-point IN and computed
+OUT state for **every reached instruction**. `R6L_EDGE` enumerates every
+retained in-range candidate CFG successor, with the outgoing R6L value
+and the destination's final IN value. These are static analysis records,
+not hardware execution traces. No solver, branch, or pruning change.
+
+At `0x107E5A` and `0x107EA2`, `SUB.B R6L,R6L` establishes R6L=0x00.
+The outgoing edge is known zero, but the final incoming state at the
+following `BLD #0,R6L` is unknown (`LOST_AT_JOIN_OR_UNKNOWN`). `BLD`
+reads bit zero into CCR.C and **does not modify R6L**. Historical
+`JOIN_DISTINCT_KNOWN_VALUES` events describe worklist history, not
+necessarily distinct physical incoming edges. The next investigation
+should audit repeated edge merges and predecessor attribution.
+
+Portable B0 counters unchanged: processed 184, updates 183, joins 92,
+merge attempts 103, revisits 92, undecided 6, exhausted 0.
+MSVC native checkpoint pending. `open_drive()` remains a cautionary tale.
+
+## Stage 9.39 H3 Pass 10 — conditional R6L back-edge witnesses
+
+Pass 9 showed final R6L joins at `0x107E5C` and `0x107EA4`. Pass 10
+adds `R6L_LOOP_WITNESS` lines to the opt-in CCR CFG report, gated by
+recognition of the decoded B0 reset, header, increment, compare, and branch
+instructions. These are *conditional static instruction-semantic witnesses*,
+not a runtime trace, path-feasibility proof, or license to prune any CFG edge.
+
+* Loop 1: `0x107E5A SUB.B R6L,R6L` establishes zero. On the candidate
+  first iteration, `0x107E9A INC.B R6L` gives 1, `CMP.B #1,R6L` sets Z,
+  so `0x107E9E BHI` is false and `0x107EA0 BRA` returns to `0x107E5C`
+  carrying 1. On a second iteration the increment gives 2 and BHI is true.
+* Loop 2: `0x107EA2 SUB.B R6L,R6L` establishes zero. On the candidate
+  first iteration, `0x107EF8 INC.B R6L` gives 1, `CMP.B #1,R6L` sets Z,
+  so `0x107EFC BLS` is true and branches back to `0x107EA4` carrying 1.
+  On a second iteration increment gives 2 and BLS is false.
+
+Thus the first join has incoming candidate values 0 (reset) and 1 (loop
+back-edge), and so does the second join. The existing single-constant
+abstract domain soundly joins distinct values to UNKNOWN. This is not a
+`BLD` instruction bug. Pass 10 does not change the transfer function,
+helper contracts, reachability, branch pruning, or the solver counters.
+The witness check fails closed if the selected decoded B0 instructions are
+changed; it does not exhaustively validate all possible intermediate paths.
+For stronger path-sensitive claims, a separate CFG path-validation analysis
+would be required. Portable regression checks include mutated witness guards.
+
+### Stage 9.39 H3 Pass 11 - bounded set diagnostics (portable)
+
+A separate diagnostic-only `dk_byte_set` analysis (maximum 4 values) and
+parameterized byte-register alias classifier have been introduced. This is a
+stepping stone toward general register tracking, not a fully generic H8S
+semantics engine. Both B0 loop headers eventually widen to UNKNOWN because
+this pass retains both syntactic branch successors without edge filtering;
+that is the correct conservative result, not evidence of a third hardware
+iteration. New `R6L_SET_DOMAIN`, `R6L_SET_MERGE`, and `R6L_ALIAS_CHECK`
+records do not affect the original CCR solver or CFG. Exact-match helper
+contracts remain mutation-sensitive. Byte auto-update through ER6 and
+wide LDM ranges containing ER6 fail closed. No branch pruning.

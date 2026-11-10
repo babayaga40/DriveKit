@@ -18,7 +18,15 @@
  * into their own projects, including commercial projects, without
  * requesting permission, subject to the MIT License terms.
  *
- * Build (Windows): cl.exe drivekit.c
+ * Build (Windows):
+ *   cl.exe drivekit.c ^
+ *       zlib\adler32.c zlib\crc32.c zlib\zutil.c ^
+ *       zlib\inftrees.c zlib\inffast.c zlib\inflate.c zlib\uncompr.c ^
+ *       zlib_decomp_stubs.c ^
+ *       /I zlib /D ZLIB_DLL=
+ *   (place the madler/zlib source tree in a "zlib\" subdirectory next to drivekit.c;
+ *    zlib_decomp_stubs.c satisfies deflate_copyright / inflate9_copyright externs;
+ *    /D ZLIB_DLL= prevents ZEXPORT from becoming __declspec(dllimport))
  * Run with Administrator privileges.
  *
  * For commands, usage instructions, research findings, and contributor
@@ -34,6 +42,13 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <ctype.h>
+/* When building zlib sources directly (not as a DLL), ZLIB_DLL must NOT be
+   defined — if it is, ZEXPORT becomes __declspec(dllimport) and the linker
+   cannot find uncompress() even though uncompr.c is on the compile line.    */
+#ifdef ZLIB_DLL
+#  undef ZLIB_DLL
+#endif
+#include "zlib/zlib.h"       /* madler/zlib — compile zlib/*.c alongside drivekit.c */
 
 /* =========================================================
    CONSTANTS
@@ -9456,6 +9471,139 @@ static int cmd_b0dumpfw(void)
                 printf("    written.\n");
             }
 
+            /* Extract COMP streams from Normal body via the COMP directory.
+             *
+             * Directory layout (all offsets within the Normal image):
+             *   0x1000  "COMP" magic (4 bytes)
+             *   0x1004  big-endian u32 pairs (start_addr, end_addr) up to
+             *           0x1100 or the first 0xFFFFFFFF terminator; max 32
+             *           words = 16 streams.
+             *
+             * Addresses are absolute in the drive's address space.
+             * Normal image base = 0x410000.
+             *
+             * For each (start, end) pair, the stream sits at image offset
+             *   o = start - BASE
+             * with layout:
+             *   o+0 .. o+3   : expanded length, big-endian u32
+             *   o+4 .. end-BASE-1 : zlib stream, length = (end - start) bytes
+             *
+             * The zlib stream starts at image offset (o + 4) = (start - BASE + 4),
+             * i.e. at the same address as 'start' but four bytes later in the image.
+             * Compressed length = end - start.  Decompressed length = word at o.   */
+#define COMP_DIR_MAGIC_OFF  0x1000u
+#define COMP_DIR_DATA_OFF   0x1004u
+#define COMP_DIR_END_OFF    0x1100u
+#define COMP_NORMAL_BASE    0x00410000UL
+#define COMP_MAX_STREAMS    16
+#define COMP_MAX_DECOMP     (64*1024*1024UL)  /* 64 MiB cap (spec limit) */
+            int comp_count = 0;
+            {
+                FILE *nf = fopen(fname_normal, "rb");
+                if (nf) {
+                    UCHAR *nbody = (UCHAR *)malloc(B0DUMPFW_NORMAL_SIZE);
+                    if (nbody) {
+                        size_t nread = fread(nbody, 1, B0DUMPFW_NORMAL_SIZE, nf);
+                        fclose(nf); nf = NULL;
+
+                        printf("\n  Reading COMP directory at Normal+0x1000...\n");
+
+                        /* Validate "COMP" magic */
+                        if (nread < COMP_DIR_END_OFF ||
+                            nbody[COMP_DIR_MAGIC_OFF+0] != 'C' ||
+                            nbody[COMP_DIR_MAGIC_OFF+1] != 'O' ||
+                            nbody[COMP_DIR_MAGIC_OFF+2] != 'M' ||
+                            nbody[COMP_DIR_MAGIC_OFF+3] != 'P') {
+                            printf("    No COMP directory found (magic not present).\n");
+                        } else {
+                            /* Read (start, end) pairs from directory */
+                            unsigned int di;
+                            for (di = 0; di < COMP_MAX_STREAMS; di++) {
+                                size_t doff = COMP_DIR_DATA_OFF + di * 8;
+                                if (doff + 8 > COMP_DIR_END_OFF) break;
+
+                                DWORD start_addr = ((DWORD)nbody[doff+0] << 24) |
+                                                   ((DWORD)nbody[doff+1] << 16) |
+                                                   ((DWORD)nbody[doff+2] <<  8) |
+                                                    (DWORD)nbody[doff+3];
+                                DWORD end_addr   = ((DWORD)nbody[doff+4] << 24) |
+                                                   ((DWORD)nbody[doff+5] << 16) |
+                                                   ((DWORD)nbody[doff+6] <<  8) |
+                                                    (DWORD)nbody[doff+7];
+
+                                if (start_addr == 0xFFFFFFFFUL) break; /* terminator */
+                                if (end_addr   == 0xFFFFFFFFUL) break;
+
+                                /* Map to image offsets */
+                                if (start_addr < COMP_NORMAL_BASE) continue;
+                                if (end_addr   < start_addr)       continue;
+                                size_t img_off   = (size_t)(start_addr - COMP_NORMAL_BASE);
+                                size_t comp_sz   = (size_t)(end_addr   - start_addr);
+                                size_t zlib_off  = img_off + 4; /* skip 4-byte length prefix */
+
+                                /* Bounds check */
+                                if (img_off  + 4 > nread) continue;
+                                if (zlib_off + comp_sz > nread) continue;
+
+                                /* Read expanded length from the 4-byte prefix */
+                                DWORD decomp_size = ((DWORD)nbody[img_off+0] << 24) |
+                                                    ((DWORD)nbody[img_off+1] << 16) |
+                                                    ((DWORD)nbody[img_off+2] <<  8) |
+                                                     (DWORD)nbody[img_off+3];
+
+                                /* Validate */
+                                if (decomp_size == 0 || decomp_size > COMP_MAX_DECOMP) continue;
+                                if (nbody[zlib_off] != 0x78) continue; /* not a zlib stream */
+
+                                /* Decompress */
+                                uLongf dest_len = (uLongf)decomp_size;
+                                Bytef  *outbuf  = (Bytef *)malloc(decomp_size);
+                                if (!outbuf) continue;
+
+                                uLong src_used = (uLong)comp_sz;
+                                int   zret     = uncompress2(outbuf, &dest_len,
+                                                             nbody + zlib_off, &src_used);
+
+                                char fname_comp[128];
+                                snprintf(fname_comp, sizeof(fname_comp),
+                                         "%s_comp_%08lX.bin", dfw_prefix,
+                                         (unsigned long)zlib_off);
+
+                                if (zret == Z_OK) {
+                                    FILE *cf = fopen(fname_comp, "wb");
+                                    if (cf) {
+                                        fwrite(outbuf, 1, (size_t)dest_len, cf);
+                                        fclose(cf);
+                                        printf("    COMP[%u]  0x%08lX-0x%08lX  %lu -> %lu bytes  -> %s\n",
+                                               di,
+                                               (unsigned long)start_addr,
+                                               (unsigned long)end_addr,
+                                               (unsigned long)comp_sz,
+                                               (unsigned long)dest_len,
+                                               fname_comp);
+                                        comp_count++;
+                                    }
+                                } else {
+                                    printf("    COMP[%u]  0x%08lX  zlib error %d — skipped\n",
+                                           di, (unsigned long)start_addr, zret);
+                                }
+                                free(outbuf);
+                            }
+
+                            if (comp_count == 0)
+                                printf("    No COMP streams extracted.\n");
+                            else
+                                printf("    %d COMP stream(s) extracted.\n", comp_count);
+                        }
+
+                        free(nbody);
+                    } else {
+                        if (nf) fclose(nf);
+                        printf("    COMP: out of memory, skipped.\n");
+                    }
+                }
+            }
+
             /* Write sidecar info file */
             {
                 FILE *inf = fopen(fname_info, "w");
@@ -9472,6 +9620,7 @@ static int cmd_b0dumpfw(void)
                             fname_kernel, (unsigned long)B0DUMPFW_KERNEL_SIZE);
                     fprintf(inf, "Normal   : %s  (%lu bytes, live B0 0x410000)\n",
                             fname_normal, (unsigned long)B0DUMPFW_NORMAL_SIZE);
+                    fprintf(inf, "COMP     : %d segment(s) extracted\n", comp_count);
                     fclose(inf);
                     printf("  Sidecar  : %s\n", fname_info);
                 }
@@ -9484,8 +9633,10 @@ static int cmd_b0dumpfw(void)
                    fname_kernel, (unsigned long)(B0DUMPFW_KERNEL_SIZE/1024));
             printf("  %s\n    %lu KiB  (live B0 0x410000)\n",
                    fname_normal, (unsigned long)(B0DUMPFW_NORMAL_SIZE/1024));
-            printf("  %s\n    %u bytes  (full sequential dump)\n\n",
+            printf("  %s\n    %u bytes  (full sequential dump)\n",
                    fname_raw, total);
+            printf("  COMP segments : %d extracted  (*_comp_XXXXXXXX.bin)\n\n",
+                   comp_count);
         }
     } else {
         printf("  WRITE BUFFER 0x41 FAILED (key=%02X ASC=%02X)\n\n",

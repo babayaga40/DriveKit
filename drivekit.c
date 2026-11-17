@@ -7039,7 +7039,6 @@ int main(int argc, char *argv[])
     if (strcmp(cmd, "decryptkernel") == 0) return cmd_decryptkernel();
     if (strcmp(cmd, "decodenormal")  == 0) return cmd_decodenormal();
     if (strcmp(cmd, "scankey")       == 0) return cmd_scankey();
-    if (strcmp(cmd, "b0key")         == 0) return cmd_b0key();
     if (strcmp(cmd, "encryptkernel") == 0) return cmd_encryptkernel();
     if (strcmp(cmd, "family")        == 0) return cmd_family();
 
@@ -7285,6 +7284,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "e5test")      == 0) ret = cmd_e5test();
     else if (strcmp(cmd, "hwdump")      == 0) ret = cmd_hwdump();
     else if (strcmp(cmd, "b0probe")     == 0) ret = cmd_b0probe();
+    else if (strcmp(cmd, "b0key")       == 0) ret = cmd_b0key();
     else if (strcmp(cmd, "b0scankey")   == 0) ret = cmd_b0scankey();
     else if (strcmp(cmd, "b0dumpfw")    == 0) ret = cmd_b0dumpfw();
     else if (strcmp(cmd, "kernelmode")  == 0) {

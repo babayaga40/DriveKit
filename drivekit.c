@@ -9324,7 +9324,7 @@ static int cmd_b0scankey(void)
                 if (result == 1) {
                     DWORD le = (DWORD)m.key[0] | ((DWORD)m.key[1]<<8)
                              | ((DWORD)m.key[2]<<16) | ((DWORD)m.key[3]<<24);
-                    DWORD known = pioneer_key_lookup(g_driveID, NULL);
+                    DWORD known = pioneer_key(g_driveID, 0);
                     printf("\n");
                     printf("  +--------------------------------------------------+\n");
                     printf("  |  B0SCANKEY — LIVE FIRMWARE IDENTIFICATION        |\n");
@@ -9911,7 +9911,7 @@ static int cmd_scankey(void)
             printf("           Extracted key is NOT valid. Use key-table entry or hardware capture.\n");
         }
         /* Cross-check against known key table */
-        DWORD known = pioneer_key_lookup(g_driveID, NULL);
+        DWORD known = pioneer_key(g_driveID, 0);
         if (known && known != le) {
             printf("  WARNING: extracted key 0x%08lX differs from key-table entry 0x%08lX\n",
                    (unsigned long)le, (unsigned long)known);

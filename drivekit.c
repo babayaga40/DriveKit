@@ -8847,71 +8847,75 @@ static int cmd_b0key(void)
         printf("  READ BUFFER 0xF4: %s\n", f4st == 0 ? "OK" : "failed (continuing anyway)");
     }
 
-    /* Step 4: Stream 0xB0 from B0_START sequentially.
-       IMPORTANT: match b0scankey exactly — read the FIRST chunk immediately after F4
-       (this is the access-check read that opens the stream), store it, then loop
-       for the remaining chunks advancing b0offset before each CDB. */
-    printf("  Streaming 0xB0 (need 0x%06lX bytes total)...\n",
-           (unsigned long)B0KEY_STREAM_STOP);
+    /* Step 4: Stream 0xB0 to a temp file (b0key_dump.bin), then read Normal back.
+       Replicates b0scankey exactly: write each chunk to file as it arrives,
+       then fseek to Normal offset and load into memory for sk_find_key. */
+    printf("  Streaming 0xB0 to b0key_dump.bin...\n");
 
-    UCHAR *dumpbuf = (UCHAR *)malloc(B0KEY_STREAM_STOP);
-    if (!dumpbuf) { fprintf(stderr, "  Out of memory\n"); return 1; }
-    memset(dumpbuf, 0, B0KEY_STREAM_STOP);
+    FILE *fp = fopen("b0key_dump.bin", "wb");
+    if (!fp) { fprintf(stderr, "  Cannot open b0key_dump.bin for writing\n"); return 1; }
 
     DWORD b0offset = B0KEY_B0_START;
-    DWORD streamed = 0;
+    DWORD total    = 0;
 
-    /* First chunk — read immediately, same as b0scankey's access-check read */
+    /* First chunk — read immediately after F4, write to file */
     {
+        UCHAR b0buf[B0KEY_CHUNK] = {0};
+        UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
+            (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+            0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
+        UCHAR b0sense[SENSE_SIZE] = {0}; int b0st = 0;
+        send_scsi(g_hDrive, b0cdb, 10, b0buf, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, b0sense, &b0st);
+        if (b0st != 0) {
+            fclose(fp); remove("b0key_dump.bin");
+            fprintf(stderr, "  READ BUFFER 0xB0 at 0x%06lX FAILED — window not open\n",
+                    (unsigned long)b0offset);
+            return 1;
+        }
+        printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               b0buf[0],b0buf[1],b0buf[2],b0buf[3],
+               b0buf[4],b0buf[5],b0buf[6],b0buf[7]);
+        fwrite(b0buf, 1, B0KEY_CHUNK, fp);
+        total    += B0KEY_CHUNK;
+        b0offset += B0KEY_CHUNK;
+    }
+
+    /* Remaining chunks — same loop as b0scankey */
+    while (total < B0KEY_STREAM_STOP) {
+        UCHAR chunk[B0KEY_CHUNK] = {0};
         UCHAR csense[SENSE_SIZE] = {0}; int cst = 0;
         UCHAR ccdb[10] = {0x3C,0x02,0xB0,
             (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
             0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
-        send_scsi(g_hDrive, ccdb, 10, dumpbuf, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, csense, &cst);
-        if (cst != 0) {
-            fprintf(stderr, "  READ BUFFER 0xB0 at 0x%06lX FAILED (sense %02X/%02X/%02X) — window not open\n",
-                    (unsigned long)b0offset, csense[2]&0x0F, csense[12], csense[13]);
-            free(dumpbuf);
-            return 1;
-        }
-        printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
-               dumpbuf[0],dumpbuf[1],dumpbuf[2],dumpbuf[3],
-               dumpbuf[4],dumpbuf[5],dumpbuf[6],dumpbuf[7]);
-        streamed  += B0KEY_CHUNK;
-        b0offset  += B0KEY_CHUNK;
-    }
-
-    /* Remaining chunks — advance b0offset before each CDB, same as b0scankey */
-    while (streamed < B0KEY_STREAM_STOP) {
-        UCHAR chunk[B0KEY_CHUNK] = {0};
-        UCHAR csense[SENSE_SIZE] = {0};
-        int   cst = 0;
-        UCHAR ccdb[10] = {0x3C,0x02,0xB0,
-            (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
-            0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
         send_scsi(g_hDrive, ccdb, 10, chunk, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, csense, &cst);
-        if (cst != 0) break;  /* window closed — stop, use what we have */
-        DWORD copy = B0KEY_CHUNK;
-        if (streamed + copy > B0KEY_STREAM_STOP) copy = B0KEY_STREAM_STOP - streamed;
-        memcpy(dumpbuf + streamed, chunk, copy);
-        streamed  += B0KEY_CHUNK;
-        b0offset  += B0KEY_CHUNK;
+        if (cst != 0) break;
+        fwrite(chunk, 1, B0KEY_CHUNK, fp);
+        total    += B0KEY_CHUNK;
+        b0offset += B0KEY_CHUNK;
         printf("\r  Streamed 0x%06lX / 0x%06lX bytes...",
-               (unsigned long)streamed, (unsigned long)B0KEY_STREAM_STOP);
+               (unsigned long)total, (unsigned long)B0KEY_STREAM_STOP);
         fflush(stdout);
     }
-    printf("\n");
+    fclose(fp);
+    printf("\n  Total: 0x%06lX bytes\n", (unsigned long)total);
 
-    UCHAR *normalbuf = dumpbuf + B0KEY_NORMAL_OFF;
-    DWORD  norm_got  = B0KEY_SCAN_SIZE;
+    if (total < B0KEY_NORMAL_OFF + 0x10) {
+        fprintf(stderr, "  Stream too short — Normal region not reached.\n");
+        return 1;
+    }
 
-    /* Step 5: Check Normal header — also dump a few earlier offsets for diagnostics */
-    printf("\n  dumpbuf[0x000000..7]: ");
-    { int hi; for(hi=0;hi<8;hi++) printf("%02X ",dumpbuf[hi]); }
-    printf("\n  dumpbuf[0x300000..7]: ");
-    { int hi; for(hi=0;hi<8;hi++) printf("%02X ",dumpbuf[0x300000+hi]); }
-    printf("\n  dumpbuf[0x310000..7]: ");
-    { int hi; for(hi=0;hi<8;hi++) printf("%02X ",dumpbuf[0x310000+hi]); }
+    /* Read Normal body from file for scanning */
+    FILE *rf = fopen("b0key_dump.bin", "rb");
+    if (!rf) { fprintf(stderr, "  Cannot re-open b0key_dump.bin\n"); return 1; }
+    fseek(rf, (long)B0KEY_NORMAL_OFF, SEEK_SET);
+    DWORD norm_got = (DWORD)((total - B0KEY_NORMAL_OFF < B0KEY_SCAN_SIZE)
+                           ? (total - B0KEY_NORMAL_OFF) : B0KEY_SCAN_SIZE);
+    UCHAR *normalbuf = (UCHAR *)malloc(norm_got);
+    if (!normalbuf) { fclose(rf); fprintf(stderr, "  Out of memory\n"); return 1; }
+    fread(normalbuf, 1, norm_got, rf);
+    fclose(rf);
+
+    /* Step 5: Check Normal header */
     printf("\n  Normal[0..15]: ");
     { int hi; for(hi=0;hi<16&&hi<(int)norm_got;hi++) printf("%02X ",normalbuf[hi]); }
     printf("  (%s)\n\n",
@@ -8921,7 +8925,7 @@ static int cmd_b0key(void)
     SK_MATCH m = {0};
     size_t count = 0;
     int result = sk_find_key(normalbuf, (size_t)norm_got, &m, &count);
-    free(dumpbuf);
+    free(normalbuf);
 
     if (result == 0) {
         fprintf(stderr, "  No keyed handler found in Normal body (0x%06lX bytes scanned).\n",

@@ -8847,18 +8847,17 @@ static int cmd_b0key(void)
         printf("  READ BUFFER 0xF4: %s\n", f4st == 0 ? "OK" : "failed (continuing anyway)");
     }
 
-    /* Step 4: Stream 0xB0 from B0_START sequentially until we have Normal+scan window.
-       Buffer only the Normal body (skip the first NORMAL_OFF bytes). */
+    /* Step 4: Stream 0xB0 from B0_START sequentially.
+       Allocate the full dump up to STREAM_STOP, copy each chunk straight in. */
     printf("  Streaming 0xB0 (need 0x%06lX bytes total)...\n",
            (unsigned long)B0KEY_STREAM_STOP);
 
-    UCHAR *normalbuf = (UCHAR *)malloc(B0KEY_SCAN_SIZE);
-    if (!normalbuf) { fprintf(stderr, "  Out of memory\n"); return 1; }
-    memset(normalbuf, 0, B0KEY_SCAN_SIZE);
+    UCHAR *dumpbuf = (UCHAR *)malloc(B0KEY_STREAM_STOP);
+    if (!dumpbuf) { fprintf(stderr, "  Out of memory\n"); return 1; }
+    memset(dumpbuf, 0, B0KEY_STREAM_STOP);
 
-    DWORD b0offset  = B0KEY_B0_START;
-    DWORD streamed  = 0;          /* bytes streamed from dump start (= b0offset - B0_START) */
-    DWORD norm_got  = 0;          /* bytes written into normalbuf */
+    DWORD b0offset = B0KEY_B0_START;
+    DWORD streamed = 0;   /* bytes received so far (dump-relative) */
 
     while (streamed < B0KEY_STREAM_STOP) {
         UCHAR chunk[B0KEY_CHUNK] = {0};
@@ -8871,35 +8870,12 @@ static int cmd_b0key(void)
         if (cst != 0) {
             fprintf(stderr, "\n  READ BUFFER 0xB0 at 0x%06lX FAILED (sense %02X/%02X/%02X)\n",
                     (unsigned long)b0offset, csense[2]&0x0F, csense[12], csense[13]);
-            free(normalbuf);
+            free(dumpbuf);
             return 1;
         }
-
-        /* Copy only the portion of this chunk that falls within the Normal scan window */
-        DWORD chunk_start = streamed;           /* dump offset of chunk[0] */
-        DWORD chunk_end   = streamed + B0KEY_CHUNK;
-        if (chunk_end > chunk_start) {          /* always true */
-            DWORD copy_src_off = 0;
-            DWORD copy_dst_off = 0;
-            DWORD copy_len     = 0;
-
-            if (chunk_end > B0KEY_NORMAL_OFF && chunk_start < B0KEY_STREAM_STOP) {
-                DWORD src_start = (chunk_start < B0KEY_NORMAL_OFF)
-                                ? (B0KEY_NORMAL_OFF - chunk_start) : 0;
-                DWORD dst_start = (chunk_start > B0KEY_NORMAL_OFF)
-                                ? (chunk_start - B0KEY_NORMAL_OFF) : 0;
-                DWORD avail = B0KEY_CHUNK - src_start;
-                DWORD room  = B0KEY_SCAN_SIZE - dst_start;
-                copy_src_off = src_start;
-                copy_dst_off = dst_start;
-                copy_len = (avail < room) ? avail : room;
-                if (copy_len > 0) {
-                    memcpy(normalbuf + copy_dst_off, chunk + copy_src_off, copy_len);
-                    norm_got = dst_start + copy_len;
-                }
-            }
-        }
-
+        DWORD copy = B0KEY_CHUNK;
+        if (streamed + copy > B0KEY_STREAM_STOP) copy = B0KEY_STREAM_STOP - streamed;
+        memcpy(dumpbuf + streamed, chunk, copy);
         streamed  += B0KEY_CHUNK;
         b0offset  += B0KEY_CHUNK;
         printf("\r  Streamed 0x%06lX / 0x%06lX bytes...",
@@ -8908,11 +8884,8 @@ static int cmd_b0key(void)
     }
     printf("\n");
 
-    if (norm_got < 0x10) {
-        fprintf(stderr, "  Normal body not reached in stream.\n");
-        free(normalbuf);
-        return 1;
-    }
+    UCHAR *normalbuf = dumpbuf + B0KEY_NORMAL_OFF;
+    DWORD  norm_got  = B0KEY_SCAN_SIZE;
 
     /* Step 5: Check Normal header */
     printf("\n  Normal[0..15]: ");
@@ -8924,7 +8897,7 @@ static int cmd_b0key(void)
     SK_MATCH m = {0};
     size_t count = 0;
     int result = sk_find_key(normalbuf, (size_t)norm_got, &m, &count);
-    free(normalbuf);
+    free(dumpbuf);
 
     if (result == 0) {
         fprintf(stderr, "  No keyed handler found in Normal body (0x%06lX bytes scanned).\n",

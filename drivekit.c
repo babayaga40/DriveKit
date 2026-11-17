@@ -3199,7 +3199,7 @@ static DWORD pioneer_key(WORD driveID, UCHAR cl)
     case 0x8722:
     case 0x8B30: return 0x08A98AF2; /* XD06U — post-cutoff key from updater.exe */
     case 0x8D30: return 0x72C07157; /* XD07  SAT8D30 — confirmed from Wireshark capture */
-    case 0x8D31: return 0x72C07157; /* XD07U SAT8D31 — same platform */
+    case 0x8D31: return 0xFF8A27B1; /* XD07U SAT8D31 — confirmed from b0scankey live extraction (ID05, 1.06) */
     /* BDR-L13SH REC8C00/ID92 — key from live b0dump, CMP.L at Normal+0x4657C, FW 1.11 */
     case 0x8C00: return 0x46372819;
     /* BDR-XD06U post-cutoff — key from BDR-XD06J-UHD updater.exe */
@@ -8777,57 +8777,40 @@ static int cmd_decodenormal(void)
 /* =========================================================
    CMD_ENCRYPTKERNEL
    =========================================================
-   cmd_b0key — experimental: read unlock key directly from 0xB0 at hardcoded offset
+   cmd_b0key — stream 0xB0 sequentially and extract the unlock key
    =========================================================
    RESEARCH TOOL — standalone, does not affect other commands.
-   Reads 64 bytes from 0xB0 at offset B0KEY_PROBE_OFFSET, prints a hex
-   dump, and reports the 4 key bytes at B0KEY_KEY_OFFSET_IN_BUF.
+   Streams READ BUFFER 0xB0 from base 0x100000 in 32KB chunks (POST-CUTOFF,
+   WRITE BUFFER 0x41 at 0xA5AAAA), reads until key offset 0x34BFEC, extracts
+   4 key bytes.  Direct seeks to the key offset return 0xFF — must stream.
 
-   Known offsets (8801/ID58, fw 1.53, confirmed Nov 2026):
+   Key offset confirmed POST-CUTOFF (XD07U 1.06 / SAT8D31, Nov 2026):
      Normal body start in B0 dump : 0x310000
-     Key relative to Normal body  : 0x3BCE6
-     Absolute B0 offset           : 0x34BCE6
-
-   These offsets are NOT universal — run on each new platform to verify.
+     Key relative to Normal body  : 0x3BFEC
+     Absolute dump offset         : 0x34BFEC
    ========================================================= */
 
-/* B0KEY address layout:
-   0xB0 dump starts at address 0x100000 (b0_start in hwdump).
-   File offset 0x34BCE6 (key in dump) = 0xB0 address 0x100000 + 0x34BCE6 = 0x44BCE6.
-   Probe 6 bytes before key: 0x44BCE0. */
-#define B0KEY_B0_START        0x100000UL
-#define B0KEY_FILE_KEY_OFF    0x34BCE6UL   /* key offset within dump file   */
-#define B0KEY_ABS_PROBE       (B0KEY_B0_START + B0KEY_FILE_KEY_OFF - 6)  /* 0x44BCE0 */
-#define B0KEY_BUF_SIZE        64
-#define B0KEY_KEY_IN_BUF      6            /* key starts 6 bytes into the buffer */
+/* B0KEY — stream the 0xB0 dump sequentially (like b0scankey) and extract the key.
+   Direct seeks to the key offset return 0xFF — the window must be read sequentially.
+   Always uses POST-CUTOFF (WRITE BUFFER offset 0xA5AAAA); key at dump offset 0x34BFEC. */
+#define B0KEY_B0_START            0x100000UL  /* 0xB0 stream base address              */
+#define B0KEY_CHUNK               0x8000      /* 32 KB chunks — matches b0scankey      */
+#define B0KEY_FILE_KEY_OFF        0x34BFECUL  /* POST-CUTOFF key offset in dump        */
+#define B0KEY_STREAM_STOP         (B0KEY_FILE_KEY_OFF + 4) /* stop once we have the key */
 
 static int cmd_b0key(void)
 {
-    UCHAR buf[B0KEY_BUF_SIZE];
     UCHAR sense[SENSE_SIZE];
     DWORD i;
     int   st = 0;
 
-    printf("=== B0KEY — experimental 0xB0 key probe ===\n\n");
+    printf("=== B0KEY — 0xB0 sequential stream, POST-CUTOFF ===\n\n");
+    printf("  Enable offset  : 0xA5AAAA  (POST-CUTOFF)\n");
+    printf("  Key offset     : 0x%08lX in dump  (dump base 0x%06lX)\n\n",
+           (unsigned long)B0KEY_FILE_KEY_OFF,
+           (unsigned long)B0KEY_B0_START);
 
-    /* Detect pre vs post-cutoff */
-    int is_pre_cutoff = 1;
-    {
-        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
-        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
-        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
-        if (inqst == 0 && inq[0x25] >= 0x20) {
-            char date[9]={0}; int di;
-            for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
-                date[di]=inq[0x25+di];
-            is_pre_cutoff = (strcmp(date,"22/12/01") < 0);
-        }
-        printf("  Generation   : %s\n",
-               is_pre_cutoff ? "PRE-CUTOFF" : "POST-CUTOFF");
-    }
-
-    /* Enable 0xB0: GET EVENT STATUS x4, WRITE BUFFER 0x41, READ BUFFER 0xF4 */
-    printf("  Enabling 0xB0 access...\n");
+    /* Step 1: GET EVENT STATUS x4 to open the 0xB0 window */
     {
         UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
         int m;
@@ -8837,76 +8820,91 @@ static int cmd_b0key(void)
             send_scsi(g_hDrive,escdb,10,esbuf,8,SCSI_IOCTL_DATA_IN,essense,&esst);
         }
     }
+
+    /* Step 2: WRITE BUFFER 0x41 at 0xA5AAAA (POST-CUTOFF) */
     {
         UCHAR payload[1] = {0};
-        UCHAR wbcdb[12] = {0x3B,0x02,0x41,
-                           (UCHAR)(is_pre_cutoff ? 0x00 : 0xA5),0xAA,0xAA,
-                           0,0,0,0,0,0};
-        send_scsi(g_hDrive, wbcdb, 12, payload, 0,
-                  SCSI_IOCTL_DATA_OUT, sense, &st);
-        if (st != 0)
-            printf("  WRITE BUFFER 0x41: status=%d (continuing anyway)\n", st);
+        UCHAR wbcdb[12] = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
+        UCHAR wbsense[SENSE_SIZE] = {0}; int wbst = 0;
+        send_scsi(g_hDrive, wbcdb, 12, payload, 0, SCSI_IOCTL_DATA_OUT, wbsense, &wbst);
+        if (wbst != 0) {
+            fprintf(stderr, "  WRITE BUFFER 0x41 at 0xA5AAAA FAILED (sense %02X/%02X/%02X)\n",
+                    wbsense[2]&0x0F, wbsense[12], wbsense[13]);
+            fprintf(stderr, "  Cannot open 0xB0 window.\n");
+            return 1;
+        }
+        printf("  WRITE BUFFER 0x41 @ 0xA5AAAA: OK\n");
     }
-    /* READ BUFFER 0xF4 then immediately 0xB0 — timing critical, ~5ms window */
+
+    /* Step 3: READ BUFFER 0xF4 (required before 0xB0 becomes accessible) */
     {
-        UCHAR f4buf[0xA4]={0};
-        UCHAR f4cdb[10]={0x3C,0x02,0xF4,0x83,0x94,0xB4,0,0,0xA4,0};
-        UCHAR f4sense[SENSE_SIZE]={0}; int f4st=0;
-        send_scsi(g_hDrive,f4cdb,10,f4buf,0xA4,SCSI_IOCTL_DATA_IN,f4sense,&f4st);
-    }
-    /* Probe immediately — inline CDB, no rb_data wrapper to minimise latency */
-    DWORD probe = B0KEY_ABS_PROBE;
-    {
-        UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
-            (UCHAR)(probe>>16),(UCHAR)(probe>>8),(UCHAR)(probe),
-            0,(UCHAR)(B0KEY_BUF_SIZE>>8),(UCHAR)(B0KEY_BUF_SIZE),0};
-        memset(buf, 0xFF, B0KEY_BUF_SIZE);
-        memset(sense, 0, SENSE_SIZE);
-        send_scsi(g_hDrive, b0cdb, 10, buf, B0KEY_BUF_SIZE,
-                  SCSI_IOCTL_DATA_IN, sense, &st);
+        UCHAR f4buf[0xA4] = {0};
+        UCHAR f4cdb[10] = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
+        UCHAR f4sense[SENSE_SIZE] = {0}; int f4st = 0;
+        send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4, SCSI_IOCTL_DATA_IN, f4sense, &f4st);
+        printf("  READ BUFFER 0xF4: %s\n", f4st == 0 ? "OK" : "failed (continuing anyway)");
     }
 
-    printf("  Probe offset : 0x%08lX  (file offset 0x%08lX + b0_start 0x%06lX - 6)\n",
-           (unsigned long)probe,
-           (unsigned long)B0KEY_FILE_KEY_OFF,
-           (unsigned long)B0KEY_B0_START);
-    printf("  Read size    : %u bytes\n\n", B0KEY_BUF_SIZE);
+    /* Step 4: Stream READ BUFFER 0xB0 sequentially from B0_START until we have the key.
+       The 0xB0 window CANNOT be seeked — each chunk address must advance by CHUNK. */
+    printf("  Streaming 0xB0 to offset 0x%08lX...\n", (unsigned long)B0KEY_FILE_KEY_OFF);
 
-    if (st != 0) {
-        fprintf(stderr, "  FAILED: READ BUFFER 0xB0 at 0x%08lX sense=%02X/%02X/%02X\n",
-                (unsigned long)probe, sense[2]&0x0F, sense[12], sense[13]);
-        fprintf(stderr, "  0xB0 window may have closed, or offset is wrong for this platform.\n");
-        return 1;
-    }
+    /* Allocate enough to hold from B0_START up to and including the key */
+    DWORD buf_need = B0KEY_FILE_KEY_OFF + 4;  /* bytes needed from start of dump */
+    UCHAR *dumpbuf = (UCHAR *)malloc(buf_need);
+    if (!dumpbuf) { fprintf(stderr, "  Out of memory\n"); return 1; }
+    memset(dumpbuf, 0xFF, buf_need);
 
-    printf("  Raw bytes at probe offset:\n  ");
-    for (i = 0; i < B0KEY_BUF_SIZE; i++) {
-        printf("%02X ", buf[i]);
-        if ((i & 0xF) == 0xF) printf("\n  ");
+    DWORD b0offset = B0KEY_B0_START;
+    DWORD written  = 0;
+    int   ok       = 0;
+
+    while (written < buf_need) {
+        UCHAR chunk[B0KEY_CHUNK] = {0};
+        UCHAR csense[SENSE_SIZE] = {0};
+        int   cst = 0;
+        UCHAR ccdb[10] = {0x3C,0x02,0xB0,
+            (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+            0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
+        send_scsi(g_hDrive, ccdb, 10, chunk, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, csense, &cst);
+        if (cst != 0) {
+            fprintf(stderr, "\n  READ BUFFER 0xB0 at 0x%06lX FAILED (sense %02X/%02X/%02X)\n",
+                    (unsigned long)b0offset, csense[2]&0x0F, csense[12], csense[13]);
+            free(dumpbuf);
+            return 1;
+        }
+        DWORD copy = B0KEY_CHUNK;
+        if (written + copy > buf_need) copy = buf_need - written;
+        memcpy(dumpbuf + written, chunk, copy);
+        written  += B0KEY_CHUNK;  /* advance by full chunk even if we copied less */
+        b0offset += B0KEY_CHUNK;
+        printf("\r  Streamed 0x%06lX / 0x%06lX bytes...", (unsigned long)written, (unsigned long)buf_need);
+        fflush(stdout);
+        if (written >= buf_need) { ok = 1; break; }
     }
     printf("\n");
 
-    /* Extract and display key candidate */
-    UCHAR *kp = buf + B0KEY_KEY_IN_BUF;
+    if (!ok) {
+        fprintf(stderr, "  Stream ended before key offset — 0xB0 window closed early?\n");
+        free(dumpbuf);
+        return 1;
+    }
+
+    /* Step 5: Extract the 4-byte key at the known offset */
+    UCHAR *kp = dumpbuf + B0KEY_FILE_KEY_OFF;
     DWORD le = (DWORD)kp[0]
              | ((DWORD)kp[1] <<  8)
              | ((DWORD)kp[2] << 16)
              | ((DWORD)kp[3] << 24);
 
-    printf("  Key candidate at buf[%u..%u] (0xB0 address 0x%08lX):\n",
-           B0KEY_KEY_IN_BUF, B0KEY_KEY_IN_BUF + 3,
-           (unsigned long)(B0KEY_ABS_PROBE + B0KEY_KEY_IN_BUF));
-    printf("    Wire order : %02X %02X %02X %02X\n",
-           kp[0], kp[1], kp[2], kp[3]);
-    printf("    LE DWORD   : 0x%08lX\n\n", (unsigned long)le);
+    printf("\n  Bytes at key offset 0x%08lX:\n  ", (unsigned long)B0KEY_FILE_KEY_OFF);
+    for (i = 0; i < 16; i++) printf("%02X ", dumpbuf[B0KEY_FILE_KEY_OFF - 8 + i]);
+    printf("\n                          ^^ ^^ ^^ ^^  (key)\n\n");
 
-    if (le == 0x6123789A) {
-        printf("  CAUTION: candidate matches acceptance-signature constant.\n");
-        printf("           Known false-extraction value — offset may be wrong for this platform.\n");
-    } else {
-        printf("  NOTE: This is a raw read at a hardcoded offset.\n");
-        printf("        Verify with scankey on a decoded Normal body before trusting.\n");
-    }
+    printf("  Wire order : %02X %02X %02X %02X\n", kp[0], kp[1], kp[2], kp[3]);
+    printf("  LE DWORD   : 0x%08lX\n\n", (unsigned long)le);
+
+    free(dumpbuf);
 
     /* Cross-check against key table if drive is identified */
     DWORD known = pioneer_key_lookup(g_driveID, NULL);
@@ -8914,6 +8912,8 @@ static int cmd_b0key(void)
         printf("  Cross-check: matches key-table entry 0x%08lX  OK\n", (unsigned long)known);
     else if (known && known != le)
         printf("  Cross-check: differs from key-table entry 0x%08lX\n", (unsigned long)known);
+    else
+        printf("  Cross-check: drive ID not in table — verify manually.\n");
 
     printf("\n=== B0KEY DONE ===\n");
     return 0;

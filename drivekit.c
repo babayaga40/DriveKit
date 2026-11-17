@@ -8824,63 +8824,57 @@ static int cmd_b0key(void)
         }
     }
 
-    /* Step 2: WRITE BUFFER 0x41 at 0xA5AAAA */
-    {
-        UCHAR payload[1] = {0};
-        UCHAR wbcdb[12] = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
-        UCHAR wbsense[SENSE_SIZE] = {0}; int wbst = 0;
-        send_scsi(g_hDrive, wbcdb, 12, payload, 0, SCSI_IOCTL_DATA_OUT, wbsense, &wbst);
-        if (wbst != 0) {
-            fprintf(stderr, "  WRITE BUFFER 0x41 at 0xA5AAAA FAILED (sense %02X/%02X/%02X)\n",
-                    wbsense[2]&0x0F, wbsense[12], wbsense[13]);
-            return 1;
-        }
-        printf("  WRITE BUFFER 0x41 @ 0xA5AAAA: OK\n");
-    }
+    /* Steps 2-4: Enable + stream — verbatim copy of b0scankey's enable+stream block.
+       No prints between WRITE BUFFER, F4, and the first B0 read — timing-critical. */
+    UCHAR wbpayload[1] = {0};
+    UCHAR wbcdb[12] = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
+    DWORD b0_start = B0KEY_B0_START;
+    int   wb_st = 0;
 
-    /* Step 3: READ BUFFER 0xF4 */
+    send_scsi(g_hDrive, wbcdb, 12, wbpayload, 0, SCSI_IOCTL_DATA_OUT, sense, &wb_st);
+    if (wb_st != 0) {
+        fprintf(stderr, "  WRITE BUFFER 0x41 at 0xA5AAAA FAILED\n");
+        return 1;
+    }
+    printf("  WRITE BUFFER 0x41 @ 0xA5AAAA: OK\n");
+
+    FILE *fp = NULL;
+    DWORD b0offset = b0_start;
+    DWORD total    = 0;
+
     {
+        /* F4 read */
         UCHAR f4buf[0xA4] = {0};
         UCHAR f4cdb[10] = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
         UCHAR f4sense[SENSE_SIZE] = {0}; int f4st = 0;
         send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4, SCSI_IOCTL_DATA_IN, f4sense, &f4st);
-        printf("  READ BUFFER 0xF4: %s\n", f4st == 0 ? "OK" : "failed (continuing anyway)");
-    }
 
-    /* Step 4: Stream 0xB0 to a temp file (b0key_dump.bin), then read Normal back.
-       Replicates b0scankey exactly: write each chunk to file as it arrives,
-       then fseek to Normal offset and load into memory for sk_find_key. */
-    printf("  Streaming 0xB0 to b0key_dump.bin...\n");
-
-    FILE *fp = fopen("b0key_dump.bin", "wb");
-    if (!fp) { fprintf(stderr, "  Cannot open b0key_dump.bin for writing\n"); return 1; }
-
-    DWORD b0offset = B0KEY_B0_START;
-    DWORD total    = 0;
-
-    /* First chunk — read immediately after F4, write to file */
-    {
+        /* First B0 chunk — immediately after F4, no intervening I/O or prints */
         UCHAR b0buf[B0KEY_CHUNK] = {0};
         UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
-            (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+            (UCHAR)(b0_start>>16),(UCHAR)(b0_start>>8),(UCHAR)(b0_start),
             0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
         UCHAR b0sense[SENSE_SIZE] = {0}; int b0st = 0;
         send_scsi(g_hDrive, b0cdb, 10, b0buf, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, b0sense, &b0st);
-        if (b0st != 0) {
-            fclose(fp); remove("b0key_dump.bin");
-            fprintf(stderr, "  READ BUFFER 0xB0 at 0x%06lX FAILED — window not open\n",
-                    (unsigned long)b0offset);
-            return 1;
-        }
+
+        printf("  READ BUFFER 0xF4  : %s\n", f4st==0 ? "OK" : "failed");
+        printf("  READ BUFFER 0xB0  : %s\n", b0st==0 ? "OK" : "FAILED — window not open");
+        if (b0st != 0) return 1;
+
         printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
                b0buf[0],b0buf[1],b0buf[2],b0buf[3],
                b0buf[4],b0buf[5],b0buf[6],b0buf[7]);
+
+        fp = fopen("b0key_dump.bin", "wb");
+        if (!fp) { fprintf(stderr, "  Cannot open b0key_dump.bin\n"); return 1; }
         fwrite(b0buf, 1, B0KEY_CHUNK, fp);
         total    += B0KEY_CHUNK;
         b0offset += B0KEY_CHUNK;
     }
 
-    /* Remaining chunks — same loop as b0scankey */
+    printf("  Streaming 0xB0 to b0key_dump.bin...\n");
+
+    /* Remaining chunks */
     while (total < B0KEY_STREAM_STOP) {
         UCHAR chunk[B0KEY_CHUNK] = {0};
         UCHAR csense[SENSE_SIZE] = {0}; int cst = 0;

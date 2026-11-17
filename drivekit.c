@@ -8797,13 +8797,38 @@ static int cmd_decodenormal(void)
 #define B0KEY_B0_START     0x100000UL   /* 0xB0 stream base address            */
 #define B0KEY_CHUNK        0x8000       /* 32 KB chunks — matches b0scankey    */
 #define B0KEY_NORMAL_OFF   0x310000UL   /* Normal body start in dump           */
-#define B0KEY_SCAN_SIZE    0x050000UL   /* scan this many bytes of Normal body */
+#define B0KEY_SCAN_SIZE    0x0A0000UL   /* scan this many bytes of Normal body */
 #define B0KEY_STREAM_STOP  (B0KEY_NORMAL_OFF + B0KEY_SCAN_SIZE)
 
 static int cmd_b0key(void)
 {
+    /* All declarations first — C89/MSVC requirement */
     UCHAR sense[SENSE_SIZE];
-    int   st = 0;
+    int   wb_st     = 0;
+    int   f4st      = 0;
+    int   b0st      = 0;
+    FILE *fp        = NULL;
+    FILE *rf        = NULL;
+    DWORD total     = 0;
+    DWORD b0offset  = B0KEY_B0_START;
+    DWORD norm_got  = 0;
+    DWORD known     = 0;
+    DWORD le        = 0;
+    int   result    = 0;
+    size_t count    = 0;
+    SK_MATCH skm;
+    UCHAR *normalbuf          = NULL;
+    UCHAR wbpayload[1]        = {0};
+    UCHAR wbcdb[12]           = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
+    UCHAR f4buf[0xA4]         = {0};
+    UCHAR f4cdb[10]           = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
+    UCHAR f4sense[SENSE_SIZE] = {0};
+    UCHAR b0buf[B0KEY_CHUNK]  = {0};
+    UCHAR b0cdb[10]           = {0x3C,0x02,0xB0,
+        (UCHAR)(B0KEY_B0_START>>16),(UCHAR)(B0KEY_B0_START>>8),(UCHAR)(B0KEY_B0_START),
+        0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
+    UCHAR b0sense[SENSE_SIZE] = {0};
+    memset(&skm, 0, sizeof(skm));
 
     printf("=== B0KEY — 0xB0 sequential stream + key scan, POST-CUTOFF ===\n\n");
     printf("  Enable offset  : 0xA5AAAA  (POST-CUTOFF)\n");
@@ -8812,6 +8837,38 @@ static int cmd_b0key(void)
            (unsigned long)B0KEY_B0_START);
     printf("  Scan size      : 0x%06lX bytes of Normal body\n\n",
            (unsigned long)B0KEY_SCAN_SIZE);
+
+    /* Preamble: INQUIRY + READ BUFFER 0xF1 — same as b0scankey.
+       Required to prime the drive before the enable sequence. */
+    {
+        UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
+        UCHAR inqcdb[6]={0x12,0,0,0,64,0};
+        send_scsi(g_hDrive,inqcdb,6,inq,64,SCSI_IOCTL_DATA_IN,inqs,&inqst);
+        printf("  INQUIRY        : %s\n", inqst==0 ? "OK" : "failed");
+        if (inqst == 0) {
+            char fwrev[5]={0}; int fi;
+            for(fi=0;fi<4;fi++){char c=(char)inq[32+fi];fwrev[fi]=(c>=' '&&c<='~')?c:'_';}
+            fwrev[4]='\0';
+            printf("  FW rev         : %.4s\n", fwrev);
+        }
+    }
+    if (g_driveID == 0 || !g_kernelID[0]) {
+        UCHAR f1buf[0x30]={0}; UCHAR f1sense[SENSE_SIZE]={0};
+        if (rb_data(0xF1, 0, f1buf, 0x30, f1sense) == 0) {
+            char plat[16]={0}; int k;
+            for(k=0;k<12&&f1buf[0x10+k]>=0x20&&f1buf[0x10+k]<0x7F;k++)
+                plat[k]=(char)f1buf[0x10+k];
+            for(k=0;k<4&&f1buf[0x18+k]>=0x20&&f1buf[0x18+k]<0x7F;k++)
+                g_kernelID[k]=(char)f1buf[0x18+k];
+            if (g_driveID == 0) {
+                const char *p=plat;
+                while(*p&&(*p<'0'||*p>'9')) p++;
+                if(*p) g_driveID=(WORD)strtol(p,NULL,16);
+            }
+        }
+        printf("  READ BUF 0xF1  : platform 0x%04X\n", (unsigned)g_driveID);
+    }
+    printf("\n");
 
     /* Step 1: GET EVENT STATUS x4 */
     {
@@ -8826,21 +8883,6 @@ static int cmd_b0key(void)
 
     /* Steps 2-4: WB → F4 → first B0 chunk, all back-to-back, zero prints in between.
        The 0xB0 window is ~5ms after WRITE BUFFER; every printf adds latency. */
-    UCHAR wbpayload[1] = {0};
-    UCHAR wbcdb[12]    = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
-    DWORD b0_start     = B0KEY_B0_START;
-    int   wb_st = 0, f4st = 0, b0st = 0;
-    UCHAR f4buf[0xA4]       = {0};
-    UCHAR f4cdb[10]         = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
-    UCHAR f4sense[SENSE_SIZE] = {0};
-    UCHAR b0buf[B0KEY_CHUNK]  = {0};
-    UCHAR b0cdb[10]           = {0x3C,0x02,0xB0,
-        (UCHAR)(B0KEY_B0_START>>16),(UCHAR)(B0KEY_B0_START>>8),(UCHAR)(B0KEY_B0_START),
-        0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
-    UCHAR b0sense[SENSE_SIZE] = {0};
-    FILE *fp    = NULL;
-    DWORD total    = 0;
-    DWORD b0offset = B0KEY_B0_START;
 
     send_scsi(g_hDrive, wbcdb, 12, wbpayload, 0, SCSI_IOCTL_DATA_OUT, sense,   &wb_st);
     send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4, SCSI_IOCTL_DATA_IN,  f4sense,  &f4st);
@@ -8888,12 +8930,12 @@ static int cmd_b0key(void)
     }
 
     /* Read Normal body from file for scanning */
-    FILE *rf = fopen("b0key_dump.bin", "rb");
+    rf = fopen("b0key_dump.bin", "rb");
     if (!rf) { fprintf(stderr, "  Cannot re-open b0key_dump.bin\n"); return 1; }
     fseek(rf, (long)B0KEY_NORMAL_OFF, SEEK_SET);
-    DWORD norm_got = (DWORD)((total - B0KEY_NORMAL_OFF < B0KEY_SCAN_SIZE)
-                           ? (total - B0KEY_NORMAL_OFF) : B0KEY_SCAN_SIZE);
-    UCHAR *normalbuf = (UCHAR *)malloc(norm_got);
+    norm_got = (DWORD)((total - B0KEY_NORMAL_OFF < B0KEY_SCAN_SIZE)
+                      ? (total - B0KEY_NORMAL_OFF) : B0KEY_SCAN_SIZE);
+    normalbuf = (UCHAR *)malloc(norm_got);
     if (!normalbuf) { fclose(rf); fprintf(stderr, "  Out of memory\n"); return 1; }
     fread(normalbuf, 1, norm_got, rf);
     fclose(rf);
@@ -8905,9 +8947,7 @@ static int cmd_b0key(void)
            (norm_got >= 8 && memcmp(normalbuf,"PIONEER ",8)==0) ? "PIONEER OK" : "not PIONEER — wrong offset?");
 
     /* Step 6: Scan for key pattern using sk_find_key (same as b0scankey) */
-    SK_MATCH m = {0};
-    size_t count = 0;
-    int result = sk_find_key(normalbuf, (size_t)norm_got, &m, &count);
+    result = sk_find_key(normalbuf, (size_t)norm_got, &skm, &count);
     free(normalbuf);
 
     if (result == 0) {
@@ -8920,16 +8960,16 @@ static int cmd_b0key(void)
         return 1;
     }
 
-    DWORD le = (DWORD)m.key[0] | ((DWORD)m.key[1]<<8)
-             | ((DWORD)m.key[2]<<16) | ((DWORD)m.key[3]<<24);
+    le = (DWORD)skm.key[0] | ((DWORD)skm.key[1]<<8)
+       | ((DWORD)skm.key[2]<<16) | ((DWORD)skm.key[3]<<24);
 
-    printf("  Key offset in Normal   : 0x%zX\n", m.key_offset);
-    printf("  Reject branch variant  : %u-byte\n", m.reject_length);
+    printf("  Key offset in Normal   : 0x%zX\n", skm.key_offset);
+    printf("  Reject branch variant  : %u-byte\n", skm.reject_length);
     printf("  Wire order             : %02X %02X %02X %02X\n",
-           m.key[0], m.key[1], m.key[2], m.key[3]);
+           skm.key[0], skm.key[1], skm.key[2], skm.key[3]);
     printf("  LE DWORD               : 0x%08lX\n\n", (unsigned long)le);
 
-    DWORD known = pioneer_key_lookup(g_driveID, NULL);
+    known = pioneer_key_lookup(g_driveID, NULL);
     if (known && known == le)
         printf("  Cross-check: matches key-table entry 0x%08lX  OK\n", (unsigned long)known);
     else if (known && known != le)

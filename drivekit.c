@@ -8848,7 +8848,9 @@ static int cmd_b0key(void)
     }
 
     /* Step 4: Stream 0xB0 from B0_START sequentially.
-       Allocate the full dump up to STREAM_STOP, copy each chunk straight in. */
+       IMPORTANT: match b0scankey exactly — read the FIRST chunk immediately after F4
+       (this is the access-check read that opens the stream), store it, then loop
+       for the remaining chunks advancing b0offset before each CDB. */
     printf("  Streaming 0xB0 (need 0x%06lX bytes total)...\n",
            (unsigned long)B0KEY_STREAM_STOP);
 
@@ -8857,8 +8859,29 @@ static int cmd_b0key(void)
     memset(dumpbuf, 0, B0KEY_STREAM_STOP);
 
     DWORD b0offset = B0KEY_B0_START;
-    DWORD streamed = 0;   /* bytes received so far (dump-relative) */
+    DWORD streamed = 0;
 
+    /* First chunk — read immediately, same as b0scankey's access-check read */
+    {
+        UCHAR csense[SENSE_SIZE] = {0}; int cst = 0;
+        UCHAR ccdb[10] = {0x3C,0x02,0xB0,
+            (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
+            0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
+        send_scsi(g_hDrive, ccdb, 10, dumpbuf, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, csense, &cst);
+        if (cst != 0) {
+            fprintf(stderr, "  READ BUFFER 0xB0 at 0x%06lX FAILED (sense %02X/%02X/%02X) — window not open\n",
+                    (unsigned long)b0offset, csense[2]&0x0F, csense[12], csense[13]);
+            free(dumpbuf);
+            return 1;
+        }
+        printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               dumpbuf[0],dumpbuf[1],dumpbuf[2],dumpbuf[3],
+               dumpbuf[4],dumpbuf[5],dumpbuf[6],dumpbuf[7]);
+        streamed  += B0KEY_CHUNK;
+        b0offset  += B0KEY_CHUNK;
+    }
+
+    /* Remaining chunks — advance b0offset before each CDB, same as b0scankey */
     while (streamed < B0KEY_STREAM_STOP) {
         UCHAR chunk[B0KEY_CHUNK] = {0};
         UCHAR csense[SENSE_SIZE] = {0};
@@ -8867,12 +8890,7 @@ static int cmd_b0key(void)
             (UCHAR)(b0offset>>16),(UCHAR)(b0offset>>8),(UCHAR)(b0offset),
             0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
         send_scsi(g_hDrive, ccdb, 10, chunk, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, csense, &cst);
-        if (cst != 0) {
-            fprintf(stderr, "\n  READ BUFFER 0xB0 at 0x%06lX FAILED (sense %02X/%02X/%02X)\n",
-                    (unsigned long)b0offset, csense[2]&0x0F, csense[12], csense[13]);
-            free(dumpbuf);
-            return 1;
-        }
+        if (cst != 0) break;  /* window closed — stop, use what we have */
         DWORD copy = B0KEY_CHUNK;
         if (streamed + copy > B0KEY_STREAM_STOP) copy = B0KEY_STREAM_STOP - streamed;
         memcpy(dumpbuf + streamed, chunk, copy);

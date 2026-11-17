@@ -8969,7 +8969,10 @@ static int cmd_b0key(void)
            skm.key[0], skm.key[1], skm.key[2], skm.key[3]);
     printf("  LE DWORD               : 0x%08lX\n\n", (unsigned long)le);
 
-    known = pioneer_key_lookup(g_driveID, NULL);
+    /* Use pioneer_key() (switch-based, platform ID only) for cross-check.
+       pioneer_key_lookup() requires a kernel_id string and falls back to
+       the universal default when NULL is passed. */
+    known = pioneer_key(g_driveID, 0);
     if (known && known == le)
         printf("  Cross-check: matches key-table entry 0x%08lX  OK\n", (unsigned long)known);
     else if (known && known != le)

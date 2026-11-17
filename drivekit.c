@@ -8831,35 +8831,28 @@ static int cmd_b0key(void)
     DWORD b0_start = B0KEY_B0_START;
     int   wb_st = 0;
 
-    send_scsi(g_hDrive, wbcdb, 12, wbpayload, 0, SCSI_IOCTL_DATA_OUT, sense, &wb_st);
-    if (wb_st != 0) {
-        fprintf(stderr, "  WRITE BUFFER 0x41 at 0xA5AAAA FAILED\n");
-        return 1;
-    }
-    printf("  WRITE BUFFER 0x41 @ 0xA5AAAA: OK\n");
-
-    FILE *fp = NULL;
-    DWORD b0offset = b0_start;
-    DWORD total    = 0;
-
+    /* Steps 2-4 inner: WB → F4 → first B0 chunk, all back-to-back, zero prints in between.
+       The 0xB0 window is ~5ms after WRITE BUFFER; every printf adds latency. */
     {
-        /* F4 read */
+        int f4st = 0, b0st = 0;
         UCHAR f4buf[0xA4] = {0};
         UCHAR f4cdb[10] = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
-        UCHAR f4sense[SENSE_SIZE] = {0}; int f4st = 0;
-        send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4, SCSI_IOCTL_DATA_IN, f4sense, &f4st);
-
-        /* First B0 chunk — immediately after F4, no intervening I/O or prints */
+        UCHAR f4sense[SENSE_SIZE] = {0};
         UCHAR b0buf[B0KEY_CHUNK] = {0};
         UCHAR b0cdb[10] = {0x3C,0x02,0xB0,
             (UCHAR)(b0_start>>16),(UCHAR)(b0_start>>8),(UCHAR)(b0_start),
             0,(UCHAR)(B0KEY_CHUNK>>8),(UCHAR)(B0KEY_CHUNK),0};
-        UCHAR b0sense[SENSE_SIZE] = {0}; int b0st = 0;
+        UCHAR b0sense[SENSE_SIZE] = {0};
+
+        send_scsi(g_hDrive, wbcdb, 12, wbpayload, 0, SCSI_IOCTL_DATA_OUT, sense, &wb_st);
+        send_scsi(g_hDrive, f4cdb, 10, f4buf, 0xA4, SCSI_IOCTL_DATA_IN, f4sense, &f4st);
         send_scsi(g_hDrive, b0cdb, 10, b0buf, B0KEY_CHUNK, SCSI_IOCTL_DATA_IN, b0sense, &b0st);
 
-        printf("  READ BUFFER 0xF4  : %s\n", f4st==0 ? "OK" : "failed");
-        printf("  READ BUFFER 0xB0  : %s\n", b0st==0 ? "OK" : "FAILED — window not open");
-        if (b0st != 0) return 1;
+        /* Now safe to print */
+        printf("  WRITE BUFFER 0x41 : %s\n", wb_st==0 ? "OK" : "FAILED");
+        printf("  READ BUFFER 0xF4  : %s\n", f4st==0  ? "OK" : "failed");
+        printf("  READ BUFFER 0xB0  : %s\n", b0st==0  ? "OK" : "FAILED — window not open");
+        if (wb_st != 0 || b0st != 0) return 1;
 
         printf("  Base[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
                b0buf[0],b0buf[1],b0buf[2],b0buf[3],

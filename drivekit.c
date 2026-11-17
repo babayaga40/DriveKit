@@ -8887,7 +8887,13 @@ static int cmd_b0key(void)
     UCHAR *normalbuf = dumpbuf + B0KEY_NORMAL_OFF;
     DWORD  norm_got  = B0KEY_SCAN_SIZE;
 
-    /* Step 5: Check Normal header */
+    /* Step 5: Check Normal header — also dump a few earlier offsets for diagnostics */
+    printf("\n  dumpbuf[0x000000..7]: ");
+    { int hi; for(hi=0;hi<8;hi++) printf("%02X ",dumpbuf[hi]); }
+    printf("\n  dumpbuf[0x300000..7]: ");
+    { int hi; for(hi=0;hi<8;hi++) printf("%02X ",dumpbuf[0x300000+hi]); }
+    printf("\n  dumpbuf[0x310000..7]: ");
+    { int hi; for(hi=0;hi<8;hi++) printf("%02X ",dumpbuf[0x310000+hi]); }
     printf("\n  Normal[0..15]: ");
     { int hi; for(hi=0;hi<16&&hi<(int)norm_got;hi++) printf("%02X ",normalbuf[hi]); }
     printf("  (%s)\n\n",

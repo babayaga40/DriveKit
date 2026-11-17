@@ -8804,22 +8804,23 @@ static int cmd_b0key(void)
 {
     /* All declarations first — C89/MSVC requirement */
     UCHAR sense[SENSE_SIZE];
-    int   wb_st     = 0;
-    int   f4st      = 0;
-    int   b0st      = 0;
-    FILE *fp        = NULL;
-    FILE *rf        = NULL;
-    DWORD total     = 0;
-    DWORD b0offset  = B0KEY_B0_START;
-    DWORD norm_got  = 0;
-    DWORD known     = 0;
-    DWORD le        = 0;
-    int   result    = 0;
-    size_t count    = 0;
+    int   wb_st        = 0;
+    int   f4st         = 0;
+    int   b0st         = 0;
+    int   is_pre       = 0;   /* pre-cutoff flag: set from INQUIRY date */
+    FILE *fp           = NULL;
+    FILE *rf           = NULL;
+    DWORD total        = 0;
+    DWORD b0offset     = B0KEY_B0_START;
+    DWORD norm_got     = 0;
+    DWORD known        = 0;
+    DWORD le           = 0;
+    int   result       = 0;
+    size_t count       = 0;
     SK_MATCH skm;
     UCHAR *normalbuf          = NULL;
     UCHAR wbpayload[1]        = {0};
-    UCHAR wbcdb[12]           = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
+    UCHAR wbcdb[12]           = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0}; /* byte[3] patched below */
     UCHAR f4buf[0xA4]         = {0};
     UCHAR f4cdb[10]           = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
     UCHAR f4sense[SENSE_SIZE] = {0};
@@ -8830,8 +8831,7 @@ static int cmd_b0key(void)
     UCHAR b0sense[SENSE_SIZE] = {0};
     memset(&skm, 0, sizeof(skm));
 
-    printf("=== B0KEY — 0xB0 sequential stream + key scan, POST-CUTOFF ===\n\n");
-    printf("  Enable offset  : 0xA5AAAA  (POST-CUTOFF)\n");
+    printf("=== B0KEY — 0xB0 sequential stream + key scan ===\n\n");
     printf("  Normal body at : 0x%06lX in dump  (dump base 0x%06lX)\n",
            (unsigned long)B0KEY_NORMAL_OFF,
            (unsigned long)B0KEY_B0_START);
@@ -8839,7 +8839,7 @@ static int cmd_b0key(void)
            (unsigned long)B0KEY_SCAN_SIZE);
 
     /* Preamble: INQUIRY + READ BUFFER 0xF1 — same as b0scankey.
-       Required to prime the drive before the enable sequence. */
+       Required to prime the drive; also determines pre/post-cutoff. */
     {
         UCHAR inq[64]={0}; UCHAR inqs[SENSE_SIZE]={0}; int inqst=0;
         UCHAR inqcdb[6]={0x12,0,0,0,64,0};
@@ -8850,7 +8850,19 @@ static int cmd_b0key(void)
             for(fi=0;fi<4;fi++){char c=(char)inq[32+fi];fwrev[fi]=(c>=' '&&c<='~')?c:'_';}
             fwrev[4]='\0';
             printf("  FW rev         : %.4s\n", fwrev);
+            /* Detect pre/post-cutoff from date field (same logic as b0scankey) */
+            if (inq[0x25] >= 0x20) {
+                char date[9]={0}; int di;
+                for(di=0;di<8&&inq[0x25+di]>=0x20&&inq[0x25+di]<=0x7E;di++)
+                    date[di]=inq[0x25+di];
+                is_pre = (strcmp(date,"22/12/01") < 0);
+            }
         }
+        /* Patch WRITE BUFFER offset: 0x00AAAA (pre) or 0xA5AAAA (post) */
+        wbcdb[3] = is_pre ? 0x00 : 0xA5;
+        printf("  Generation     : %s\n",
+               is_pre ? "PRE-CUTOFF  (enable offset 0x00AAAA)"
+                      : "POST-CUTOFF (enable offset 0xA5AAAA)");
     }
     if (g_driveID == 0 || !g_kernelID[0]) {
         UCHAR f1buf[0x30]={0}; UCHAR f1sense[SENSE_SIZE]={0};

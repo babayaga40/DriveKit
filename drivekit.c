@@ -48,7 +48,10 @@
 #ifdef ZLIB_DLL
 #  undef ZLIB_DLL
 #endif
-#include "zlib/zlib.h"       /* madler/zlib — compile zlib/*.c alongside drivekit.c */
+#include "zlib/zlib.h"
+#include <process.h>
+#include <stdint.h>
+#include "drivekit_disasm.h"       /* madler/zlib — compile zlib/*.c alongside drivekit.c */
 
 /* =========================================================
    CONSTANTS
@@ -5107,6 +5110,18 @@ static void print_help(void)
     printf("  triggerkernel Trigger kernel mode via READ BUFFER 0xB0\n");
     printf("  brutekey      Try all known Pioneer unlock keys\n");
     printf("  sendcdb       Send raw SCSI CDB to drive\n\n");
+    printf("Offline firmware analysis (no drive letter required):\n");
+    printf("  --makeasm <firmware.bin> [options]  Export strict ASM and review reports\n");
+    printf("       --out <file.asm>   Strict ASM output (default FUNCTIONS_LABELED.asm)\n");
+    printf("       --no-editor        Generate reports without opening the editor\n");
+    printf("       --review-editor    Open dynamic sub_/loc_ review listing in editor\n");
+    printf("       --help             Show detailed --makeasm options\n");
+    printf("  --editor <file.asm> [--firmware <firmware.bin>]\n");
+    printf("                       Open an existing ASM listing in embedded editor\n");
+    printf("       --help             Show detailed --editor options\n");
+    printf("  disasm --file <firmware.bin> [--base <address>] [--out <file>]\n");
+    printf("                       Low-level H8S disassembly and optional audits\n");
+    printf("\n");
     printf("Other:\n");
     printf("  about         About DriveKit and credits\n\n");
     printf("Options:\n");
@@ -5125,7 +5140,10 @@ static void print_help(void)
     printf("  drivekit flash G --file S9330360.102 --file2 S9330361.101 --patch --nounlock\n");
     printf("  drivekit rawdump G --bufid 0xB0\n");
     printf("  drivekit dumpfw G --file firmware_dump.bin\n");
-    printf("  drivekit sendcdb G 3B 05 FF 00 00 00 00 01 00 00\n\n");
+    printf("  drivekit sendcdb G 3B 05 FF 00 00 00 00 01 00 00\n");
+    printf("  drivekit --makeasm normal.bin --review-editor\n");
+    printf("  drivekit --makeasm normal.bin --no-editor --out strict.asm\n");
+    printf("  drivekit --editor PASS90_LOCATIONS_REVIEW.asm --firmware normal.bin\n\n");
     printf("Note: Always eject disc before unlock/flash. Run as Administrator.\n");
 }
 
@@ -5220,7 +5238,7 @@ static int cmd_autoflash(void)
     if (hf == INVALID_HANDLE_VALUE) {
         printf("  No files found in firmware\\ folder.\n");
         printf("  Download Pioneer firmware files and place in:\n");
-        printf("    %s\\\n", fw_dir);
+        printf("    %s\\n", fw_dir);
         return 1;
     }
 
@@ -6879,6 +6897,72 @@ static int cmd_flashfw(void)
 /* =========================================================
    MAIN
    ========================================================= */
+/* Offline ASM workflows. No optical-drive commands or SCSI calls. */
+/* Pass 62: single-executable editor and Pass 44/45/46 function export. */
+extern int dk_embedded_editor_main(int argc, char **argv);
+extern int dk_functions_export(const char *firmware, const char *listing, const char *index, const char *summary);
+static int dk_launch_editor(const char *asm_path, const char *fw_path)
+{
+    char *args[8]; int n=0;
+    args[n++]="drivekit"; args[n++]=(char*)asm_path;
+    if(fw_path){args[n++]="--firmware";args[n++]=(char*)fw_path;args[n++]="--base";args[n++]="00410000";}
+    args[n]=NULL;
+    return dk_embedded_editor_main(n,args);
+}
+static void dk_makeasm_help(void)
+{
+    printf("Usage: drivekit --makeasm <firmware.bin> [--out <file.asm>] [--no-editor | --review-editor]\n\n");
+    printf("  <firmware.bin>     Input decrypted normal firmware (no drive letter)\n");
+    printf("  --out <file.asm>   Strict ASM filename (default FUNCTIONS_LABELED.asm)\n");
+    printf("  --no-editor        Export without opening the editor\n");
+    printf("  --review-editor    Open PASS90_LOCATIONS_REVIEW.asm with sub_/loc_ labels\n");
+    printf("  --help             Display this help\n\n");
+    printf("Outputs: strict ASM/index/summary, discovery audits and automatic review\n");
+    printf("listing. Review labels are candidates, not proven function boundaries.\n");
+    printf("Optional PASS90_ANALYSIS_SEEDS.tsv enables an additional seeded review run.\n");
+    printf("Examples:\n");
+    printf("  drivekit --makeasm normal.bin\n");
+    printf("  drivekit --makeasm normal.bin --review-editor\n");
+    printf("  drivekit --makeasm normal.bin --no-editor --out strict.asm\n");
+}
+static void dk_editor_help(void)
+{
+    printf("Usage: drivekit --editor <file.asm> [--firmware <firmware.bin>]\n\n");
+    printf("  <file.asm>         Existing ASM listing to open\n");
+    printf("  --firmware <file>  Firmware bytes for the HEX/ASM editor\n");
+    printf("  --help             Display this help\n\n");
+    printf("Example: drivekit --editor PASS90_LOCATIONS_REVIEW.asm --firmware normal.bin\n");
+}
+static int dk_makeasm_command(int argc,char **argv)
+{
+    const char *fw=NULL,*out="FUNCTIONS_LABELED.asm",*idx="FUNCTIONS_LABELED.index.tsv",*summary="FUNCTIONS_LABELED.summary.txt";
+    int no_editor=0,review_editor=0,i,rc;
+    for(i=2;i<argc;i++){
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){dk_makeasm_help();return 0;}
+        else if(!strcmp(argv[i],"--no-editor"))no_editor=1;
+        else if(!strcmp(argv[i],"--review-editor"))review_editor=1;
+        else if(!strcmp(argv[i],"--out")&&i+1<argc)out=argv[++i];
+        else if(argv[i][0]!='-'&&!fw)fw=argv[i];
+        else {dk_makeasm_help();return 2;}
+    }
+    if(!fw||(no_editor&&review_editor)){dk_makeasm_help();return 2;}
+    rc=dk_functions_export(fw,out,idx,summary);
+    if(rc||no_editor)return rc;
+    return dk_launch_editor(review_editor?"PASS90_LOCATIONS_REVIEW.asm":out,fw);
+}
+static int dk_editor_command(int argc,char **argv)
+{
+    const char *asm_path=NULL,*fw=NULL;int i;
+    for(i=2;i<argc;i++){
+        if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){dk_editor_help();return 0;}
+        else if(!strcmp(argv[i],"--firmware")&&i+1<argc)fw=argv[++i];
+        else if(argv[i][0]!='-'&&!asm_path)asm_path=argv[i];
+        else {dk_editor_help();return 2;}
+    }
+    if(!asm_path){dk_editor_help();return 2;}
+    return dk_launch_editor(asm_path,fw);
+}
+
 int main(int argc, char *argv[])
 {
     int    ret = 0;
@@ -6897,6 +6981,10 @@ int main(int argc, char *argv[])
     if (argc < 2) { print_help(); return 0; }
 
     cmd = argv[1];
+    if (!strcmp(cmd,"--makeasm")) return dk_makeasm_command(argc,argv);
+    if (!strcmp(cmd,"--editor")) return dk_editor_command(argc,argv);
+    if (!strcmp(cmd,"disasm")) return dk_disasm_command(argc,argv);
+
 
     /* Parse arguments */
     {

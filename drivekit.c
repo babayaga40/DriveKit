@@ -8790,27 +8790,30 @@ static int cmd_decodenormal(void)
      Absolute dump offset         : 0x34BFEC
    ========================================================= */
 
-/* B0KEY — stream the 0xB0 dump sequentially (like b0scankey) and extract the key.
-   Direct seeks to the key offset return 0xFF — the window must be read sequentially.
-   Always uses POST-CUTOFF (WRITE BUFFER offset 0xA5AAAA); key at dump offset 0x34BFEC. */
-#define B0KEY_B0_START            0x100000UL  /* 0xB0 stream base address              */
-#define B0KEY_CHUNK               0x8000      /* 32 KB chunks — matches b0scankey      */
-#define B0KEY_FILE_KEY_OFF        0x34BFECUL  /* POST-CUTOFF key offset in dump        */
-#define B0KEY_STREAM_STOP         (B0KEY_FILE_KEY_OFF + 4) /* stop once we have the key */
+/* B0KEY — stream the 0xB0 dump sequentially (like b0scankey), scan Normal body
+   for the key pattern using sk_find_key().  Direct seeks return 0xFF.
+   Always uses POST-CUTOFF: WRITE BUFFER 0x41 at 0xA5AAAA.
+   Normal body starts at dump offset 0x310000; we scan up to 0x50000 bytes of it. */
+#define B0KEY_B0_START     0x100000UL   /* 0xB0 stream base address            */
+#define B0KEY_CHUNK        0x8000       /* 32 KB chunks — matches b0scankey    */
+#define B0KEY_NORMAL_OFF   0x310000UL   /* Normal body start in dump           */
+#define B0KEY_SCAN_SIZE    0x050000UL   /* scan this many bytes of Normal body */
+#define B0KEY_STREAM_STOP  (B0KEY_NORMAL_OFF + B0KEY_SCAN_SIZE)
 
 static int cmd_b0key(void)
 {
     UCHAR sense[SENSE_SIZE];
-    DWORD i;
     int   st = 0;
 
-    printf("=== B0KEY — 0xB0 sequential stream, POST-CUTOFF ===\n\n");
+    printf("=== B0KEY — 0xB0 sequential stream + key scan, POST-CUTOFF ===\n\n");
     printf("  Enable offset  : 0xA5AAAA  (POST-CUTOFF)\n");
-    printf("  Key offset     : 0x%08lX in dump  (dump base 0x%06lX)\n\n",
-           (unsigned long)B0KEY_FILE_KEY_OFF,
+    printf("  Normal body at : 0x%06lX in dump  (dump base 0x%06lX)\n",
+           (unsigned long)B0KEY_NORMAL_OFF,
            (unsigned long)B0KEY_B0_START);
+    printf("  Scan size      : 0x%06lX bytes of Normal body\n\n",
+           (unsigned long)B0KEY_SCAN_SIZE);
 
-    /* Step 1: GET EVENT STATUS x4 to open the 0xB0 window */
+    /* Step 1: GET EVENT STATUS x4 */
     {
         UCHAR masks[] = {0x5A, 0x58, 0x50, 0x40};
         int m;
@@ -8821,7 +8824,7 @@ static int cmd_b0key(void)
         }
     }
 
-    /* Step 2: WRITE BUFFER 0x41 at 0xA5AAAA (POST-CUTOFF) */
+    /* Step 2: WRITE BUFFER 0x41 at 0xA5AAAA */
     {
         UCHAR payload[1] = {0};
         UCHAR wbcdb[12] = {0x3B,0x02,0x41, 0xA5,0xAA,0xAA, 0,0,0,0,0,0};
@@ -8830,13 +8833,12 @@ static int cmd_b0key(void)
         if (wbst != 0) {
             fprintf(stderr, "  WRITE BUFFER 0x41 at 0xA5AAAA FAILED (sense %02X/%02X/%02X)\n",
                     wbsense[2]&0x0F, wbsense[12], wbsense[13]);
-            fprintf(stderr, "  Cannot open 0xB0 window.\n");
             return 1;
         }
         printf("  WRITE BUFFER 0x41 @ 0xA5AAAA: OK\n");
     }
 
-    /* Step 3: READ BUFFER 0xF4 (required before 0xB0 becomes accessible) */
+    /* Step 3: READ BUFFER 0xF4 */
     {
         UCHAR f4buf[0xA4] = {0};
         UCHAR f4cdb[10] = {0x3C,0x02,0xF4, 0x83,0x94,0xB4, 0,0,0xA4,0};
@@ -8845,21 +8847,20 @@ static int cmd_b0key(void)
         printf("  READ BUFFER 0xF4: %s\n", f4st == 0 ? "OK" : "failed (continuing anyway)");
     }
 
-    /* Step 4: Stream READ BUFFER 0xB0 sequentially from B0_START until we have the key.
-       The 0xB0 window CANNOT be seeked — each chunk address must advance by CHUNK. */
-    printf("  Streaming 0xB0 to offset 0x%08lX...\n", (unsigned long)B0KEY_FILE_KEY_OFF);
+    /* Step 4: Stream 0xB0 from B0_START sequentially until we have Normal+scan window.
+       Buffer only the Normal body (skip the first NORMAL_OFF bytes). */
+    printf("  Streaming 0xB0 (need 0x%06lX bytes total)...\n",
+           (unsigned long)B0KEY_STREAM_STOP);
 
-    /* Allocate enough to hold from B0_START up to and including the key */
-    DWORD buf_need = B0KEY_FILE_KEY_OFF + 4;  /* bytes needed from start of dump */
-    UCHAR *dumpbuf = (UCHAR *)malloc(buf_need);
-    if (!dumpbuf) { fprintf(stderr, "  Out of memory\n"); return 1; }
-    memset(dumpbuf, 0xFF, buf_need);
+    UCHAR *normalbuf = (UCHAR *)malloc(B0KEY_SCAN_SIZE);
+    if (!normalbuf) { fprintf(stderr, "  Out of memory\n"); return 1; }
+    memset(normalbuf, 0, B0KEY_SCAN_SIZE);
 
-    DWORD b0offset = B0KEY_B0_START;
-    DWORD written  = 0;
-    int   ok       = 0;
+    DWORD b0offset  = B0KEY_B0_START;
+    DWORD streamed  = 0;          /* bytes streamed from dump start (= b0offset - B0_START) */
+    DWORD norm_got  = 0;          /* bytes written into normalbuf */
 
-    while (written < buf_need) {
+    while (streamed < B0KEY_STREAM_STOP) {
         UCHAR chunk[B0KEY_CHUNK] = {0};
         UCHAR csense[SENSE_SIZE] = {0};
         int   cst = 0;
@@ -8870,43 +8871,80 @@ static int cmd_b0key(void)
         if (cst != 0) {
             fprintf(stderr, "\n  READ BUFFER 0xB0 at 0x%06lX FAILED (sense %02X/%02X/%02X)\n",
                     (unsigned long)b0offset, csense[2]&0x0F, csense[12], csense[13]);
-            free(dumpbuf);
+            free(normalbuf);
             return 1;
         }
-        DWORD copy = B0KEY_CHUNK;
-        if (written + copy > buf_need) copy = buf_need - written;
-        memcpy(dumpbuf + written, chunk, copy);
-        written  += B0KEY_CHUNK;  /* advance by full chunk even if we copied less */
-        b0offset += B0KEY_CHUNK;
-        printf("\r  Streamed 0x%06lX / 0x%06lX bytes...", (unsigned long)written, (unsigned long)buf_need);
+
+        /* Copy only the portion of this chunk that falls within the Normal scan window */
+        DWORD chunk_start = streamed;           /* dump offset of chunk[0] */
+        DWORD chunk_end   = streamed + B0KEY_CHUNK;
+        if (chunk_end > chunk_start) {          /* always true */
+            DWORD copy_src_off = 0;
+            DWORD copy_dst_off = 0;
+            DWORD copy_len     = 0;
+
+            if (chunk_end > B0KEY_NORMAL_OFF && chunk_start < B0KEY_STREAM_STOP) {
+                DWORD src_start = (chunk_start < B0KEY_NORMAL_OFF)
+                                ? (B0KEY_NORMAL_OFF - chunk_start) : 0;
+                DWORD dst_start = (chunk_start > B0KEY_NORMAL_OFF)
+                                ? (chunk_start - B0KEY_NORMAL_OFF) : 0;
+                DWORD avail = B0KEY_CHUNK - src_start;
+                DWORD room  = B0KEY_SCAN_SIZE - dst_start;
+                copy_src_off = src_start;
+                copy_dst_off = dst_start;
+                copy_len = (avail < room) ? avail : room;
+                if (copy_len > 0) {
+                    memcpy(normalbuf + copy_dst_off, chunk + copy_src_off, copy_len);
+                    norm_got = dst_start + copy_len;
+                }
+            }
+        }
+
+        streamed  += B0KEY_CHUNK;
+        b0offset  += B0KEY_CHUNK;
+        printf("\r  Streamed 0x%06lX / 0x%06lX bytes...",
+               (unsigned long)streamed, (unsigned long)B0KEY_STREAM_STOP);
         fflush(stdout);
-        if (written >= buf_need) { ok = 1; break; }
     }
     printf("\n");
 
-    if (!ok) {
-        fprintf(stderr, "  Stream ended before key offset — 0xB0 window closed early?\n");
-        free(dumpbuf);
+    if (norm_got < 0x10) {
+        fprintf(stderr, "  Normal body not reached in stream.\n");
+        free(normalbuf);
         return 1;
     }
 
-    /* Step 5: Extract the 4-byte key at the known offset */
-    UCHAR *kp = dumpbuf + B0KEY_FILE_KEY_OFF;
-    DWORD le = (DWORD)kp[0]
-             | ((DWORD)kp[1] <<  8)
-             | ((DWORD)kp[2] << 16)
-             | ((DWORD)kp[3] << 24);
+    /* Step 5: Check Normal header */
+    printf("\n  Normal[0..15]: ");
+    { int hi; for(hi=0;hi<16&&hi<(int)norm_got;hi++) printf("%02X ",normalbuf[hi]); }
+    printf("  (%s)\n\n",
+           (norm_got >= 8 && memcmp(normalbuf,"PIONEER ",8)==0) ? "PIONEER OK" : "not PIONEER — wrong offset?");
 
-    printf("\n  Bytes at key offset 0x%08lX:\n  ", (unsigned long)B0KEY_FILE_KEY_OFF);
-    for (i = 0; i < 16; i++) printf("%02X ", dumpbuf[B0KEY_FILE_KEY_OFF - 8 + i]);
-    printf("\n                          ^^ ^^ ^^ ^^  (key)\n\n");
+    /* Step 6: Scan for key pattern using sk_find_key (same as b0scankey) */
+    SK_MATCH m = {0};
+    size_t count = 0;
+    int result = sk_find_key(normalbuf, (size_t)norm_got, &m, &count);
+    free(normalbuf);
 
-    printf("  Wire order : %02X %02X %02X %02X\n", kp[0], kp[1], kp[2], kp[3]);
-    printf("  LE DWORD   : 0x%08lX\n\n", (unsigned long)le);
+    if (result == 0) {
+        fprintf(stderr, "  No keyed handler found in Normal body (0x%06lX bytes scanned).\n",
+                (unsigned long)norm_got);
+        return 1;
+    }
+    if (result < 0) {
+        fprintf(stderr, "  Ambiguous: %zu keyed handlers found — cannot determine key.\n", count);
+        return 1;
+    }
 
-    free(dumpbuf);
+    DWORD le = (DWORD)m.key[0] | ((DWORD)m.key[1]<<8)
+             | ((DWORD)m.key[2]<<16) | ((DWORD)m.key[3]<<24);
 
-    /* Cross-check against key table if drive is identified */
+    printf("  Key offset in Normal   : 0x%zX\n", m.key_offset);
+    printf("  Reject branch variant  : %u-byte\n", m.reject_length);
+    printf("  Wire order             : %02X %02X %02X %02X\n",
+           m.key[0], m.key[1], m.key[2], m.key[3]);
+    printf("  LE DWORD               : 0x%08lX\n\n", (unsigned long)le);
+
     DWORD known = pioneer_key_lookup(g_driveID, NULL);
     if (known && known == le)
         printf("  Cross-check: matches key-table entry 0x%08lX  OK\n", (unsigned long)known);

@@ -2986,6 +2986,8 @@ static void aes128_encrypt_block(const uint32_t *rk, const uint8_t *in, uint8_t 
     }
     for(c=0;c<16;c++) out[c]=s[c];
 }
+/* forward declaration — defined below after aes_inv_sbox */
+static void aes128_decrypt_block(const uint32_t *rk, const uint8_t *in, uint8_t *out);
 
 /* AACS unit key derivation from Unit_Key_RO.inf.
    AACS spec layout:

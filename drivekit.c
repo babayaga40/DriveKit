@@ -2756,6 +2756,8 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
     uint8_t sec[2048];
     uint32_t vds_lba, part_start = 0;
     uint32_t root_icb_lba = 0;
+    uint32_t meta_file_lba = 0;    /* Metadata File ICB LBA (Type 2 partition map) */
+    uint32_t meta_mirror_lba = 0;  /* Metadata Mirror File ICB LBA */
     int i;
 
     /* Wake the drive / keep it spinning */
@@ -2841,7 +2843,50 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                         vd[off],vd[off+1],vd[off+2],vd[off+3],
                         vd[off+4],vd[off+5],vd[off+6],vd[off+7]); fflush(stdout);
             }
-            /* Dump sector in hex to find FSD pointer — skip for now, use partition scan */
+            /* Parse partition maps from LVD to detect metadata partition (UDF 2.5+).
+               Partition Map Table starts at LVD offset 440 (after fixed 440-byte header).
+               Map Table Length is at LVD[432..435], Num Partition Maps at [436..439].
+               Type 1 Partition Map: [01 06 vol_seq(2) part_num(2)] — 6 bytes
+               Type 2 Partition Map: [02 40 reserved(2) vol_seq(2) part_num(2) partIdent(32) ...]
+                 For UDF Metadata Partition (OSTA spec §2.2.10):
+                   partIdent = "*UDF Metadata Partition"
+                   Metadata File Location   at map+36 (4 bytes LE) — partition-relative LBA
+                   Metadata Mirror Location at map+40 (4 bytes LE)
+                   Metadata Bitmap Location at map+44 (4 bytes LE)
+                   Allocation Unit Size     at map+48 (4 bytes LE)
+                   Alignment Unit Size      at map+52 (2 bytes LE) */
+            {
+                uint32_t map_table_len = le32(vd + 432);
+                uint32_t num_maps      = le32(vd + 436);
+                uint32_t map_off = 440;
+                uint32_t mi;
+                printf("    [UDF]   LVD: map_table_len=%u num_maps=%u\n", map_table_len, num_maps);
+                for (mi = 0; mi < num_maps && map_off + 2 <= 440 + map_table_len && map_off + 2 <= 2048; mi++) {
+                    uint8_t mtype = vd[map_off];
+                    uint8_t mlen  = vd[map_off + 1];
+                    if (mlen < 6 || map_off + mlen > 2048) break;
+                    printf("    [UDF]   PartMap[%u]: type=%u len=%u\n", mi, mtype, mlen);
+                    if (mtype == 2 && mlen >= 56) {
+                        /* Type 2: check for Metadata Partition identifier */
+                        /* partIdent is a 32-byte Entity Identifier at map+4:
+                           [4..11]  = flags(1) + identifier(23 chars) */
+                        char pid[24] = {0};
+                        memcpy(pid, vd + map_off + 5, 23);
+                        printf("    [UDF]   Type2 partIdent: '%s'\n", pid);
+                        if (memcmp(pid, "*UDF Metadata Partition", 23) == 0 ||
+                            strstr(pid, "Metadata") != NULL) {
+                            /* Metadata File Location is at map+36 relative to main partition */
+                            uint32_t mfl = le32(vd + map_off + 36);
+                            uint32_t mml = le32(vd + map_off + 40);
+                            meta_file_lba   = part_start + mfl;
+                            meta_mirror_lba = part_start + mml;
+                            printf("    [UDF]   Metadata File LBA: %u (rel %u)\n", meta_file_lba, mfl);
+                            printf("    [UDF]   Metadata Mirror LBA: %u (rel %u)\n", meta_mirror_lba, mml);
+                        }
+                    }
+                    map_off += mlen;
+                }
+            }
             root_icb_lba = 0; /* will use fallback scan */
         }
     }
@@ -2892,18 +2937,77 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                 uint16_t root_pr      = (uint16_t)(fsd[408] | (fsd[409]<<8));
                 printf("    [UDF]   FSD root ICB: ext_len=%u lb=%u part_ref=%u abs=%u\n",
                        root_ext_len, root_lb, root_pr, part_start + root_lb); fflush(stdout);
-                /* For UDF with virtual partition (part_ref=1), the root ICB lb_num
-                   is a virtual block number mapped through the VAT. For pressed BD-ROM
-                   we can try: scan from the FSD sector forward for a File Entry (tag 260/261).
-                   Also try part_start + lb as a direct fallback. */
-                uint32_t candidate = part_start + root_lb;
+                /* For UDF with metadata partition (part_ref != 0):
+                   The root ICB lb_num is a VIRTUAL block number in the metadata partition.
+                   The metadata partition maps virtual blocks via the Metadata File's allocation
+                   descriptors: each AD entry [len, loc] covers a contiguous range of virtual
+                   blocks, where loc is a physical LBA in the main partition.
+                   For root_lb=N: find which AD covers block N, compute physical LBA. */
+                uint32_t candidate = 0;
+                if (root_pr == 0) {
+                    /* Physical partition: direct mapping */
+                    candidate = part_start + root_lb;
+                } else if (meta_file_lba) {
+                    /* Metadata partition: resolve root_lb through Metadata File ADs */
+                    uint8_t mfe[2048];
+                    printf("    [UDF]   Reading Metadata FE @ LBA %u...\n", meta_file_lba); fflush(stdout);
+                    if (read10(meta_file_lba, 1, mfe, NULL) == 0) {
+                        uint16_t mfe_tag = le16(mfe);
+                        printf("    [UDF]   Metadata FE tag=%u\n", mfe_tag); fflush(stdout);
+                        if (mfe_tag == 260 || mfe_tag == 261) {
+                            uint32_t mfe_eal, mfe_ad_off;
+                            uint8_t  mfe_ad_type = (mfe[18] >> 3) & 7;
+                            if (mfe_tag == 260) { mfe_eal = le32(mfe+168); mfe_ad_off = 176+mfe_eal; }
+                            else                { mfe_eal = le32(mfe+176); mfe_ad_off = 184+mfe_eal; }
+                            /* Walk Short ADs: each covers alloc_unit_size virtual blocks */
+                            uint32_t alloc_unit = 32; /* typical BD-ROM metadata alloc unit */
+                            uint32_t vblock = 0;
+                            uint32_t ad_i2;
+                            for (ad_i2 = mfe_ad_off; ad_i2 + 8 <= 2048; ad_i2 += (mfe_ad_type==1?8:16)) {
+                                uint32_t ad_len, ad_loc;
+                                if (mfe_ad_type == 1) { /* Short AD */
+                                    ad_len = le32(mfe + ad_i2) & 0x3FFFFFFF;
+                                    ad_loc = le32(mfe + ad_i2 + 4);
+                                } else if (mfe_ad_type == 3) { /* Long AD */
+                                    ad_len = le32(mfe + ad_i2) & 0x3FFFFFFF;
+                                    ad_loc = le32(mfe + ad_i2 + 4);
+                                } else break;
+                                if (ad_len == 0) break;
+                                uint32_t blocks_in_extent = (ad_len + 2047) / 2048;
+                                if (root_lb >= vblock && root_lb < vblock + blocks_in_extent) {
+                                    candidate = part_start + ad_loc + (root_lb - vblock);
+                                    printf("    [UDF]   root_lb=%u → vblock_base=%u ad_loc=%u → phys LBA %u\n",
+                                           root_lb, vblock, ad_loc, candidate); fflush(stdout);
+                                    break;
+                                }
+                                vblock += blocks_in_extent;
+                                if (ad_i2 + (mfe_ad_type==1?8:16) > 2048) break;
+                            }
+                        }
+                    }
+                    if (!candidate && meta_mirror_lba) {
+                        /* Try mirror */
+                        printf("    [UDF]   Metadata FE failed, trying mirror @ LBA %u\n", meta_mirror_lba); fflush(stdout);
+                        uint8_t mmfe[2048];
+                        if (read10(meta_mirror_lba, 1, mmfe, NULL) == 0) {
+                            uint16_t mmfe_tag = le16(mmfe);
+                            if (mmfe_tag == 260 || mmfe_tag == 261) {
+                                /* Same logic — simplified: just try part_start + root_lb as fallback */
+                                candidate = part_start + root_lb;
+                                printf("    [UDF]   Mirror tag=%u, fallback candidate=%u\n", mmfe_tag, candidate); fflush(stdout);
+                            }
+                        }
+                    }
+                }
+                if (!candidate) candidate = part_start + root_lb; /* last resort */
                 {
                     uint8_t tmp[2048];
                     uint16_t tt = 0;
                     if (read10(candidate, 1, tmp, NULL) == 0) tt = le16(tmp);
+                    printf("    [UDF]   candidate LBA %u: tag=%u\n", candidate, tt); fflush(stdout);
                     if (tt == 260 || tt == 261) {
                         root_icb_lba = candidate;
-                        printf("    [UDF]   Root FE found directly at LBA %u (tag %u)\n", candidate, tt); fflush(stdout);
+                        printf("    [UDF]   Root FE found at LBA %u (tag %u)\n", candidate, tt); fflush(stdout);
                     }
                 }
                 if (!root_icb_lba) {
@@ -3405,41 +3509,40 @@ static void aacs_decrypt_sector(uint8_t *s0, uint8_t *s1, uint8_t *s2, const uin
    1 if activation failed.
    ========================================================= */
 
-/* Send one freemkv SET command. Returns 0 on success.
-   The freemkv protocol sends the SET as a bidirectional command:
-   64 bytes out (zero payload), and the drive returns 64 bytes
-   (validate_set_reply: all zero = success).
-   Since Windows SPTI doesn't support true bidirectional, we do
-   it as DATA_IN (the drive sends us 64 bytes; our zero payload
-   is implicit, as the SET parameters are in the CDB itself). */
-static int fmkv_set(UCHAR param, UCHAR value, const char *name) {
-    UCHAR cdb[12] = {
-        0xF1,  /* vendor opcode */
-        0x01,  /* SET sub-code */
-        param, /* what: 0x01=Region, 0x02=Speed, 0x03=Unrestricted, 0x04=Encryption */
-        value, /* value: 0x00=off/free/max, 0x01=on */
-        0, 0, 0, 0, 0, 0,
-        0x40,  /* transfer length = 64 bytes */
-        0x00
+/* Read N bytes from Pioneer diagnostic memory via READ BUFFER mode=0x02.
+   selector: 0x92 = high CPU RAM (addr offset = addr - 0x2000)
+             0x93 = controller RAM (base 0xa00000)
+             0xB0 = CPU memory (normal, e.g. 0x410000)
+   addr: 24-bit address within the selector space.
+   Returns 0 on success. */
+static int diag_read(UCHAR selector, DWORD addr, UCHAR *buf, UCHAR len) {
+    UCHAR cdb[10] = {
+        0x3C, 0x02, selector,
+        (UCHAR)(addr >> 16), (UCHAR)(addr >> 8), (UCHAR)(addr),
+        0, 0, len, 0
     };
-    UCHAR reply[64] = {0};
     UCHAR sense[SENSE_SIZE] = {0};
     int st = 0;
+    send_scsi(g_hDrive, cdb, 10, buf, len, SCSI_IOCTL_DATA_IN, sense, &st);
+    return st;
+}
 
-    /* DATA_IN: drive returns 64-byte status block; validate_set_reply = all zero */
-    send_scsi(g_hDrive, cdb, 12, reply, 64, SCSI_IOCTL_DATA_IN, sense, &st);
-    if (st != 0) {
-        printf("[LD]   SET(%s=%02X): FAIL (SK=%02X ASC=%02X ASCQ=%02X)\n",
-               name, value, sense[2]&0x0F, sense[12], sense[13]);
-        return 1;
-    }
-
-    int valid = 1;
-    int k;
-    for (k = 0; k < 64; k++) if (reply[k]) { valid = 0; break; }
-    printf("[LD]   SET(%s=%02X): %s\n", name, value,
-           valid ? "OK (64 zero reply)" : "WARN (non-zero reply)");
-    return 0;
+/* Write N bytes to Pioneer diagnostic memory via WRITE BUFFER mode=0x02.
+   selector/addr as above. Returns 0 on success. */
+static int diag_write(UCHAR selector, DWORD addr, const UCHAR *data, UCHAR len) {
+    UCHAR cdb[10] = {
+        0x3B, 0x02, selector,
+        (UCHAR)(addr >> 16), (UCHAR)(addr >> 8), (UCHAR)(addr),
+        0, 0, len, 0
+    };
+    UCHAR sense[SENSE_SIZE] = {0};
+    int st = 0;
+    /* cast away const — SPTI buffer is void* */
+    send_scsi(g_hDrive, cdb, 10, (UCHAR*)data, len, SCSI_IOCTL_DATA_OUT, sense, &st);
+    if (st != 0)
+        printf("[LD]   diag_write sel=%02X addr=%06X: FAIL (SK=%02X ASC=%02X ASCQ=%02X)\n",
+               selector, (unsigned)addr, sense[2]&0x0F, sense[12], sense[13]);
+    return st;
 }
 
 static int libredrive_activate(void) {
@@ -3482,65 +3585,89 @@ static int libredrive_activate(void) {
         }
     }
 
-    /* ---- freemkv Renesas SET sequence ----
-       Sends the four freemkv SET commands that constitute BypassUhd/OemUhd:
-         SET(Region,       0x00)  — REGION_FREE
-         SET(Speed,        0x00)  — SPEED_MAX
-         SET(Unrestricted, 0x01)  — STATE_ON
-         SET(Encryption,   0x00)  — STATE_OFF  ← the actual unlock
-       Each is a 12-byte vendor CDB (opcode 0xF1) with 64-byte payload.
-       On success the drive suppresses AACS bus encryption. */
-    printf("[LD] Sending freemkv SET sequence (Renesas/Pioneer BypassUhd)...\n");
+    /* ---- freemkv SET sequence via READ BUFFER mode=0x02 (Renesas control) ----
+       The freemkv SET commands use READ BUFFER mode=0x02 with specific selector
+       and address bytes targeting firmware control registers.
+
+       From renesas.rs:
+         selector 0x92 = high CPU RAM at 0xffff_xxxx (addr = target - 0xffff_0000 >> 1? or direct offset)
+         VID status at 0x0d3c (from VID_STATUS_CDB addr bytes 0x00,0x0d,0x3c)
+         VID data   at 0x0d20 (from VID_CDB addr bytes 0x00,0x0d,0x20)
+
+       The activation flag is adjacent to the state byte. We read the state,
+       then check RB 0x77 — if the drive self-activates on probe, we're done. */
+
+    printf("[LD] Checking Renesas activation state...\n");
     fflush(stdout);
 
-    /* Optional sets — ignore failures */
-    fmkv_set(0x01, 0x00, "Region=FREE");
-    Sleep(100);
-    fmkv_set(0x02, 0x00, "Speed=MAX");
-    Sleep(100);
-    fmkv_set(0x03, 0x01, "Unrestricted=ON");
-    Sleep(100);
-
-    /* Required: Encryption=OFF */
-    if (fmkv_set(0x04, 0x00, "Encryption=OFF") != 0) {
-        printf("[LD] SET(Encryption=OFF) failed — drive may need firmware support.\n");
-        /* Don't give up yet; check RB 0x77 anyway */
+    /* ---- Read state byte at selector 0x92, addr 0x0d3c ---- */
+    UCHAR state_byte = 0;
+    {
+        UCHAR sv_buf[4] = {0};
+        int svst = diag_read(0x92, 0x0d3c, sv_buf, 4);
+        if (svst == 0) {
+            state_byte = sv_buf[0];
+            printf("[LD]   State @ 0x0d3c: %02X %02X %02X %02X\n",
+                   sv_buf[0],sv_buf[1],sv_buf[2],sv_buf[3]);
+            /* freemkv verify_state: loaded==0, checked==1, result==0 → active
+               bit0 = loaded, bit1 = checked, bit2 = result */
+            printf("[LD]   loaded=%u checked=%u result=%u\n",
+                   sv_buf[0]&1, (sv_buf[0]>>1)&1, (sv_buf[0]>>2)&1);
+        } else {
+            printf("[LD]   State read FAIL (sel=0x92 not accessible)\n");
+        }
     }
-    Sleep(300);
 
-    /* ---- Verify activation ---- */
+    /* ---- Verify via RB 0x77 ---- */
     memset(buf77, 0, 4);
-    if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
-        buf77[0]==0xAA && buf77[1]==0x0B &&
+    rb_data(0x77, 0, buf77, 4, s77);
+    printf("[LD]   RB 0x77 = %02X %02X %02X %02X\n",
+           buf77[0], buf77[1], buf77[2], buf77[3]);
+
+    if (buf77[0]==0xAA && buf77[1]==0x0B &&
         buf77[2]==0xE0 && buf77[3]==0xFF) {
-        printf("[LD] LibreDrive activated! (freemkv SET, AA 0B E0 FF)\n\n");
+        printf("[LD] LibreDrive activated! (AA 0B E0 FF)\n\n");
         return 0;
     }
 
-    printf("[LD] freemkv SET sent. RB 0x77 = %02X %02X %02X %02X\n",
-           buf77[0], buf77[1], buf77[2], buf77[3]);
-
-    /* ---- Secondary verify: Renesas RAM state ----
-       After activation: loaded==0, checked==1, result==0 at 0xffff_ed3c.
-       Status CDB: [0x3c,2,0x92,0,0x0d,0x3c,0,0,1,0] → byte[0] bit1 set */
+    /* ---- Try VID read (renesas.rs VID_CDB) as alternate active check ----
+       If the drive is active (encryption bypassed), reading VID directly
+       via the hardware register succeeds without AKE.
+       VID_STATUS_CDB: [3c 02 92 00 0d 3c 00 00 01 00] → bit1 = ready
+       VID_CDB:        [3c 02 92 00 0d 20 00 00 10 00] → 16 bytes of VID */
     {
-        UCHAR sv_cdb[10] = {0x3C, 0x02, 0x92, 0x00, 0x0D, 0x3C, 0, 0, 0x01, 0};
-        UCHAR sv_buf[1]  = {0};
-        UCHAR sv_sense[SENSE_SIZE] = {0};
-        int svst = 0;
-        send_scsi(g_hDrive, sv_cdb, 10, sv_buf, 1,
-                  SCSI_IOCTL_DATA_IN, sv_sense, &svst);
-        printf("[LD]   Renesas state byte: 0x%02X (bit1=checked, 0x02=active)\n",
-               sv_buf[0]);
-        if (svst == 0 && (sv_buf[0] & 0x02)) {
-            printf("[LD] Renesas confirms active (checked bit set).\n\n");
+        UCHAR vid_status[1] = {0};
+        UCHAR vid_data[16]  = {0};
+        int vss = diag_read(0x92, 0x0d3c, vid_status, 1);
+        int vds = diag_read(0x92, 0x0d20, vid_data, 16);
+        printf("[LD]   VID status: %s  VID[0..3]: %02X %02X %02X %02X\n",
+               vss==0 ? "OK" : "FAIL",
+               vid_data[0],vid_data[1],vid_data[2],vid_data[3]);
+        /* If VID is non-zero we may be active even without RB 0x77 */
+        int vid_nonzero = 0;
+        int vi;
+        for (vi = 0; vi < 16; vi++) if (vid_data[vi]) { vid_nonzero = 1; break; }
+        if (vid_nonzero) {
+            printf("[LD]   VID non-zero — drive may be active (bypass working).\n");
+            printf("[LD]   Full VID: ");
+            for (vi = 0; vi < 16; vi++) printf("%02X", vid_data[vi]);
+            printf("\n\n");
+            /* Treat as activated — RB 0x77 check may not apply to all fw versions */
             return 0;
         }
     }
 
-    printf("[LD] LibreDrive not confirmed active after SET sequence.\n");
-    printf("[LD] The SET sub-command encoding may differ from expected.\n");
-    printf("[LD] Try: install freemkv, run once to unlock, then retry.\n\n");
+    /* ---- State 0x03 without VID means diagnostic access is on but ----
+       the encryption bypass trampoline has not been installed.
+       The freemkv pioneer_optical crate patches the READ BUFFER callback
+       table in firmware RAM — without it we can read diagnostic regs but
+       not bypass AACS. */
+    if (state_byte & 0x02) {
+        printf("[LD] Renesas checked=1 but VID=0 and RB77≠AA0BE0FF.\n");
+        printf("[LD] Diagnostic memory accessible; encryption bypass NOT installed.\n");
+    }
+    printf("[LD] AACS bus still encrypted — raw sector reads will return garbage.\n");
+    printf("[LD] Install freemkv and run it once to install the firmware hook.\n\n");
     return 1;
 
 try_write_buffer:;

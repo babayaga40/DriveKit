@@ -178,6 +178,7 @@ static int   cmd_uhdinfo(void);
 static int   cmd_ripuhd(void);
 static int   cmd_diagdump(void);
 static int   cmd_rbprobe(void);
+static int   cmd_setprobe(void);
 
 /* =========================================================
    UTILITY: memmem for Windows
@@ -2836,7 +2837,7 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                Actually ECMA-167 Table 5 (charspec) = 64 bytes each.
                LV Identifier = regid (32 bytes) + LVI string (128 bytes) = starts at byte 84
                ... Let's just dump the bytes at several candidate offsets. */
-            printf("    [UDF]   LVD raw @ offsets 84,164,228,432:\n"); fflush(stdout);
+            printf("    [UDF]   LVD raw (non-zero offsets, key: MapTableLen@264 NumMaps@268 Maps@440):\n"); fflush(stdout);
             int off;
             for (off = 0; off <= 440; off += 4) {
                 if (le32(vd + off) != 0 || le32(vd+off+4) != 0)
@@ -2858,8 +2859,8 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                    Allocation Unit Size     at map+48 (4 bytes LE)
                    Alignment Unit Size      at map+52 (2 bytes LE) */
             {
-                uint32_t map_table_len = le32(vd + 432);
-                uint32_t num_maps      = le32(vd + 436);
+                uint32_t map_table_len = le32(vd + 264);
+                uint32_t num_maps      = le32(vd + 268);
                 uint32_t map_off = 440;
                 uint32_t mi;
                 printf("    [UDF]   LVD: map_table_len=%u num_maps=%u\n", map_table_len, num_maps);
@@ -3891,15 +3892,32 @@ static int cmd_uhdinfo(void) {
         } else printf("    GET CONFIGURATION failed.\n\n");
     }
 
-    /* MKB via READ DISC STRUCTURE 0x83 (lead-in, unencrypted, works without LibreDrive) */
-    printf("[3] Reading AACS MKB via READ DISC STRUCTURE 0x83 (lead-in, always accessible)...\n");
+    /* MKB via READ DISC STRUCTURE 0x83 or 0x0C (lead-in, unencrypted, works without LibreDrive) */
+    printf("[3] Reading AACS MKB via READ DISC STRUCTURE (lead-in, always accessible)...\n");
     {
-        /* First get MKB size with a 4-byte probe */
+        /* Try format 0x83 first (BD AACS MKB), fall back to 0x0C (BD MKB, some drives) */
         UCHAR mkb_hdr[4] = {0};
-        UCHAR mkb_cdb[12] = {0xAD,0x01, 0,0,0,0, 0,0x83, 0,4, 0,0};
         UCHAR mkb_sense[SENSE_SIZE] = {0}; int mkb_st = 0;
-        if (!send_scsi(g_hDrive, mkb_cdb, 12, mkb_hdr, 4,
-                       SCSI_IOCTL_DATA_IN, mkb_sense, &mkb_st) && !mkb_st) {
+        UCHAR mkb_fmt = 0x83;
+        UCHAR mkb_cdb[12] = {0xAD,0x01, 0,0,0,0, 0, mkb_fmt, 0,4, 0,0};
+        int mkb_ok = (!send_scsi(g_hDrive, mkb_cdb, 12, mkb_hdr, 4,
+                                 SCSI_IOCTL_DATA_IN, mkb_sense, &mkb_st) && !mkb_st);
+        if (!mkb_ok) {
+            /* Retry with format 0x0C (some drives expose MKB here) */
+            UCHAR mkb_sense2[SENSE_SIZE] = {0}; int mkb_st2 = 0;
+            UCHAR mkb_cdb2[12] = {0xAD,0x01, 0,0,0,0, 0, 0x0C, 0,4, 0,0};
+            memset(mkb_hdr, 0, 4);
+            if (!send_scsi(g_hDrive, mkb_cdb2, 12, mkb_hdr, 4,
+                           SCSI_IOCTL_DATA_IN, mkb_sense2, &mkb_st2) && !mkb_st2) {
+                mkb_ok = 1;
+                mkb_fmt = 0x0C;
+                printf("    (format 0x83 failed, succeeded with 0x0C)\n");
+            }
+        }
+        if (mkb_ok) {
+            printf("    Format 0x%02X\n", mkb_fmt);
+        }
+        if (mkb_ok) {
             /* Header: bytes[0..1] = data length (not including itself, big-endian) */
             uint32_t mkb_dlen = ((uint32_t)mkb_hdr[0]<<8)|mkb_hdr[1];
             uint32_t mkb_total = mkb_dlen + 2; /* add 2 for the length field itself */
@@ -3909,11 +3927,11 @@ static int cmd_uhdinfo(void) {
             uint8_t *mkb_buf = (uint8_t*)malloc(mkb_total + 4);
             if (mkb_buf) {
                 memset(mkb_buf, 0, mkb_total + 4);
-                UCHAR mkb_cdb2[12] = {0xAD,0x01, 0,0,0,0, 0,0x83,
+                UCHAR mkb_cdb_full[12] = {0xAD,0x01, 0,0,0,0, 0, mkb_fmt,
                     (UCHAR)((mkb_total+4)>>8),(UCHAR)(mkb_total+4), 0,0};
-                UCHAR mkb_sense2[SENSE_SIZE] = {0}; int mkb_st2 = 0;
-                if (!send_scsi(g_hDrive, mkb_cdb2, 12, mkb_buf, mkb_total+4,
-                               SCSI_IOCTL_DATA_IN, mkb_sense2, &mkb_st2) && !mkb_st2) {
+                UCHAR mkb_sense3[SENSE_SIZE] = {0}; int mkb_st3 = 0;
+                if (!send_scsi(g_hDrive, mkb_cdb_full, 12, mkb_buf, mkb_total+4,
+                               SCSI_IOCTL_DATA_IN, mkb_sense3, &mkb_st3) && !mkb_st3) {
                     /* MKB starts at byte 4 of the response (after 4-byte header) */
                     uint8_t *mkb = mkb_buf + 4;
                     uint32_t mkb_sz = (mkb_total > 4) ? mkb_total - 4 : 0;
@@ -3940,14 +3958,14 @@ static int cmd_uhdinfo(void) {
                     }
                 } else {
                     printf("    MKB full read FAILED (SK=%02X ASC=%02X)\n",
-                           mkb_sense2[2]&0x0F, mkb_sense2[12]);
+                           mkb_sense3[2]&0x0F, mkb_sense3[12]);
                 }
                 free(mkb_buf);
             }
         } else {
-            printf("    READ DISC STRUCTURE 0x83 FAILED (SK=%02X ASC=%02X)\n",
-                   mkb_sense[2]&0x0F, mkb_sense[12]);
-            printf("    (This is normal if no disc is inserted or disc is not AACS.)\n");
+            printf("    READ DISC STRUCTURE 0x83 and 0x0C both FAILED.\n");
+            printf("    SK=0x%02X ASC=0x%02X\n", mkb_sense[2]&0x0F, mkb_sense[12]);
+            printf("    (No disc, non-AACS disc, or drive doesn't expose MKB via RDS.)\n");
         }
         printf("\n");
     }
@@ -4429,6 +4447,123 @@ static int cmd_rbprobe(void) {
 
     printf("\nDone. Successful mode=0x02 reads with all-zero 64-byte response\n");
     printf("are candidates for the freemkv SET command interface.\n\n");
+    return 0;
+}
+
+/* =========================================================
+   setprobe — probe buffer_id 0xA5 (and optionally others)
+   with varying addr field bytes to find the SET CDB format.
+
+   Freemkv SET uses READ BUFFER (0x3C) mode=0x02 with a
+   specific buffer_id and Feature+State encoded in CDB bytes
+   3-5 (the addr field). This command sweeps addr values to
+   find which encoding produces a response different from the
+   default all-zero 64-byte reply.
+
+   Also tries WRITE BUFFER (0x3B) mode=0x02 on buffer_ids
+   that returned SK=00 ASC=00 on rbprobe (possible write-
+   direction SET commands: 0xE6, 0xE9, 0xEB, 0xEC).
+
+   Usage:
+     drivekit setprobe E
+   ========================================================= */
+static int cmd_setprobe(void) {
+    printf("=== SET COMMAND PROBE ===\n\n");
+    printf("  Probing READ BUFFER mode=0x02 buf_id=0xA5 with varying addr field.\n");
+    printf("  Goal: find Feature+State encoding for the freemkv SET interface.\n\n");
+
+    /* Renesas probe */
+    {
+        UCHAR probe_cdb[10] = {0x3C, 0x02, 0xF1, 0,0,0, 0,0, 0x30, 0};
+        UCHAR probe_buf[0x30]={0}; UCHAR probe_sense[SENSE_SIZE]={0}; int pst=0;
+        send_scsi(g_hDrive, probe_cdb, 10, probe_buf, 0x30, SCSI_IOCTL_DATA_IN, probe_sense, &pst);
+        if (pst || probe_buf[16]!='S' || probe_buf[17]!='A' || probe_buf[18]!='T') {
+            printf("  Renesas probe FAILED — not a Renesas/Pioneer drive.\n\n");
+            return 1;
+        }
+        printf("  Renesas probe OK\n\n");
+    }
+
+    /* Step 1: sweep addr bytes for buf_id=0xA5 */
+    /* Freemkv Feature enum: Identity=0, Region=1, Speed=2, Unrestricted=3, Encryption=4 */
+    /* State values: OFF=0, ON=1, plus special values up to 0x14 for region/speed */
+    /* Try addr as: [0, feature, state], [feature, state, 0], [0, 0, feature*16+state] etc */
+    printf("[1] Sweeping buf_id=0xA5 addr variations...\n");
+    printf("    CDB: 3C 02 A5 [a2] [a1] [a0] 00 00 40 00\n");
+    printf("    addr[2] | addr[1] | addr[0] | response[0..7] | notes\n");
+    printf("    --------+---------+---------+----------------+-------\n");
+    int a2, a1, a0;
+    /* Sweep feature (0-5) in a1 and state (0-5) in a0, with a2=0 */
+    for (a1 = 0; a1 <= 5; a1++) {
+        for (a0 = 0; a0 <= 5; a0++) {
+            UCHAR cdb[10] = {0x3C, 0x02, 0xA5, 0, (UCHAR)a1, (UCHAR)a0, 0, 0, 0x40, 0};
+            UCHAR buf[64]={0}; UCHAR sense[SENSE_SIZE]={0}; int st=0;
+            int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+            if (rc || st) {
+                printf("    0x%02X     | 0x%02X    | 0x%02X    | FAIL SK=%02X ASC=%02X\n",
+                       0, a1, a0, sense[2]&0x0F, sense[12]);
+            } else {
+                int allz=1, j; for(j=0;j<64;j++) if(buf[j]) allz=0;
+                printf("    0x%02X     | 0x%02X    | 0x%02X    | %02X%02X%02X%02X %02X%02X%02X%02X | %s\n",
+                       0, a1, a0,
+                       buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
+                       allz?"all-zero (unchanged)":"NON-ZERO — CHANGED!");
+            }
+        }
+    }
+    /* Also try a2=feature, a1=state, a0=0 */
+    printf("\n    Also trying a2=feature, a1=state, a0=0:\n");
+    for (a2 = 0; a2 <= 5; a2++) {
+        for (a1 = 0; a1 <= 5; a1++) {
+            UCHAR cdb[10] = {0x3C, 0x02, 0xA5, (UCHAR)a2, (UCHAR)a1, 0, 0, 0, 0x40, 0};
+            UCHAR buf[64]={0}; UCHAR sense[SENSE_SIZE]={0}; int st=0;
+            int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+            if (!rc && !st) {
+                int allz=1, j; for(j=0;j<64;j++) if(buf[j]) allz=0;
+                if (!allz) {
+                    printf("    a2=0x%02X a1=0x%02X: NON-ZERO %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                           a2,a1,buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]);
+                }
+            }
+        }
+    }
+
+    /* Step 2: try WRITE BUFFER (0x3B) mode=0x02 on buffer_ids that returned SK=00 ASC=00 */
+    /* These are candidates for write-direction SET commands */
+    printf("\n[2] Probing WRITE BUFFER (0x3B) mode=0x02 on SK=00 candidates...\n");
+    printf("    buf_ids: 0xE6, 0xE9, 0xEB, 0xEC\n");
+    {
+        static const UCHAR wb_ids[] = {0xE6, 0xE9, 0xEB, 0xEC};
+        int wi;
+        for (wi = 0; wi < 4; wi++) {
+            UCHAR bid = wb_ids[wi];
+            /* Write 64 zero bytes */
+            UCHAR wbuf[64]={0};
+            UCHAR wcdb[10] = {0x3B, 0x02, bid, 0,0,0, 0,0, 0x40, 0};
+            UCHAR wsense[SENSE_SIZE]={0}; int wst=0;
+            int wrc = send_scsi(g_hDrive, wcdb, 10, wbuf, 64, SCSI_IOCTL_DATA_OUT, wsense, &wst);
+            printf("    WB 0x%02X: %s (SK=%02X ASC=%02X)\n",
+                   bid,
+                   (!wrc && !wst)?"OK — ACCEPTED":"FAIL",
+                   wsense[2]&0x0F, wsense[12]);
+        }
+    }
+
+    /* Step 3: try RB 0x77 again after all probes — check if anything changed */
+    printf("\n[3] RB 0x77 check (is LibreDrive marker present after probes?)...\n");
+    {
+        UCHAR cdb77[10] = {0x3C, 0x02, 0x77, 0,0,0, 0,0, 0x40, 0};
+        UCHAR buf77[64]={0}; UCHAR s77[SENSE_SIZE]={0}; int st77=0;
+        int rc77 = send_scsi(g_hDrive, cdb77, 10, buf77, 64, SCSI_IOCTL_DATA_IN, s77, &st77);
+        if (!rc77 && !st77)
+            printf("    RB 0x77 = %02X %02X %02X %02X (%s)\n",
+                   buf77[0],buf77[1],buf77[2],buf77[3],
+                   (buf77[0]==0xAA&&buf77[1]==0x0B&&buf77[2]==0xE0&&buf77[3]==0xFF)?
+                   "LibreDrive ACTIVE!":"not activated");
+        else
+            printf("    RB 0x77: FAIL (SK=%02X ASC=%02X)\n", s77[2]&0x0F, s77[12]);
+    }
+    printf("\nDone.\n\n");
     return 0;
 }
 
@@ -9231,6 +9366,7 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "ripuhd")     == 0) ret = cmd_ripuhd();
     else if (strcmp(cmd, "diagdump")   == 0) ret = cmd_diagdump();
     else if (strcmp(cmd, "rbprobe")    == 0) ret = cmd_rbprobe();
+    else if (strcmp(cmd, "setprobe")   == 0) ret = cmd_setprobe();
     else if (strcmp(cmd, "probeb0")     == 0) ret = cmd_probeb0();
     else if (strcmp(cmd, "modelcheck")  == 0) ret = cmd_modelcheck();
     else if (strcmp(cmd, "keycheck")    == 0) ret = cmd_keycheck();

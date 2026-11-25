@@ -4468,9 +4468,9 @@ static int cmd_rbprobe(void) {
      drivekit setprobe E
    ========================================================= */
 static int cmd_setprobe(void) {
-    printf("=== SET COMMAND PROBE ===\n\n");
-    printf("  Probing READ BUFFER mode=0x02 buf_id=0xA5 with varying addr field.\n");
-    printf("  Goal: find Feature+State encoding for the freemkv SET interface.\n\n");
+    printf("=== SET COMMAND PROBE (PHASE 2) ===\n\n");
+    printf("  Phase 2: RB 0x77 changed state (SK=00 instead of ILLEGAL_FIELD).\n");
+    printf("  One of WB 0xE6/0xEB/0xEC toggled drive state. Investigating.\n\n");
 
     /* Renesas probe */
     {
@@ -4478,90 +4478,132 @@ static int cmd_setprobe(void) {
         UCHAR probe_buf[0x30]={0}; UCHAR probe_sense[SENSE_SIZE]={0}; int pst=0;
         send_scsi(g_hDrive, probe_cdb, 10, probe_buf, 0x30, SCSI_IOCTL_DATA_IN, probe_sense, &pst);
         if (pst || probe_buf[16]!='S' || probe_buf[17]!='A' || probe_buf[18]!='T') {
-            printf("  Renesas probe FAILED — not a Renesas/Pioneer drive.\n\n");
-            return 1;
+            printf("  Renesas probe FAILED.\n\n"); return 1;
         }
         printf("  Renesas probe OK\n\n");
     }
 
-    /* Step 1: sweep addr bytes for buf_id=0xA5 */
-    /* Freemkv Feature enum: Identity=0, Region=1, Speed=2, Unrestricted=3, Encryption=4 */
-    /* State values: OFF=0, ON=1, plus special values up to 0x14 for region/speed */
-    /* Try addr as: [0, feature, state], [feature, state, 0], [0, 0, feature*16+state] etc */
-    printf("[1] Sweeping buf_id=0xA5 addr variations...\n");
-    printf("    CDB: 3C 02 A5 [a2] [a1] [a0] 00 00 40 00\n");
-    printf("    addr[2] | addr[1] | addr[0] | response[0..7] | notes\n");
-    printf("    --------+---------+---------+----------------+-------\n");
-    int a2, a1, a0;
-    /* Sweep feature (0-5) in a1 and state (0-5) in a0, with a2=0 */
-    for (a1 = 0; a1 <= 5; a1++) {
-        for (a0 = 0; a0 <= 5; a0++) {
-            UCHAR cdb[10] = {0x3C, 0x02, 0xA5, 0, (UCHAR)a1, (UCHAR)a0, 0, 0, 0x40, 0};
-            UCHAR buf[64]={0}; UCHAR sense[SENSE_SIZE]={0}; int st=0;
-            int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
-            if (rc || st) {
-                printf("    0x%02X     | 0x%02X    | 0x%02X    | FAIL SK=%02X ASC=%02X\n",
-                       0, a1, a0, sense[2]&0x0F, sense[12]);
-            } else {
-                int allz=1, j; for(j=0;j<64;j++) if(buf[j]) allz=0;
-                printf("    0x%02X     | 0x%02X    | 0x%02X    | %02X%02X%02X%02X %02X%02X%02X%02X | %s\n",
-                       0, a1, a0,
-                       buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
-                       allz?"all-zero (unchanged)":"NON-ZERO — CHANGED!");
-            }
-        }
-    }
-    /* Also try a2=feature, a1=state, a0=0 */
-    printf("\n    Also trying a2=feature, a1=state, a0=0:\n");
-    for (a2 = 0; a2 <= 5; a2++) {
-        for (a1 = 0; a1 <= 5; a1++) {
-            UCHAR cdb[10] = {0x3C, 0x02, 0xA5, (UCHAR)a2, (UCHAR)a1, 0, 0, 0, 0x40, 0};
-            UCHAR buf[64]={0}; UCHAR sense[SENSE_SIZE]={0}; int st=0;
-            int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+    /* Step 1: read RB 0x77 with both mode=0x02 (descriptor) and mode=0x04 (data) */
+    printf("[1] RB 0x77 — read with mode=0x02 and mode=0x04...\n");
+    {
+        int mode;
+        for (mode = 2; mode <= 4; mode += 2) {
+            UCHAR cdb[10] = {0x3C, (UCHAR)mode, 0x77, 0,0,0, 0,0, 0x40, 0};
+            UCHAR buf[64]={0}; UCHAR s[SENSE_SIZE]={0}; int st=0;
+            int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, s, &st);
             if (!rc && !st) {
                 int allz=1, j; for(j=0;j<64;j++) if(buf[j]) allz=0;
+                printf("    mode=0x%02X: OK — %02X %02X %02X %02X | %02X %02X %02X %02X | %s\n",
+                       mode, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
+                       (buf[0]==0xAA&&buf[1]==0x0B&&buf[2]==0xE0&&buf[3]==0xFF)?"LibreDrive ACTIVE!":
+                       allz?"all-zero":"non-zero (see above)");
                 if (!allz) {
-                    printf("    a2=0x%02X a1=0x%02X: NON-ZERO %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                           a2,a1,buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]);
+                    int k;
+                    printf("    Full 64 bytes:\n    ");
+                    for(k=0;k<64;k++){printf("%02X ",buf[k]);if((k&15)==15)printf("\n    ");}
+                    printf("\n");
                 }
+            } else {
+                printf("    mode=0x%02X: FAIL SK=%02X ASC=%02X\n", mode, s[2]&0x0F, s[12]);
             }
         }
     }
 
-    /* Step 2: try WRITE BUFFER (0x3B) mode=0x02 on buffer_ids that returned SK=00 ASC=00 */
-    /* These are candidates for write-direction SET commands */
-    printf("\n[2] Probing WRITE BUFFER (0x3B) mode=0x02 on SK=00 candidates...\n");
-    printf("    buf_ids: 0xE6, 0xE9, 0xEB, 0xEC\n");
+    /* Step 2: read diag state register to see if loaded/checked/result changed */
+    printf("\n[2] Diag state @ 0x0d3c (loaded/checked/result flags)...\n");
     {
-        static const UCHAR wb_ids[] = {0xE6, 0xE9, 0xEB, 0xEC};
+        UCHAR sbuf[4]={0};
+        if (!diag_read(0x92, 0x0d3c, sbuf, 4))
+            printf("    State: %02X %02X %02X %02X  (loaded=%d checked=%d result=%d)\n",
+                   sbuf[0],sbuf[1],sbuf[2],sbuf[3],
+                   sbuf[0]&1,(sbuf[0]>>1)&1,(sbuf[0]>>2)&1);
+        else
+            printf("    Diag read FAILED.\n");
+    }
+
+    /* Step 3: re-run WB commands one at a time, reading RB 0x77 after each to find which one changes state */
+    printf("\n[3] Isolating which WB command changed RB 0x77 (send each, then read RB 0x77)...\n");
+    {
+        static const UCHAR wb_ids[] = {0xE6, 0xEB, 0xEC};
         int wi;
-        for (wi = 0; wi < 4; wi++) {
+        for (wi = 0; wi < 3; wi++) {
             UCHAR bid = wb_ids[wi];
-            /* Write 64 zero bytes */
+            /* Send WB */
             UCHAR wbuf[64]={0};
             UCHAR wcdb[10] = {0x3B, 0x02, bid, 0,0,0, 0,0, 0x40, 0};
             UCHAR wsense[SENSE_SIZE]={0}; int wst=0;
             int wrc = send_scsi(g_hDrive, wcdb, 10, wbuf, 64, SCSI_IOCTL_DATA_OUT, wsense, &wst);
-            printf("    WB 0x%02X: %s (SK=%02X ASC=%02X)\n",
-                   bid,
-                   (!wrc && !wst)?"OK — ACCEPTED":"FAIL",
-                   wsense[2]&0x0F, wsense[12]);
+            printf("    WB 0x%02X: %s (SK=%02X ASC=%02X) → ", bid,
+                   (!wrc&&!wst)?"OK":"FAIL", wsense[2]&0x0F, wsense[12]);
+            /* Immediately read RB 0x77 */
+            UCHAR cdb77[10]={0x3C,0x02,0x77,0,0,0,0,0,0x40,0};
+            UCHAR buf77[64]={0}; UCHAR s77[SENSE_SIZE]={0}; int st77=0;
+            int rc77=send_scsi(g_hDrive,cdb77,10,buf77,64,SCSI_IOCTL_DATA_IN,s77,&st77);
+            if(!rc77&&!st77)
+                printf("RB 0x77 = %02X %02X %02X %02X (%s)\n",
+                       buf77[0],buf77[1],buf77[2],buf77[3],
+                       (buf77[0]==0xAA&&buf77[1]==0x0B&&buf77[2]==0xE0&&buf77[3]==0xFF)?
+                       "ACTIVE!":"not active");
+            else
+                printf("RB 0x77 FAIL SK=%02X ASC=%02X\n",s77[2]&0x0F,s77[12]);
         }
     }
 
-    /* Step 3: try RB 0x77 again after all probes — check if anything changed */
-    printf("\n[3] RB 0x77 check (is LibreDrive marker present after probes?)...\n");
+    /* Step 4: try RB 0xA5 with addr=0,4,0 (Encryption=4, State=0=OFF) now that hook may be partial */
+    printf("\n[4] RB 0xA5 addr=0,04,00 (Encryption=4 State=OFF=0) — retry after WB state change...\n");
     {
-        UCHAR cdb77[10] = {0x3C, 0x02, 0x77, 0,0,0, 0,0, 0x40, 0};
+        UCHAR cdb[10]={0x3C,0x02,0xA5, 0,4,0, 0,0,0x40,0};
+        UCHAR buf[64]={0}; UCHAR s[SENSE_SIZE]={0}; int st=0;
+        int rc=send_scsi(g_hDrive,cdb,10,buf,64,SCSI_IOCTL_DATA_IN,s,&st);
+        if(!rc&&!st){
+            int allz=1,j;for(j=0;j<64;j++)if(buf[j])allz=0;
+            printf("    OK! Response: %02X%02X%02X%02X %02X%02X%02X%02X (%s)\n",
+                   buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
+                   allz?"all-zero (validate_set_reply would PASS)":"non-zero");
+        } else {
+            printf("    FAIL SK=%02X ASC=%02X\n",s[2]&0x0F,s[12]);
+        }
+    }
+
+    /* Step 5: also try broader addr sweep now — single byte values 0x00..0xFF in addr[0] only */
+    printf("\n[5] Wide addr[0] sweep of RB 0xA5 (addr[2]=0 addr[1]=0 addr[0]=0x00..0xFF)...\n");
+    printf("    Showing only OK results and SK!=03/51 failures:\n");
+    {
+        int a;
+        for (a = 0; a <= 0xFF; a++) {
+            UCHAR cdb[10]={0x3C,0x02,0xA5, 0,0,(UCHAR)a, 0,0,0x40,0};
+            UCHAR buf[64]={0}; UCHAR s[SENSE_SIZE]={0}; int st=0;
+            int rc=send_scsi(g_hDrive,cdb,10,buf,64,SCSI_IOCTL_DATA_IN,s,&st);
+            if(!rc&&!st){
+                int allz=1,j;for(j=0;j<64;j++)if(buf[j])allz=0;
+                printf("    a0=0x%02X: OK %02X%02X%02X%02X%s\n",a,
+                       buf[0],buf[1],buf[2],buf[3],allz?" (all-zero)":" NON-ZERO!");
+            } else if(!((s[2]&0x0F)==3&&s[12]==0x51)){
+                /* print unexpected failures */
+                printf("    a0=0x%02X: FAIL SK=%02X ASC=%02X (unexpected)\n",a,s[2]&0x0F,s[12]);
+            }
+        }
+    }
+
+    /* Step 6: final RB 0x77 and diag state */
+    printf("\n[6] Final state check...\n");
+    {
+        UCHAR cdb77[10]={0x3C,0x02,0x77,0,0,0,0,0,0x40,0};
         UCHAR buf77[64]={0}; UCHAR s77[SENSE_SIZE]={0}; int st77=0;
-        int rc77 = send_scsi(g_hDrive, cdb77, 10, buf77, 64, SCSI_IOCTL_DATA_IN, s77, &st77);
-        if (!rc77 && !st77)
+        int rc77=send_scsi(g_hDrive,cdb77,10,buf77,64,SCSI_IOCTL_DATA_IN,s77,&st77);
+        if(!rc77&&!st77)
             printf("    RB 0x77 = %02X %02X %02X %02X (%s)\n",
                    buf77[0],buf77[1],buf77[2],buf77[3],
                    (buf77[0]==0xAA&&buf77[1]==0x0B&&buf77[2]==0xE0&&buf77[3]==0xFF)?
-                   "LibreDrive ACTIVE!":"not activated");
+                   "LibreDrive ACTIVE!":"not active");
         else
-            printf("    RB 0x77: FAIL (SK=%02X ASC=%02X)\n", s77[2]&0x0F, s77[12]);
+            printf("    RB 0x77: FAIL SK=%02X ASC=%02X\n",s77[2]&0x0F,s77[12]);
+
+        UCHAR sbuf[4]={0};
+        if(!diag_read(0x92,0x0d3c,sbuf,4))
+            printf("    Diag state: %02X %02X %02X %02X  (loaded=%d checked=%d result=%d)\n",
+                   sbuf[0],sbuf[1],sbuf[2],sbuf[3],
+                   sbuf[0]&1,(sbuf[0]>>1)&1,(sbuf[0]>>2)&1);
     }
     printf("\nDone.\n\n");
     return 0;

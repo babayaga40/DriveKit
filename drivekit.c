@@ -2889,6 +2889,17 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                 uint16_t root_pr      = (uint16_t)(fsd[408] | (fsd[409]<<8));
                 printf("    [UDF]   FSD root ICB: ext_len=%u lb=%u part_ref=%u abs=%u\n",
                        root_ext_len, root_lb, root_pr, part_start + root_lb); fflush(stdout);
+                /* Scan nearby LBAs to find the actual FE */
+                printf("    [UDF]   Scanning near abs=%u for FE tag...\n", part_start+root_lb); fflush(stdout);
+                uint32_t scan_base = (root_lb > 4) ? part_start + root_lb - 4 : part_start;
+                uint32_t sj;
+                for (sj = 0; sj < 32; sj++) {
+                    uint8_t tmp[2048]; uint16_t tt;
+                    if (read10(scan_base + sj, 1, tmp, NULL)) continue;
+                    tt = le16(tmp);
+                    if (tt != 0)
+                        printf("    [UDF]     LBA %u: tag=%u\n", scan_base+sj, tt); fflush(stdout);
+                }
                 root_icb_lba = part_start + root_lb;
             } else {
                 printf("    [UDF] Tag %u != 256, not an FSD\n", ftag); fflush(stdout);

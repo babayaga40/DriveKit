@@ -176,6 +176,8 @@ static void  xf_build_trigger(UCHAR *payload, const char *model, DWORD key_le);
 static int   cmd_uhdcheck(void);
 static int   cmd_uhdinfo(void);
 static int   cmd_ripuhd(void);
+static int   cmd_diagdump(void);
+static int   cmd_rbprobe(void);
 
 /* =========================================================
    UTILITY: memmem for Windows
@@ -3648,26 +3650,34 @@ static int libredrive_activate(void) {
         int vi;
         for (vi = 0; vi < 16; vi++) if (vid_data[vi]) { vid_nonzero = 1; break; }
         if (vid_nonzero) {
-            printf("[LD]   VID non-zero — drive may be active (bypass working).\n");
             printf("[LD]   Full VID: ");
             for (vi = 0; vi < 16; vi++) printf("%02X", vid_data[vi]);
-            printf("\n\n");
-            /* Treat as activated — RB 0x77 check may not apply to all fw versions */
-            return 0;
+            printf("\n");
+            /* VID readable via diagnostic register but RB 0x77 ≠ AA0BE0FF.
+               This means the drive completed AACS internally and stored the VID
+               in its hardware register at 0xffff_ed20, BUT the firmware trampoline
+               that bypasses sector-level bus encryption is NOT installed.
+               READ(10) of AACS-protected sectors still returns zeros/garbage.
+               The VID alone does NOT imply LibreDrive is active. */
+            printf("[LD]   NOTE: VID readable via diag register (0xffff_ed20).\n");
+            printf("[LD]   RB 0x77 ≠ AA 0B E0 FF → firmware trampoline NOT active.\n");
+            printf("[LD]   Sector reads are still encrypted; LibreDrive NOT ready.\n\n");
         }
     }
 
-    /* ---- State 0x03 without VID means diagnostic access is on but ----
-       the encryption bypass trampoline has not been installed.
+    /* ---- Diagnostic access on, encryption bypass trampoline not installed ----
        The freemkv pioneer_optical crate patches the READ BUFFER callback
        table in firmware RAM — without it we can read diagnostic regs but
-       not bypass AACS. */
+       not bypass AACS sector encryption. */
+    printf("[LD] LibreDrive NOT active.\n");
+    printf("[LD] RB 0x77 = 00 00 00 00 (need AA 0B E0 FF).\n");
+    printf("[LD] The firmware hook is not installed; sector reads return garbage.\n");
     if (state_byte & 0x02) {
-        printf("[LD] Renesas checked=1 but VID=0 and RB77≠AA0BE0FF.\n");
-        printf("[LD] Diagnostic memory accessible; encryption bypass NOT installed.\n");
+        printf("[LD] Renesas diag accessible (state=0x%02X). Run 'diagdump' to\n", state_byte);
+        printf("[LD] inspect firmware RAM and 'rbprobe' to find SET CDB interface.\n");
     }
-    printf("[LD] AACS bus still encrypted — raw sector reads will return garbage.\n");
-    printf("[LD] Install freemkv and run it once to install the firmware hook.\n\n");
+    printf("[LD] To fully activate: install freemkv (pioneer_optical) and run it\n");
+    printf("[LD] once to patch the READ BUFFER callback table in drive firmware RAM.\n\n");
     return 1;
 
 try_write_buffer:;
@@ -3881,18 +3891,86 @@ static int cmd_uhdinfo(void) {
         } else printf("    GET CONFIGURATION failed.\n\n");
     }
 
+    /* MKB via READ DISC STRUCTURE 0x83 (lead-in, unencrypted, works without LibreDrive) */
+    printf("[3] Reading AACS MKB via READ DISC STRUCTURE 0x83 (lead-in, always accessible)...\n");
+    {
+        /* First get MKB size with a 4-byte probe */
+        UCHAR mkb_hdr[4] = {0};
+        UCHAR mkb_cdb[12] = {0xAD,0x01, 0,0,0,0, 0,0x83, 0,4, 0,0};
+        UCHAR mkb_sense[SENSE_SIZE] = {0}; int mkb_st = 0;
+        if (!send_scsi(g_hDrive, mkb_cdb, 12, mkb_hdr, 4,
+                       SCSI_IOCTL_DATA_IN, mkb_sense, &mkb_st) && !mkb_st) {
+            /* Header: bytes[0..1] = data length (not including itself, big-endian) */
+            uint32_t mkb_dlen = ((uint32_t)mkb_hdr[0]<<8)|mkb_hdr[1];
+            uint32_t mkb_total = mkb_dlen + 2; /* add 2 for the length field itself */
+            if (mkb_total < 4) mkb_total = 4;
+            if (mkb_total > 65536) mkb_total = 65536; /* safety cap */
+            printf("    MKB report length : %u bytes\n", mkb_total);
+            uint8_t *mkb_buf = (uint8_t*)malloc(mkb_total + 4);
+            if (mkb_buf) {
+                memset(mkb_buf, 0, mkb_total + 4);
+                UCHAR mkb_cdb2[12] = {0xAD,0x01, 0,0,0,0, 0,0x83,
+                    (UCHAR)((mkb_total+4)>>8),(UCHAR)(mkb_total+4), 0,0};
+                UCHAR mkb_sense2[SENSE_SIZE] = {0}; int mkb_st2 = 0;
+                if (!send_scsi(g_hDrive, mkb_cdb2, 12, mkb_buf, mkb_total+4,
+                               SCSI_IOCTL_DATA_IN, mkb_sense2, &mkb_st2) && !mkb_st2) {
+                    /* MKB starts at byte 4 of the response (after 4-byte header) */
+                    uint8_t *mkb = mkb_buf + 4;
+                    uint32_t mkb_sz = (mkb_total > 4) ? mkb_total - 4 : 0;
+                    printf("    MKB first 32 bytes: ");
+                    uint32_t pi;
+                    for (pi=0; pi<32 && pi<mkb_sz; pi++) printf("%02X ", mkb[pi]);
+                    printf("\n");
+                    /* MKB version: in MKB record 0 (Type=0x81 Content Certificate), or
+                       Type=0x01 (MKB Header) first record — look for 0x81 record type */
+                    if (mkb_sz >= 8 && mkb[0] == 0x01) {
+                        uint32_t rec_len = ((uint32_t)mkb[2]<<8)|mkb[3];
+                        if (rec_len >= 8 && mkb_sz >= rec_len + 8) {
+                            /* MKB version at offset 4 of MKB Header record (big-endian) */
+                            uint32_t mkb_ver = ((uint32_t)mkb[4]<<24)|((uint32_t)mkb[5]<<16)|
+                                               ((uint32_t)mkb[6]<<8)|mkb[7];
+                            printf("    MKB version       : %u (0x%08X)\n", mkb_ver, mkb_ver);
+                        }
+                    }
+                    if (mkb_sz > 0) {
+                        /* Save to file for offline analysis */
+                        FILE *mfp = fopen("mkb.bin","wb");
+                        if (mfp) { fwrite(mkb, 1, mkb_sz, mfp); fclose(mfp);
+                                   printf("    Saved to mkb.bin (%u bytes)\n", mkb_sz); }
+                    }
+                } else {
+                    printf("    MKB full read FAILED (SK=%02X ASC=%02X)\n",
+                           mkb_sense2[2]&0x0F, mkb_sense2[12]);
+                }
+                free(mkb_buf);
+            }
+        } else {
+            printf("    READ DISC STRUCTURE 0x83 FAILED (SK=%02X ASC=%02X)\n",
+                   mkb_sense[2]&0x0F, mkb_sense[12]);
+            printf("    (This is normal if no disc is inserted or disc is not AACS.)\n");
+        }
+        printf("\n");
+    }
+
     /* UDF walk to find AACS directory */
-    printf("[3] Locating AACS directory (UDF walk)...\n");
+    printf("[4] Locating AACS directory (UDF walk — requires LibreDrive active)...\n");
     if (udf_find_aacs_dir(&part_start, &aacs_lba)) {
         printf("    FAILED — could not locate AACS directory on disc.\n");
-        printf("    Disc may not be inserted, or UDF structure is non-standard.\n\n");
+        printf("    This usually means LibreDrive is not active (sectors encrypted).\n");
+        printf("    Run 'drivekit uhdcheck %c' to diagnose LibreDrive state.\n\n",
+               g_drivePath[4]);
+        printf("Summary (partial — LibreDrive not active):\n");
+        printf("  MKB was read above from lead-in (unencrypted).\n");
+        printf("  To get Unit_Key_RO.inf hash and do keyDB lookup, LibreDrive must\n");
+        printf("  be active so READ(10) of UDF sectors works without encryption.\n");
+        printf("  Install freemkv and run it once to patch drive firmware RAM.\n\n");
         return 1;
     }
     printf("    Partition start : sector 0x%08lX\n", part_start);
     printf("    AACS dir ICB    : sector 0x%08lX\n\n", aacs_lba);
 
     /* Read Unit_Key_RO.inf */
-    printf("[4] Reading AACS/Unit_Key_RO.inf...\n");
+    printf("[5] Reading AACS/Unit_Key_RO.inf...\n");
     inf_data = udf_read_file_from_dir(aacs_lba, "Unit_Key_RO.inf", part_start, &inf_size);
     if (!inf_data) {
         printf("    FAILED — could not read Unit_Key_RO.inf.\n");
@@ -3905,7 +3983,7 @@ static int cmd_uhdinfo(void) {
     printf("\n\n");
 
     /* Compute SHA-1 → disc hash */
-    printf("[5] Computing disc hash (SHA-1 of Unit_Key_RO.inf)...\n");
+    printf("[6] Computing disc hash (SHA-1 of Unit_Key_RO.inf)...\n");
     sha1_init(&sha);
     sha1_update(&sha, inf_data, inf_size);
     sha1_final(&sha, digest);
@@ -3919,7 +3997,7 @@ static int cmd_uhdinfo(void) {
                           (g_outFile[0]   ? g_outFile   : NULL);
         if (kdb) {
             uint8_t vuk[16] = {0};
-            printf("[6] keyDB lookup in: %s\n", kdb);
+            printf("[7] keyDB lookup in: %s\n", kdb);
             if (keydb_lookup(kdb, hash_hex, vuk)) {
                 printf("    Status    : FOUND\n");
                 printf("    VUK       : ");
@@ -3932,12 +4010,12 @@ static int cmd_uhdinfo(void) {
                 printf("    Add this disc to keyDB or use MakeMKV to extract VUK first.\n\n");
             }
         } else {
-            printf("[6] keyDB lookup: (skipped — no --keydb keydb.cfg provided)\n\n");
+            printf("[7] keyDB lookup: (skipped — no --keydb keydb.cfg provided)\n\n");
         }
     }
 
-    /* MKB info */
-    printf("[7] Reading AACS/MKB_RO.inf (MKB version check)...\n");
+    /* MKB info from UDF */
+    printf("[8] Reading AACS/MKB_RO.inf (MKB version check via UDF)...\n");
     {
         size_t mkb_size = 0;
         uint8_t *mkb = udf_read_file_from_dir(aacs_lba, "MKB_RO.inf",
@@ -4160,6 +4238,198 @@ static int cmd_ripuhd(void) {
     if (!decrypt)
         printf("  Note: Output is raw (encrypted). Re-run with --keydb keydb.cfg for decryption.\n\n");
     return errors > 100 ? 1 : 0;
+}
+
+/* =========================================================
+   CMD_DIAGDUMP
+   Dump Renesas diagnostic RAM at selector 0x92 (high CPU RAM,
+   mapped as 0xffff_e000 + addr_low16).
+
+   Reads a 256-byte window at a given 16-bit offset (default 0x0D00)
+   to inspect the AACS state structure near VID register:
+     0x0d20 = VID (16 bytes)
+     0x0d3c = state byte (bit0=loaded, bit1=checked, bit2=result)
+
+   Usage:
+     drivekit diagdump E            -- dump 0x0D00..0x0DFF
+     drivekit diagdump E --key N    -- dump starting at addr N (hex)
+   ========================================================= */
+static int cmd_diagdump(void) {
+    DWORD base_addr = 0x0D00;
+    if (g_key_override) base_addr = g_key_override & 0xFFFF;
+
+    printf("=== RENESAS DIAGNOSTIC RAM DUMP ===\n\n");
+    printf("  Selector: 0x92 (CPU high RAM: 0xffff_e000 + addr)\n");
+    printf("  Addr range: 0x%04X..0x%04X (physical 0xffff%04X..0xffff%04X)\n",
+           (unsigned)base_addr, (unsigned)(base_addr+0xFF),
+           (unsigned)(0xe000 + base_addr), (unsigned)(0xe000 + base_addr + 0xFF));
+    printf("  VID   register: 0xffff_ed20 (addr 0x0D20)\n");
+    printf("  State register: 0xffff_ed3c (addr 0x0D3C)\n\n");
+
+    /* First check the drive is accessible */
+    {
+        UCHAR probe_cdb[10] = {0x3C, 0x02, 0xF1, 0,0,0, 0,0, 0x30, 0};
+        UCHAR probe_buf[0x30] = {0}; UCHAR probe_sense[SENSE_SIZE] = {0}; int pst=0;
+        send_scsi(g_hDrive, probe_cdb, 10, probe_buf, 0x30, SCSI_IOCTL_DATA_IN, probe_sense, &pst);
+        if (pst || probe_buf[16]!='S' || probe_buf[17]!='A' || probe_buf[18]!='T') {
+            printf("  Renesas probe FAILED — not a Renesas/Pioneer drive or drive not ready.\n\n");
+            return 1;
+        }
+        printf("  Renesas probe OK (SAT marker confirmed at bytes[16..18])\n\n");
+    }
+
+    /* Dump in 16-byte rows, up to 256 bytes = 16 rows */
+    printf("  Addr   | 00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F | ASCII\n");
+    printf("  -------+-------------------------------------------------+-----------------\n");
+    DWORD row;
+    for (row = 0; row < 16; row++) {
+        DWORD addr = base_addr + row * 16;
+        UCHAR rbuf[16] = {0};
+        int rst = diag_read(0x92, addr, rbuf, 16);
+        if (rst != 0) {
+            printf("  %04X   | (read failed)\n", (unsigned)addr);
+            continue;
+        }
+        printf("  %04X   | ", (unsigned)addr);
+        int b;
+        for (b=0; b<8; b++)  printf("%02X ", rbuf[b]);
+        printf(" ");
+        for (b=8; b<16; b++) printf("%02X ", rbuf[b]);
+        printf("| ");
+        for (b=0; b<16; b++) printf("%c", (rbuf[b]>=0x20&&rbuf[b]<0x7F)?rbuf[b]:'.');
+        /* Annotate known registers */
+        if (addr == 0x0D20) printf(" ← VID[0..15]");
+        else if (addr == 0x0D30) printf(" ← VID[16..31]?");
+        else if (addr == 0x0D38) printf(" ← near state");
+        else if (addr == 0x0D3C) {
+            printf(" ← state=0x%02X (loaded=%u checked=%u result=%u)",
+                   rbuf[0], rbuf[0]&1, (rbuf[0]>>1)&1, (rbuf[0]>>2)&1);
+        }
+        printf("\n");
+    }
+    printf("\n");
+
+    /* Also do a targeted read of VID and state for confirmation */
+    printf("  Targeted register reads:\n");
+    {
+        UCHAR vid[16]={0}; UCHAR sta[4]={0};
+        if (!diag_read(0x92, 0x0D20, vid, 16)) {
+            printf("  VID (0x0D20): ");
+            int vi; for(vi=0;vi<16;vi++) printf("%02X",vid[vi]); printf("\n");
+        }
+        if (!diag_read(0x92, 0x0D3C, sta, 4)) {
+            printf("  State(0x0D3C): %02X %02X %02X %02X\n",
+                   sta[0],sta[1],sta[2],sta[3]);
+        }
+    }
+
+    /* Scan 32 bytes before VID to look for AACS key / bus key material */
+    printf("\n  Extended scan 0x0C80..0x0D3F (looking for key material near VID):\n");
+    printf("  Addr   | 00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F\n");
+    printf("  -------+-----------------------------------------------\n");
+    for (row = 0; row < 8; row++) {
+        DWORD addr = 0x0C80 + row * 16;
+        UCHAR rbuf[16]={0};
+        int rst = diag_read(0x92, addr, rbuf, 16);
+        if (rst != 0) {
+            printf("  %04X   | (read failed)\n", (unsigned)addr);
+            continue;
+        }
+        /* Check if it's all-zero or all-FF (likely not key material) */
+        int allz=1, allf=1, j;
+        for(j=0;j<16;j++){if(rbuf[j]!=0)allz=0; if(rbuf[j]!=0xFF)allf=0;}
+        printf("  %04X   | ", (unsigned)addr);
+        for (j=0; j<8; j++)  printf("%02X ", rbuf[j]);
+        printf(" ");
+        for (j=8; j<16; j++) printf("%02X ", rbuf[j]);
+        if (!allz && !allf) printf(" ← non-trivial");
+        printf("\n");
+    }
+    printf("\n");
+    printf("  Hint: If RB 0x77 ≠ AA0BE0FF, sector-level bypass is not active.\n");
+    printf("  Hint: To find AACS Km (bus key) look for 16 non-zero/non-FF bytes\n");
+    printf("        near the VID that change between disc insertions.\n\n");
+    return 0;
+}
+
+/* =========================================================
+   CMD_RBPROBE
+   Probe READ BUFFER mode=0x02 buffer IDs 0xE0..0xFF to find
+   the freemkv SET command interface (the CDB that arms the
+   firmware trampoline).
+
+   On a Renesas/Pioneer drive that has pioneer_optical support,
+   the SET command is a READ BUFFER (0x3C) with a specific
+   buffer_id and address field encoding Feature+State.
+   A successful SET returns 64 zero bytes; we look for that.
+
+   Usage:
+     drivekit rbprobe E
+   ========================================================= */
+static int cmd_rbprobe(void) {
+    printf("=== READ BUFFER 0x02 PROBE (buffer_id 0x00..0xFF) ===\n\n");
+    printf("  Probing READ BUFFER mode=0x02 (descriptor) with all buffer_ids.\n");
+    printf("  Looking for the SET command interface (returns 64 zero bytes).\n\n");
+
+    /* First check the drive is accessible */
+    {
+        UCHAR probe_cdb[10] = {0x3C, 0x02, 0xF1, 0,0,0, 0,0, 0x30, 0};
+        UCHAR probe_buf[0x30]={0}; UCHAR probe_sense[SENSE_SIZE]={0}; int pst=0;
+        send_scsi(g_hDrive, probe_cdb, 10, probe_buf, 0x30, SCSI_IOCTL_DATA_IN, probe_sense, &pst);
+        if (pst || probe_buf[16]!='S' || probe_buf[17]!='A' || probe_buf[18]!='T') {
+            printf("  Renesas probe FAILED — not a Renesas/Pioneer drive.\n\n");
+            return 1;
+        }
+        printf("  Renesas probe OK\n\n");
+    }
+
+    printf("  buf_id | status | bytes[0..7]                      | notes\n");
+    printf("  -------+--------+---------------------------------+------------------------\n");
+    int bid;
+    for (bid = 0; bid <= 0xFF; bid++) {
+        UCHAR cdb[10] = {0x3C, 0x02, (UCHAR)bid, 0,0,0, 0,0, 0x40, 0}; /* alloc=64 */
+        UCHAR buf[64]={0}; UCHAR sense[SENSE_SIZE]={0}; int st=0;
+        int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+        if (rc || st) {
+            /* Failed — only print for interesting range */
+            if (bid >= 0x70 && bid <= 0xFF) {
+                printf("  0x%02X   | FAIL   | SK=%02X ASC=%02X%s\n",
+                       bid, sense[2]&0x0F, sense[12],
+                       (sense[2]&0x0F)==5&&sense[12]==0x20?" (ILLEGAL_CMD)":
+                       (sense[2]&0x0F)==5&&sense[12]==0x24?" (ILLEGAL_FIELD)":"");
+            }
+            continue;
+        }
+        /* Succeeded — print all successful reads */
+        int allz=1, allf=1, j;
+        for(j=0;j<64;j++){if(buf[j]!=0)allz=0; if(buf[j]!=0xFF)allf=0;}
+        printf("  0x%02X   | OK     | %02X%02X%02X%02X %02X%02X%02X%02X | %s\n",
+               bid,
+               buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
+               allz?"ALL ZERO — may be SET interface":
+               allf?"ALL 0xFF":
+               (buf[0]==0xAA&&buf[1]==0x0B&&buf[2]==0xE0&&buf[3]==0xFF)?"LibreDrive marker!":
+               "non-zero data");
+    }
+    printf("\n");
+
+    /* Also try mode=0x03 (echo buffer descriptor) for the same range */
+    printf("  Also probing mode=0x03 (echo buffer) for 0xE0..0xFF:\n");
+    for (bid = 0xE0; bid <= 0xFF; bid++) {
+        UCHAR cdb[10] = {0x3C, 0x03, (UCHAR)bid, 0,0,0, 0,0, 0x40, 0};
+        UCHAR buf[64]={0}; UCHAR sense[SENSE_SIZE]={0}; int st=0;
+        int rc = send_scsi(g_hDrive, cdb, 10, buf, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+        if (!rc && !st) {
+            int allz=1, j;
+            for(j=0;j<64;j++){if(buf[j]!=0)allz=0;}
+            printf("  mode=03 0x%02X | OK | %02X%02X%02X%02X%s\n",
+                   bid, buf[0],buf[1],buf[2],buf[3], allz?" ALL ZERO":"");
+        }
+    }
+
+    printf("\nDone. Successful mode=0x02 reads with all-zero 64-byte response\n");
+    printf("are candidates for the freemkv SET command interface.\n\n");
+    return 0;
 }
 
 /* =========================================================
@@ -8959,6 +9229,8 @@ int main(int argc, char *argv[])
     else if (strcmp(cmd, "uhdcheck")   == 0) ret = cmd_uhdcheck();
     else if (strcmp(cmd, "uhdinfo")    == 0) ret = cmd_uhdinfo();
     else if (strcmp(cmd, "ripuhd")     == 0) ret = cmd_ripuhd();
+    else if (strcmp(cmd, "diagdump")   == 0) ret = cmd_diagdump();
+    else if (strcmp(cmd, "rbprobe")    == 0) ret = cmd_rbprobe();
     else if (strcmp(cmd, "probeb0")     == 0) ret = cmd_probeb0();
     else if (strcmp(cmd, "modelcheck")  == 0) ret = cmd_modelcheck();
     else if (strcmp(cmd, "keycheck")    == 0) ret = cmd_keycheck();

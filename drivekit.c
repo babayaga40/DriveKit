@@ -2854,8 +2854,9 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
             uint8_t fsd[2048];
             if (read10(part_start + i, 1, fsd, NULL)) { printf("    [UDF]   scan[%d]: read failed\n", i); fflush(stdout); break; }
             uint16_t ftag = le16(fsd);
-            if (ftag != 0)
+            if (ftag != 0) {
                 printf("    [UDF]   scan[%d] @ LBA %u: tag=%u\n", i, part_start+i, ftag); fflush(stdout);
+            }
             if (ftag == 256) { fsd_abs_lba = part_start + i; break; }
         }
     }
@@ -2870,10 +2871,24 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
             uint16_t ftag = le16(fsd);
             printf("    [UDF] FSD @ LBA %u: tag=%u (want 256)\n", fsd_abs_lba, ftag); fflush(stdout);
             if (ftag == 256) {
-                /* Root Directory ICB: long_ad at bytes 400..415
-                   lb_num at [400..403], part_ref at [404..405] */
-                uint32_t root_lb = le32(fsd + 400);
-                printf("    [UDF]   FSD root_icb rel=%u abs=%u\n", root_lb, part_start + root_lb); fflush(stdout);
+                /* Root Directory ICB: long_ad at bytes 400..415 (ECMA-167 §14.1)
+                   long_ad layout:
+                     [400..403] extent_length  (4 bytes LE)
+                     [404..407] extent_location.lb_num  (4 bytes LE) ← partition-relative LBA
+                     [408..409] extent_location.partition_reference_number (2 bytes LE)
+                   Also dump raw bytes for verification */
+                printf("    [UDF]   FSD bytes[396..415]: "
+                       "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                       fsd[396],fsd[397],fsd[398],fsd[399],
+                       fsd[400],fsd[401],fsd[402],fsd[403],
+                       fsd[404],fsd[405],fsd[406],fsd[407],
+                       fsd[408],fsd[409],fsd[410],fsd[411],
+                       fsd[412],fsd[413],fsd[414],fsd[415]); fflush(stdout);
+                uint32_t root_ext_len = le32(fsd + 400);
+                uint32_t root_lb      = le32(fsd + 404);
+                uint16_t root_pr      = (uint16_t)(fsd[408] | (fsd[409]<<8));
+                printf("    [UDF]   FSD root ICB: ext_len=%u lb=%u part_ref=%u abs=%u\n",
+                       root_ext_len, root_lb, root_pr, part_start + root_lb); fflush(stdout);
                 root_icb_lba = part_start + root_lb;
             } else {
                 printf("    [UDF] Tag %u != 256, not an FSD\n", ftag); fflush(stdout);

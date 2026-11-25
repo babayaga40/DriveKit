@@ -2800,25 +2800,60 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
             }
         }
         if (tid == 6) {
-            /* Logical Volume Descriptor */
-            printf("    [UDF]   LVD found\n"); fflush(stdout);
+            /* Logical Volume Descriptor (ECMA-167 §10.6)
+               Bytes 84..99: Logical Volume Contents Use (long_ad)
+                 [84..87]  extent_length  (4 bytes LE)
+                 [88..91]  extent_location.lb_num  (4 bytes LE) ← FSD LBA relative to partition
+                 [92..93]  extent_location.part_ref (2 bytes LE)
+               This points directly to the File Set Descriptor. */
+            uint32_t lvcu_len = le32(vd + 84);
+            uint32_t lvcu_lb  = le32(vd + 88);
+            uint16_t lvcu_pr  = (uint16_t)(vd[92] | (vd[93]<<8));
+            printf("    [UDF]   LVD: FSD long_ad len=%u lb=%u part_ref=%u\n",
+                   lvcu_len, lvcu_lb, lvcu_pr); fflush(stdout);
+            /* Store for FSD lookup; will be resolved against part_start after PD */
+            root_icb_lba = lvcu_lb; /* temporarily store relative LBA */
         }
     }
-    printf("    [UDF] part_start = %u\n", part_start); fflush(stdout);
+    printf("    [UDF] part_start = %u, FSD rel LBA = %u\n", part_start, root_icb_lba); fflush(stdout);
 
-    /* Find FSD (File Set Descriptor, tag 256) by scanning from partition start */
-    for (i = 0; i < 32; i++) {
-        uint8_t fsd[2048];
-        if (read10(part_start + i, 1, fsd, NULL)) { printf("    [UDF]   FSD scan[%d]: read failed\n", i); fflush(stdout); break; }
-        uint16_t ftag = le16(fsd);
-        printf("    [UDF]   FSD scan[%d] @ LBA %u: tag=%u\n", i, part_start+i, ftag); fflush(stdout);
-        if (ftag == 256) {
-            uint32_t icb_lb = le32(fsd + 400);
-            root_icb_lba = part_start + icb_lb;
-            printf("    [UDF]   FSD found! root_icb rel=%u abs=%u\n", icb_lb, root_icb_lba); fflush(stdout);
-            break;
+    /* Resolve FSD absolute LBA using the LVD long_ad + partition start */
+    uint32_t fsd_abs_lba = 0;
+    if (root_icb_lba != 0) {
+        fsd_abs_lba = part_start + root_icb_lba;
+        printf("    [UDF] FSD absolute LBA = %u (from LVD)\n", fsd_abs_lba); fflush(stdout);
+    } else {
+        /* Fallback: scan from partition start */
+        printf("    [UDF] LVD gave no FSD location, scanning from part_start...\n"); fflush(stdout);
+        for (i = 0; i < 32; i++) {
+            uint8_t fsd[2048];
+            if (read10(part_start + i, 1, fsd, NULL)) { printf("    [UDF]   FSD scan[%d]: read failed\n", i); fflush(stdout); break; }
+            uint16_t ftag = le16(fsd);
+            printf("    [UDF]   FSD scan[%d] @ LBA %u: tag=%u\n", i, part_start+i, ftag); fflush(stdout);
+            if (ftag == 256) { fsd_abs_lba = part_start + i; break; }
+            if (ftag == 8 || ftag == 9) break;
         }
-        if (ftag == 8 || ftag == 9) break; /* terminating/unused */
+    }
+    root_icb_lba = 0; /* reset — will set from FSD below */
+
+    /* Read the FSD and extract root directory ICB */
+    if (fsd_abs_lba) {
+        uint8_t fsd[2048];
+        if (read10(fsd_abs_lba, 1, fsd, NULL)) {
+            printf("    [UDF] FSD read failed @ LBA %u\n", fsd_abs_lba); fflush(stdout);
+        } else {
+            uint16_t ftag = le16(fsd);
+            printf("    [UDF] FSD @ LBA %u: tag=%u (want 256)\n", fsd_abs_lba, ftag); fflush(stdout);
+            if (ftag == 256) {
+                /* Root Directory ICB: long_ad at bytes 400..415
+                   lb_num at [400..403], part_ref at [404..405] */
+                uint32_t root_lb = le32(fsd + 400);
+                printf("    [UDF]   FSD root_icb rel=%u abs=%u\n", root_lb, part_start + root_lb); fflush(stdout);
+                root_icb_lba = part_start + root_lb;
+            } else {
+                printf("    [UDF] Tag %u != 256, not an FSD\n", ftag); fflush(stdout);
+            }
+        }
     }
     if (!root_icb_lba) { printf("    [UDF] No FSD found, root_icb_lba=0\n"); fflush(stdout); return 1; }
 
@@ -3206,35 +3241,37 @@ static int libredrive_activate(void) {
     printf("[LD] Activating LibreDrive (MODE SELECT volatile patch)...\n");
 
     /*
-     * MODE SELECT(10): opcode 0x55
-     *   byte 1: PF=1 (page format), SP=0 (don't save)
-     *   bytes 7-8: parameter length = 20 (8 header + 12 page)
+     * LibreDrive MODE SELECT(6): opcode 0x15
+     *   From MakeMKV USBPcap captures on Pioneer BDR-XD06/209/212:
+     *   MODE SELECT(6) PF=1, param length=16
+     *   Header: 4 bytes (mode data length=14, medium type=0, dev-specific=0, block desc len=0)
+     *   Mode page 0x05 (Write Parameters), length 0x0E, all zeros
      *
-     * Parameter data layout (20 bytes):
-     *   [0..7]  Mode Parameter Header (8 bytes, all zero)
-     *   [8]     Page code 0x03
-     *   [9]     Page length 0x0A (10 bytes of data follow)
-     *   [10..19] Page data: all zeros
+     *   Alternate: some drives use page 0x2A (CD Capabilities)
+     *   We try page 0x05 first (most common per freemkv-unlock source).
      */
-    UCHAR ms_cdb[10] = {
-        0x55,       /* MODE SELECT(10) */
-        0x10,       /* PF=1, SP=0 */
-        0,0,0,0,    /* reserved */
-        0,          /* reserved */
-        0x00, 0x14, /* parameter list length = 20 */
-        0           /* control */
+    UCHAR ms_cdb[6] = {
+        0x15,       /* MODE SELECT(6) */
+        0x10,       /* PF=1 (page format), SP=0 */
+        0x00,       /* reserved */
+        0x00,       /* reserved */
+        0x10,       /* parameter list length = 16 */
+        0x00        /* control */
     };
-    UCHAR ms_data[20] = {
-        /* 8-byte mode param header */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        /* Mode page 0x03, length 0x0A, 10 bytes data */
-        0x03, 0x0A,
-        0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00
+    UCHAR ms_data[16] = {
+        /* 4-byte mode parameter header */
+        0x0E,       /* mode data length (remaining bytes) */
+        0x00,       /* medium type */
+        0x00,       /* device-specific parameter */
+        0x00,       /* block descriptor length = 0 (no block descriptors) */
+        /* Mode page 0x05 (Write Parameters), length 0x0E, 14 bytes data = all zeros */
+        0x05, 0x0E,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
     UCHAR ms_sense[SENSE_SIZE] = {0};
 
-    if (send_scsi(g_hDrive, ms_cdb, 10, ms_data, 20,
+    if (send_scsi(g_hDrive, ms_cdb, 6, ms_data, 16,
                   SCSI_IOCTL_DATA_OUT, ms_sense, &st) == 0 && st == 0) {
         /* Verify */
         memset(buf77, 0, 4);

@@ -3376,16 +3376,19 @@ static int libredrive_activate(void) {
         int ust = 0;
         send_scsi(g_hDrive, ucdb, 12, payload, 0x100,
                   SCSI_IOCTL_DATA_OUT, usense, &ust);
-        if (ust == 0) {
-            /* Verify immediately */
-            memset(buf77, 0, 4);
-            if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
-                buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
-                printf("[LD] LibreDrive activated! mode=0x%02X buf=0x%02X (AA 0B E0 FF)\n\n",
-                       modes[i], bufids[i]);
-                activated = 1;
-                break;
-            }
+        printf("[LD]   WB mode=0x%02X bufid=0x%02X: %s",
+               modes[i], bufids[i], ust==0 ? "GOOD" : "FAIL");
+        if (ust != 0)
+            printf(" (SK=%02X ASC=%02X ASCQ=%02X)", usense[2]&0x0F, usense[12], usense[13]);
+        /* Verify after each attempt */
+        memset(buf77, 0, 4);
+        rb_data(0x77, 0, buf77, 4, s77);
+        printf("  RB77=%02X%02X%02X%02X\n", buf77[0],buf77[1],buf77[2],buf77[3]);
+        if (buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
+            printf("[LD] LibreDrive activated! mode=0x%02X buf=0x%02X (AA 0B E0 FF)\n\n",
+                   modes[i], bufids[i]);
+            activated = 1;
+            break;
         }
     }
 

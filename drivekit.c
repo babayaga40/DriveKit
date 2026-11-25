@@ -3284,24 +3284,29 @@ static void aacs_decrypt_sector(uint8_t *s0, uint8_t *s1, uint8_t *s2, const uin
 
 /* =========================================================
    LIBREDRIVE_ACTIVATE
-   Sends the MODE SELECT(10) volatile RAM patch that enables
-   raw UHD sector reads on supported Pioneer/ASUS/LG drives.
+   Applies the Pioneer LibreDrive volatile RAM patch via
+   WRITE BUFFER, enabling raw UHD sector reads.
 
-   The sequence (from MakeMKV USBPcap / freemkv-unlock source):
-     MODE SELECT(10)  opcode=0x55, PF=1
-     Parameter data: 8-byte header + mode page 0x03 (12 bytes)
-       Page 0x03, len 0x0A, data: 00 00 00 00 00 00 00 00 00 00
+   Pioneer LibreDrive uses the same WRITE BUFFER unlock
+   mechanism as the crossflash: 32-byte payload with model
+   string (bytes 0-15) and unlock key (bytes 16-19).
+   The drive firmware, upon seeing its own model+key via
+   WRITE BUFFER mode 0x04/buf 0xFF, sets an internal flag
+   that allows raw sector reads and returns AA 0B E0 FF to
+   READ BUFFER 0x77 (the LibreDrive handshake).
 
-   After this command, READ BUFFER 0x77 returns AA 0B E0 FF
-   and the drive serves raw UHD sectors via READ(10).
+   The key is drive-model specific. We read READ BUFFER 0xF1
+   to identify the drive platform and look up the key in the
+   same table used by cmd_unlock().
 
    Returns 0 if already active or successfully activated,
-   1 if activation failed and drive unlikely to serve raw data.
+   1 if activation failed.
    ========================================================= */
 static int libredrive_activate(void) {
     UCHAR buf77[4] = {0};
     UCHAR s77[SENSE_SIZE] = {0};
     int st = 0;
+    int i;
 
     /* Check if already active */
     if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
@@ -3310,59 +3315,87 @@ static int libredrive_activate(void) {
         return 0;
     }
 
-    printf("[LD] Activating LibreDrive (MODE SELECT volatile patch)...\n");
+    printf("[LD] Activating LibreDrive (WRITE BUFFER unlock)...\n");
 
-    /*
-     * LibreDrive MODE SELECT(6): opcode 0x15
-     *   From MakeMKV USBPcap captures on Pioneer BDR-XD06/209/212:
-     *   MODE SELECT(6) PF=1, param length=16
-     *   Header: 4 bytes (mode data length=14, medium type=0, dev-specific=0, block desc len=0)
-     *   Mode page 0x05 (Write Parameters), length 0x0E, all zeros
-     *
-     *   Alternate: some drives use page 0x2A (CD Capabilities)
-     *   We try page 0x05 first (most common per freemkv-unlock source).
-     */
-    UCHAR ms_cdb[6] = {
-        0x15,       /* MODE SELECT(6) */
-        0x10,       /* PF=1 (page format), SP=0 */
-        0x00,       /* reserved */
-        0x00,       /* reserved */
-        0x14,       /* parameter list length = 20 (4 header + 2 page hdr + 14 page data) */
-        0x00        /* control */
-    };
-    /* 4-byte header + page 0x05 (2-byte hdr + 14 bytes data) = 20 bytes total */
-    UCHAR ms_data[20] = {
-        /* 4-byte mode parameter header */
-        0x12,       /* mode data length = 18 (total - 2) */
-        0x00,       /* medium type */
-        0x00,       /* device-specific parameter */
-        0x00,       /* block descriptor length = 0 */
-        /* Mode page 0x05 (Write Parameters), length 0x0E = 14 bytes follow */
-        0x05, 0x0E,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    UCHAR ms_sense[SENSE_SIZE] = {0};
+    /* Read 0xF1 to identify drive platform/kernel */
+    UCHAR rb[0x30] = {0};
+    UCHAR rbs[SENSE_SIZE] = {0};
+    rb_data(0xF1, 0, rb, 0x30, rbs);
 
-    if (send_scsi(g_hDrive, ms_cdb, 6, ms_data, 20,
-                  SCSI_IOCTL_DATA_OUT, ms_sense, &st) == 0 && st == 0) {
-        /* Verify */
+    char platform[12] = {0};
+    char kernelID[5]  = {0};
+    int j;
+    for (j=0; j<8  && rb[16+j]>=0x20&&rb[16+j]<0x7F; j++) platform[j] = rb[16+j];
+    for (j=0; j<4  && rb[24+j]>=0x20&&rb[24+j]<0x7F; j++) kernelID[j] = rb[24+j];
+
+    char *pp = platform;
+    while (*pp && (*pp < '0' || *pp > '9')) pp++;
+    WORD driveID = *pp ? (WORD)strtol(pp, NULL, 16) : 0;
+
+    DWORD unlockKey = pioneer_key_lookup(driveID, kernelID);
+    if (!unlockKey) unlockKey = 0x6123789A; /* universal fallback */
+
+    printf("[LD]   Platform: %s  Kernel: %s  DriveID: 0x%04X  Key: 0x%08lX\n",
+           platform[0] ? platform : "?",
+           kernelID[0] ? kernelID : "?",
+           driveID, unlockKey);
+
+    /* Build 32-byte payload: model string (0-15) + key (16-19) + zeros */
+    UCHAR payload[0x20] = {0};
+    /* Find model string from g_mdl_map */
+    for (i = 0; g_mdl_map[i].did; i++) {
+        if (g_mdl_map[i].did == driveID) {
+            memcpy(payload, g_mdl_map[i].str, 16);
+            break;
+        }
+    }
+    if (!payload[0]) {
+        /* Fallback model string */
+        memcpy(payload, "PIONEER         ", 16);
+    }
+    payload[0x10] = (UCHAR)(unlockKey >>  0);
+    payload[0x11] = (UCHAR)(unlockKey >>  8);
+    payload[0x12] = (UCHAR)(unlockKey >> 16);
+    payload[0x13] = (UCHAR)(unlockKey >> 24);
+
+    /* Try WRITE BUFFER modes (same sweep as cmd_unlock) */
+    UCHAR modes[]  = {0x04, 0x01, 0x00, 0x0A, 0x0B, 0x0C, 0x0D};
+    UCHAR bufids[] = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    int activated = 0;
+    for (i = 0; i < 7; i++) {
+        UCHAR ucdb[10] = {0x3B, modes[i], bufids[i], 0,0,0, 0, 0x00, 0x20, 0};
+        UCHAR usense[SENSE_SIZE] = {0};
+        int ust = 0;
+        send_scsi(g_hDrive, ucdb, 10, payload, 0x20,
+                  SCSI_IOCTL_DATA_OUT, usense, &ust);
+        if (ust == 0) {
+            /* Verify immediately */
+            memset(buf77, 0, 4);
+            if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
+                buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
+                printf("[LD] LibreDrive activated! mode=0x%02X buf=0x%02X (AA 0B E0 FF)\n\n",
+                       modes[i], bufids[i]);
+                activated = 1;
+                break;
+            }
+        }
+    }
+
+    if (!activated) {
+        /* Final check — drive may have activated on a previous command */
         memset(buf77, 0, 4);
         if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
             buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
-            printf("[LD] LibreDrive activated! (AA 0B E0 FF)\n\n");
-            return 0;
+            printf("[LD] LibreDrive activated (AA 0B E0 FF)\n\n");
+            activated = 1;
+        } else {
+            printf("[LD] WRITE BUFFER sweep complete, RB 0x77 = %02X %02X %02X %02X\n",
+                   buf77[0], buf77[1], buf77[2], buf77[3]);
+            printf("[LD] LibreDrive not active. Drive may need firmware support.\n");
+            printf("[LD] Try running MakeMKV once to activate, then retry.\n\n");
         }
-        printf("[LD] MODE SELECT sent but RB 0x77 = %02X %02X %02X %02X (not AA 0B E0 FF)\n",
-               buf77[0], buf77[1], buf77[2], buf77[3]);
-        printf("[LD] Drive may need MakeMKV to apply the patch first.\n\n");
-        return 1;
-    } else {
-        printf("[LD] MODE SELECT failed (sense %02X %02X/%02X)\n",
-               ms_sense[2]&0x0F, ms_sense[12], ms_sense[13]);
-        printf("[LD] Drive may not support LibreDrive, or needs MakeMKV patch.\n\n");
-        return 1;
     }
+    return activated ? 0 : 1;
 }
 
 /* =========================================================

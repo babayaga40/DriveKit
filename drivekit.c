@@ -2758,6 +2758,9 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
     uint32_t root_icb_lba = 0;
     int i;
 
+    /* Wake the drive / keep it spinning */
+    { uint8_t w[2048]; read10(0, 1, w, NULL); }
+
     /* UDF anchor at sector 256 (ECMA-167 §8.4.2) */
     printf("    [UDF] Reading sector 256 (AVDP)...\n"); fflush(stdout);
     int r256 = read10(256, 1, sec, NULL);
@@ -2889,18 +2892,36 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                 uint16_t root_pr      = (uint16_t)(fsd[408] | (fsd[409]<<8));
                 printf("    [UDF]   FSD root ICB: ext_len=%u lb=%u part_ref=%u abs=%u\n",
                        root_ext_len, root_lb, root_pr, part_start + root_lb); fflush(stdout);
-                /* Scan nearby LBAs to find the actual FE */
-                printf("    [UDF]   Scanning near abs=%u for FE tag...\n", part_start+root_lb); fflush(stdout);
-                uint32_t scan_base = (root_lb > 4) ? part_start + root_lb - 4 : part_start;
-                uint32_t sj;
-                for (sj = 0; sj < 32; sj++) {
-                    uint8_t tmp[2048]; uint16_t tt;
-                    if (read10(scan_base + sj, 1, tmp, NULL)) continue;
-                    tt = le16(tmp);
-                    if (tt != 0)
-                        printf("    [UDF]     LBA %u: tag=%u\n", scan_base+sj, tt); fflush(stdout);
+                /* For UDF with virtual partition (part_ref=1), the root ICB lb_num
+                   is a virtual block number mapped through the VAT. For pressed BD-ROM
+                   we can try: scan from the FSD sector forward for a File Entry (tag 260/261).
+                   Also try part_start + lb as a direct fallback. */
+                uint32_t candidate = part_start + root_lb;
+                {
+                    uint8_t tmp[2048];
+                    uint16_t tt = 0;
+                    if (read10(candidate, 1, tmp, NULL) == 0) tt = le16(tmp);
+                    if (tt == 260 || tt == 261) {
+                        root_icb_lba = candidate;
+                        printf("    [UDF]   Root FE found directly at LBA %u (tag %u)\n", candidate, tt); fflush(stdout);
+                    }
                 }
-                root_icb_lba = part_start + root_lb;
+                if (!root_icb_lba) {
+                    /* Scan from just after the FSD for the root FE */
+                    printf("    [UDF]   Scanning from FSD+1 for root FE (tag 260/261)...\n"); fflush(stdout);
+                    uint32_t sj;
+                    for (sj = fsd_abs_lba + 1; sj < fsd_abs_lba + 64; sj++) {
+                        uint8_t tmp[2048]; uint16_t tt;
+                        if (read10(sj, 1, tmp, NULL)) continue;
+                        tt = le16(tmp);
+                        if (tt != 0) printf("    [UDF]     LBA %u: tag=%u\n", sj, tt); fflush(stdout);
+                        if (tt == 260 || tt == 261) {
+                            root_icb_lba = sj;
+                            printf("    [UDF]   Root FE found at LBA %u (tag %u)\n", sj, tt); fflush(stdout);
+                            break;
+                        }
+                    }
+                }
             } else {
                 printf("    [UDF] Tag %u != 256, not an FSD\n", ftag); fflush(stdout);
             }

@@ -2907,18 +2907,106 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                     }
                 }
                 if (!root_icb_lba) {
-                    /* Scan from just after the FSD for the root FE */
-                    printf("    [UDF]   Scanning from FSD+1 for root FE (tag 260/261)...\n"); fflush(stdout);
-                    uint32_t sj;
-                    for (sj = fsd_abs_lba + 1; sj < fsd_abs_lba + 64; sj++) {
-                        uint8_t tmp[2048]; uint16_t tt;
-                        if (read10(sj, 1, tmp, NULL)) continue;
-                        tt = le16(tmp);
-                        if (tt != 0) printf("    [UDF]     LBA %u: tag=%u\n", sj, tt); fflush(stdout);
-                        if (tt == 260 || tt == 261) {
-                            root_icb_lba = sj;
-                            printf("    [UDF]   Root FE found at LBA %u (tag %u)\n", sj, tt); fflush(stdout);
-                            break;
+                    /* Scan from just after the FSD for the root FE.
+                       Also follow tag=257 (Indirect Entry) which redirects to actual FE.
+                       VAT on BD-ROM: virtual lb_num maps via VAT at last sector of disc.
+                       Try reading near last LBA for VAT FE (tag 260/261), then use
+                       VAT table to resolve root_lb → physical LBA. */
+
+                    /* First: try VAT approach — VAT FE is near last recorded LBA */
+                    {
+                        uint8_t cap_buf[8] = {0};
+                        uint32_t last_lba = 0;
+                        /* Try READ CAPACITY(10) */
+                        UCHAR rc_cdb[10] = {0x25,0,0,0,0,0,0,0,0,0};
+                        UCHAR rc_sense[SENSE_SIZE] = {0}; int rc_st = 0;
+                        send_scsi(g_hDrive, rc_cdb, 10, cap_buf, 8,
+                                  SCSI_IOCTL_DATA_IN, rc_sense, &rc_st);
+                        if (rc_st == 0)
+                            last_lba = ((uint32_t)cap_buf[0]<<24)|((uint32_t)cap_buf[1]<<16)|
+                                       ((uint32_t)cap_buf[2]<<8)|(uint32_t)cap_buf[3];
+                        printf("    [UDF]   Last LBA from CAPACITY: %u (0x%08X)\n", last_lba, last_lba);
+                        fflush(stdout);
+
+                        if (last_lba > 64) {
+                            /* VAT FE is at or just before last_lba; scan last 32 sectors */
+                            uint32_t vat_fe_lba = 0;
+                            uint32_t sk;
+                            for (sk = last_lba; sk > last_lba - 32 && sk > 0; sk--) {
+                                uint8_t vtmp[2048]; uint16_t vtt;
+                                if (read10(sk, 1, vtmp, NULL)) continue;
+                                vtt = le16(vtmp);
+                                if (vtt != 0) printf("    [UDF]   VAT scan LBA %u: tag=%u\n", sk, vtt);
+                                fflush(stdout);
+                                if (vtt == 260 || vtt == 261) {
+                                    vat_fe_lba = sk;
+                                    printf("    [UDF]   VAT FE found at LBA %u\n", sk);
+                                    fflush(stdout);
+                                    break;
+                                }
+                            }
+                            if (vat_fe_lba) {
+                                /* Read VAT FE to find the VAT data (list of physical LBAs) */
+                                uint8_t vfe[2048];
+                                if (read10(vat_fe_lba, 1, vfe, NULL) == 0) {
+                                    uint16_t vfe_tag = le16(vfe);
+                                    uint32_t vfe_eal, vfe_edl, vfe_adoff;
+                                    if (vfe_tag == 260) {
+                                        vfe_eal = le32(vfe+168); vfe_edl = le32(vfe+172); vfe_adoff = 176+vfe_eal;
+                                    } else {
+                                        vfe_eal = le32(vfe+176); vfe_edl = le32(vfe+180); vfe_adoff = 184+vfe_eal;
+                                    }
+                                    printf("    [UDF]   VAT FE tag=%u edl=%u adoff=%u\n", vfe_tag, vfe_edl, vfe_adoff);
+                                    fflush(stdout);
+                                    /* VAT data is inline or in AD; for small VAT it's inline in FE */
+                                    /* Each VAT entry is a 4-byte physical LBA; entry[N] = phys for virtual N */
+                                    /* root_lb is the virtual block number */
+                                    uint32_t vat_entry_off = vfe_adoff + root_lb * 4;
+                                    if (vat_entry_off + 4 <= 2048) {
+                                        uint32_t phys = le32(vfe + vat_entry_off);
+                                        printf("    [UDF]   VAT[%u] = physical LBA %u\n", root_lb, phys);
+                                        fflush(stdout);
+                                        if (phys && phys < last_lba) {
+                                            root_icb_lba = part_start + phys;
+                                            printf("    [UDF]   Root ICB via VAT: LBA %u\n", root_icb_lba);
+                                            fflush(stdout);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!root_icb_lba) {
+                        /* Fallback: linear scan from FSD+1, follow Indirect Entries (tag 257) */
+                        printf("    [UDF]   Scanning from FSD+1 for root FE (tag 260/261/257)...\n"); fflush(stdout);
+                        uint32_t sj;
+                        for (sj = fsd_abs_lba + 1; sj < fsd_abs_lba + 64; sj++) {
+                            uint8_t tmp[2048]; uint16_t tt;
+                            if (read10(sj, 1, tmp, NULL)) continue;
+                            tt = le16(tmp);
+                            if (tt != 0) printf("    [UDF]     LBA %u: tag=%u\n", sj, tt); fflush(stdout);
+                            if (tt == 260 || tt == 261) {
+                                root_icb_lba = sj;
+                                printf("    [UDF]   Root FE found at LBA %u (tag %u)\n", sj, tt); fflush(stdout);
+                                break;
+                            }
+                            if (tt == 257) {
+                                /* Indirect Entry: ICB at bytes 16..21 (lb_num + part_ref) */
+                                uint32_t ind_lb  = le32(tmp + 16);
+                                uint16_t ind_pr  = (uint16_t)(tmp[20]|(tmp[21]<<8));
+                                uint32_t ind_abs = part_start + ind_lb;
+                                printf("    [UDF]     IE redirect → lb=%u part_ref=%u abs=%u\n",
+                                       ind_lb, ind_pr, ind_abs); fflush(stdout);
+                                uint8_t itmp[2048]; uint16_t itt = 0;
+                                if (read10(ind_abs, 1, itmp, NULL) == 0) itt = le16(itmp);
+                                printf("    [UDF]     IE target LBA %u: tag=%u\n", ind_abs, itt); fflush(stdout);
+                                if (itt == 260 || itt == 261) {
+                                    root_icb_lba = ind_abs;
+                                    printf("    [UDF]   Root FE via IE at LBA %u\n", ind_abs); fflush(stdout);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

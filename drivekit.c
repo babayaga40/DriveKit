@@ -3340,8 +3340,10 @@ static int libredrive_activate(void) {
            kernelID[0] ? kernelID : "?",
            driveID, unlockKey);
 
-    /* Build 32-byte payload: model string (0-15) + key (16-19) + zeros */
-    UCHAR payload[0x20] = {0};
+    /* Build 256-byte payload: model string (0-15) + key (16-19) + zeros
+       MrPenguin: CDB must be >= 19 bytes; payload must be 0x100 bytes
+       (same size as firmware unlock — drive ignores bytes beyond 0x14) */
+    UCHAR payload[0x100] = {0};
     /* Find model string from g_mdl_map */
     for (i = 0; g_mdl_map[i].did; i++) {
         if (g_mdl_map[i].did == driveID) {
@@ -3358,15 +3360,21 @@ static int libredrive_activate(void) {
     payload[0x12] = (UCHAR)(unlockKey >> 16);
     payload[0x13] = (UCHAR)(unlockKey >> 24);
 
-    /* Try WRITE BUFFER modes (same sweep as cmd_unlock) */
+    printf("[LD]   Payload: %.16s + %02X%02X%02X%02X\n",
+           (char*)payload,
+           payload[0x10], payload[0x11], payload[0x12], payload[0x13]);
+
+    /* Try WRITE BUFFER modes — 12-byte CDB, 0x100 byte payload
+       MrPenguin confirmed: CDB >= 19 bytes required for LibreDrive activation */
     UCHAR modes[]  = {0x04, 0x01, 0x00, 0x0A, 0x0B, 0x0C, 0x0D};
     UCHAR bufids[] = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     int activated = 0;
     for (i = 0; i < 7; i++) {
-        UCHAR ucdb[10] = {0x3B, modes[i], bufids[i], 0,0,0, 0, 0x00, 0x20, 0};
+        /* 12-byte CDB: opcode=0x3B, mode, bufid, 0,0,0,0, len(3 bytes), 0,0 */
+        UCHAR ucdb[12] = {0x3B, modes[i], bufids[i], 0,0,0, 0, 0x01, 0x00, 0, 0, 0};
         UCHAR usense[SENSE_SIZE] = {0};
         int ust = 0;
-        send_scsi(g_hDrive, ucdb, 10, payload, 0x20,
+        send_scsi(g_hDrive, ucdb, 12, payload, 0x100,
                   SCSI_IOCTL_DATA_OUT, usense, &ust);
         if (ust == 0) {
             /* Verify immediately */

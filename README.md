@@ -215,11 +215,28 @@ Note: WRITE BUFFER offsets ≠ file offsets; they are not proven physical NAND a
 
 ## ✅ CONFIRMED WORKING
 
+**POST→PRE downgrade — BDR-XD06U (November 2026, DriveKit verified):**
+- Drive: BDR-XD06U (SAT 8B30/ID69, serial NKDL005825JP), firmware **1.12** (post-cutoff, date `23/03/03`)
+- Confirmed: **1.12 → 1.11** using `drivekit flash D --file S8B30690.111 --file2 S8B30691.111 --patch`
+- KernelFront: generation marker patched `0xFF → 0x01`; checksum word `0xD0BC595A → 0xD0BD575A`; body sum `00000000` ✓
+- Protocol: flat 3-chunk kernel (`FE` at `0x000000`, `0x008000`, `0x010000`) → Normal (59 chunks, `0x1D5600` bytes) → immediate commit
+- Model string: `PIONEER BDR-XS06` (from `g_mdl_map[0x8B30]`)
+- Unlock/commit key: `0x08A98AF2` (`F2 8A A9 08` on wire)
+- Commit returned **GOOD**; subsequent `drivekit info` confirmed **firmware 1.11**, date `17/06/22`, **UHD: Yes**
+
 **Pre-cutoff BDR-XD06U full b0 suite (November 2026):**
-- Drive: BDR-XD06U (SAT 8B30/ID69, firmware 1.11, pre-cutoff)
+- Drive: BDR-XD06U (SAT 8B30/ID69, firmware 1.11, pre-cutoff) — same drive after above downgrade
 - Confirmed: `b0scankey`, `b0key`, and `b0dumpfw` all working correctly
 - Key extracted: `0x08A98AF2` — cross-check: **MATCH** in both `b0scankey` and `b0key`
-- Post-downgrade reflash to native BDR-XD06U firmware succeeded
+
+**POST→PRE downgrade — BDR-XD06U (November 2026, DriveKit verified):**
+- Drive: BDR-XD06U (SAT 8B30/ID69, serial NKDL005825JP), firmware **1.12** (post-cutoff, `23/03/03`)
+- Confirmed: **1.12 → 1.11** using `drivekit flash D --file S8B30690.111 --file2 S8B30691.111 --patch`
+- KernelFront patched kernel SHA-256: `9253407e0e51e423641cafafc0729a5691ee6c0892bc33f4396e7f3071369202`
+- Protocol: flat 3-chunk kernel (`FE` at `0x000000`/`0x008000`/`0x010000`) → Normal (59 × `0x8000` chunks, `0x1D5600` bytes) → immediate commit
+- Model string: `PIONEER BDR-XS06` (from `g_mdl_map[0x8B30]`); unlock/commit key: `0x08A98AF2` (`F2 8A A9 08` on wire)
+- Commit returned **GOOD**; subsequent `drivekit info` confirmed **firmware 1.11**, date `17/06/22`, **UHD: Yes**
+- Same drive then confirmed working with full pre-cutoff b0 suite: `b0scankey`, `b0key`, `b0dumpfw` all MATCH
 
 **Post-cutoff crossflash/downgrade (September 14, 2026):**
 - Drive: BDR-XD08U (SAT 9331 ID05)

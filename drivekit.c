@@ -3176,6 +3176,86 @@ static void aacs_decrypt_sector(uint8_t *s0, uint8_t *s1, uint8_t *s2, const uin
 }
 
 /* =========================================================
+   LIBREDRIVE_ACTIVATE
+   Sends the MODE SELECT(10) volatile RAM patch that enables
+   raw UHD sector reads on supported Pioneer/ASUS/LG drives.
+
+   The sequence (from MakeMKV USBPcap / freemkv-unlock source):
+     MODE SELECT(10)  opcode=0x55, PF=1
+     Parameter data: 8-byte header + mode page 0x03 (12 bytes)
+       Page 0x03, len 0x0A, data: 00 00 00 00 00 00 00 00 00 00
+
+   After this command, READ BUFFER 0x77 returns AA 0B E0 FF
+   and the drive serves raw UHD sectors via READ(10).
+
+   Returns 0 if already active or successfully activated,
+   1 if activation failed and drive unlikely to serve raw data.
+   ========================================================= */
+static int libredrive_activate(void) {
+    UCHAR buf77[4] = {0};
+    UCHAR s77[SENSE_SIZE] = {0};
+    int st = 0;
+
+    /* Check if already active */
+    if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
+        buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
+        printf("[LD] LibreDrive already active (AA 0B E0 FF)\n\n");
+        return 0;
+    }
+
+    printf("[LD] Activating LibreDrive (MODE SELECT volatile patch)...\n");
+
+    /*
+     * MODE SELECT(10): opcode 0x55
+     *   byte 1: PF=1 (page format), SP=0 (don't save)
+     *   bytes 7-8: parameter length = 20 (8 header + 12 page)
+     *
+     * Parameter data layout (20 bytes):
+     *   [0..7]  Mode Parameter Header (8 bytes, all zero)
+     *   [8]     Page code 0x03
+     *   [9]     Page length 0x0A (10 bytes of data follow)
+     *   [10..19] Page data: all zeros
+     */
+    UCHAR ms_cdb[10] = {
+        0x55,       /* MODE SELECT(10) */
+        0x10,       /* PF=1, SP=0 */
+        0,0,0,0,    /* reserved */
+        0,          /* reserved */
+        0x00, 0x14, /* parameter list length = 20 */
+        0           /* control */
+    };
+    UCHAR ms_data[20] = {
+        /* 8-byte mode param header */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        /* Mode page 0x03, length 0x0A, 10 bytes data */
+        0x03, 0x0A,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    UCHAR ms_sense[SENSE_SIZE] = {0};
+
+    if (send_scsi(g_hDrive, ms_cdb, 10, ms_data, 20,
+                  SCSI_IOCTL_DATA_OUT, ms_sense, &st) == 0 && st == 0) {
+        /* Verify */
+        memset(buf77, 0, 4);
+        if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
+            buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
+            printf("[LD] LibreDrive activated! (AA 0B E0 FF)\n\n");
+            return 0;
+        }
+        printf("[LD] MODE SELECT sent but RB 0x77 = %02X %02X %02X %02X (not AA 0B E0 FF)\n",
+               buf77[0], buf77[1], buf77[2], buf77[3]);
+        printf("[LD] Drive may need MakeMKV to apply the patch first.\n\n");
+        return 1;
+    } else {
+        printf("[LD] MODE SELECT failed (sense %02X %02X/%02X)\n",
+               ms_sense[2]&0x0F, ms_sense[12], ms_sense[13]);
+        printf("[LD] Drive may not support LibreDrive, or needs MakeMKV patch.\n\n");
+        return 1;
+    }
+}
+
+/* =========================================================
    CMD_UHDCHECK
    Verify that LibreDrive is active on the current drive and
    disc, and report the disc capacity.
@@ -3196,25 +3276,9 @@ static int cmd_uhdcheck(void) {
 
     printf("=== UHD LIBREDRIVE CHECK ===\n\n");
 
-    /* 1. Check READ BUFFER 0x77 — LibreDrive handshake */
-    printf("[1] READ BUFFER 0x77 (LibreDrive handshake)...\n");
-    if (rb_data(0x77, 0, buf, 4, sense) == 0) {
-        printf("  Response : %02X %02X %02X %02X\n",
-               buf[0], buf[1], buf[2], buf[3]);
-        if (buf[0]==0xAA && buf[1]==0x0B && buf[2]==0xE0 && buf[3]==0xFF) {
-            printf("  Status   : *** LibreDrive ACTIVE *** (AA 0B E0 FF)\n");
-            printf("             Raw UHD sector reads enabled.\n\n");
-        } else {
-            printf("  Status   : NOT active (expected AA 0B E0 FF)\n");
-            printf("  LibreDrive MODE SELECT patch not applied.\n");
-            printf("  Apply with MakeMKV, then retry: drivekit uhdcheck %c\n\n",
-                   g_drivePath[4]);
-            return 1;
-        }
-    } else {
-        printf("  Status   : READ BUFFER 0x77 FAILED (sense %02X %02X)\n",
-               sense[2]&0x0F, sense[12]);
-        printf("  Drive does not support LibreDrive or disc not inserted.\n\n");
+    /* 1. Activate LibreDrive (or confirm already active) */
+    printf("[1] LibreDrive activation...\n");
+    if (libredrive_activate() != 0) {
         return 1;
     }
 
@@ -3302,16 +3366,8 @@ static int cmd_uhdinfo(void) {
 
     printf("=== UHD DISC INFO / AACS METADATA ===\n\n");
 
-    /* LibreDrive active check */
-    {
-        UCHAR buf77[4] = {0}; UCHAR s77[SENSE_SIZE]={0};
-        if (rb_data(0x77, 0, buf77, 4, s77) || buf77[0]!=0xAA) {
-            printf("[!] LibreDrive not active (run uhdcheck first).\n");
-            printf("    Continuing anyway — reads may fail if drive is not patched.\n\n");
-        } else {
-            printf("[OK] LibreDrive active (AA 0B E0 FF)\n\n");
-        }
-    }
+    /* Auto-activate LibreDrive if not already active */
+    libredrive_activate();
 
     /* Disc capacity */
     printf("[1] Disc capacity...\n");
@@ -3470,19 +3526,13 @@ static int cmd_ripuhd(void) {
     printf("=== UHD DISC RIP ===\n\n");
     printf("  Output    : %s\n", iso_path);
 
-    /* LibreDrive check */
-    {
-        UCHAR buf77[4]={0}; UCHAR s77[SENSE_SIZE]={0};
-        if (rb_data(0x77,0,buf77,4,s77)||buf77[0]!=0xAA) {
-            printf("[!] LibreDrive handshake not confirmed (READ BUFFER 0x77 != AA 0B E0 FF).\n");
-            if (!g_force) {
-                printf("    Use --force to rip anyway (sectors may be encrypted).\n\n");
-                return 1;
-            }
-            printf("    Continuing with --force.\n\n");
-        } else {
-            printf("  LibreDrive: active (AA 0B E0 FF)\n");
+    /* Auto-activate LibreDrive */
+    if (libredrive_activate() != 0) {
+        if (!g_force) {
+            printf("    Use --force to rip anyway (sectors may be encrypted).\n\n");
+            return 1;
         }
+        printf("    Continuing with --force.\n\n");
     }
 
     /* Disc capacity */

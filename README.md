@@ -18,9 +18,13 @@ New to DriveKit? See **[USERGUIDE.md](USERGUIDE.md)** for step-by-step flashing 
 - DriveKit successfully performed a **post-cutoff → post-cutoff same-era flash**: 1.06 → 1.05 using the same new 4-transfer kernel layout. Commit returned SCSI GOOD; post-reflash INQUIRY confirmed firmware 1.05.
 - Added **`scankey`**, an offline scanner that extracts the update-entry unlock key directly from decoded Normal firmware. It recovered the known XD07 key and flagged a conflicting entry for `S8800601.153`.
 - Added **`b0scankey`**, a live key extractor that reads Normal firmware directly from the running drive via `0xB0` and extracts the unlock key without needing a firmware file. Tested on pre-cutoff and post-cutoff BDR-XD07U. The firmware may identify itself as `PIONEER BDR-BDS7`, an internal protocol model string shared by multiple physical drive models—not a separate tested drive. Takes ~30 seconds.
+- Added **`b0key`**, a live key extractor that opens the `0xB0` window and reads key-handler regions in real time — no firmware file needed. Auto-detects pre/post-cutoff via INQUIRY date; cross-checks extracted key against the internal key table. Confirmed working on pre-cutoff BDR-XD06U (SAT 8B30/ID69/FW 1.11) and post-cutoff BDR-XD07U. Takes ~30 seconds.
 - Added **`b0dumpfw`**, a live firmware extractor that streams `0xB0`, carves out Kernel (64 KiB) and Normal (~1.8 MB) at their confirmed offsets, and writes named files (`pioneer_<model>_<kernelID>_<platformID>_<fwrev>_kernel.bin` etc.) plus a sidecar info file.
+- Added **H8S/2600 disassembler** — built-in disassembler for Pioneer drive firmware. Disassembles H8S/2600 machine code extracted from `0xB0` dumps or `decryptkernel` output directly within DriveKit.
+- Added **ASM text editor** — interactive text-mode assembly editor for inspecting and patching H8S/2600 assembly listings. Navigate, search, and edit disassembly output without leaving the terminal.
+- Full **b0 command suite confirmed on pre-cutoff BDR-XD06U** (SAT 8B30/ID69/FW 1.11, November 2026): `b0scankey`, `b0key`, and `b0dumpfw` all working. Post-downgrade reflash to native firmware succeeded without issue.
 
-All three results are verified on tested hardware; not a claim of universal compatibility.
+All results are verified on tested hardware; not a claim of universal compatibility.
 
 See [Confirmed working](#-confirmed-working), [Flash Protocol](#flash-protocol), and [KernelFront patch validation](#kernelfront-patch-validation).
 
@@ -211,6 +215,12 @@ Note: WRITE BUFFER offsets ≠ file offsets; they are not proven physical NAND a
 
 ## ✅ CONFIRMED WORKING
 
+**Pre-cutoff BDR-XD06U full b0 suite (November 2026):**
+- Drive: BDR-XD06U (SAT 8B30/ID69, firmware 1.11, pre-cutoff)
+- Confirmed: `b0scankey`, `b0key`, and `b0dumpfw` all working correctly
+- Key extracted: `0x08A98AF2` — cross-check: **MATCH** in both `b0scankey` and `b0key`
+- Post-downgrade reflash to native BDR-XD06U firmware succeeded
+
 **Post-cutoff crossflash/downgrade (September 14, 2026):**
 - Drive: BDR-XD08U (SAT 9331 ID05)
 - Confirmed: 1.04 ↔ 1.02 crossflash both directions, single command
@@ -290,7 +300,7 @@ The key table should be treated as a cross-check rather than the sole source of 
 - BDR-XD08U — **1.01** (2022-10-11), kernel ID05
 - BDR-XD08U — **1.00** (2022-04-03), kernel ID05
 - BDR-XD07U — **1.04** (2022-05-31), kernel ID05 ✅ UHD capable
-- BDR-XD06U — **1.11** ✅ UHD capable
+- BDR-XD06U — **1.11** (SAT 8B30/ID69) ✅ UHD capable — b0 suite confirmed (Nov 2026)
 - BDR-XD05 — **3.01 / 2.10 / 1.21**
 
 ---
@@ -349,7 +359,10 @@ drivekit <command> <drive_letter> [options]
 | `hwdump` | Dump H8S/2600 kernel from RAM via `0xB0` — works on both pre and post-cutoff |
 | **`b0probe`** | **Quick 0xB0 access probe — tests if drive is in pre/post-cutoff mode and whether 0xB0 is readable** |
 | **`b0scankey`** | **Live unlock key extraction — streams Normal firmware from 0xB0 and runs `scankey` without a firmware file** |
+| **`b0key`** | **Live key extractor — opens 0xB0 window and scans key-handler region in real time; auto-detects pre/post-cutoff; cross-checks against key table** |
 | **`b0dumpfw`** | **Live firmware extractor — streams 0xB0 and carves out Kernel and Normal into named `.bin` files** |
+| **`disasm`** | **H8S/2600 disassembler — disassemble firmware extracted from 0xB0 or decryptkernel output** |
+| **`asmedit`** | **H8S/2600 ASM text editor — interactive text-mode assembly viewer and editor** |
 | `xordiff` | XOR two encrypted firmware files to find version bytes |
 | `patchfw` | Patch firmware ASCII header to spoof version |
 | `decryptkernel` | Decode KernelFront XOR/rotate cipher on a Pioneer H8S kernel file; outputs raw plaintext body for IDA analysis. `--patch` additionally flips the generation marker (`0xFF→0x01`) and recomputes the body checksum |
@@ -585,11 +598,11 @@ year letter (N=2022, O=2023, P=2024...)
 
 ---
 
-## Live Firmware Extraction (`b0scankey` / `b0dumpfw`)
+## Live Firmware Extraction (`b0scankey` / `b0key` / `b0dumpfw`)
 
-These commands use the same `0xB0` enable sequence as `hwdump` to read firmware directly from the running drive — no firmware file required. Both work on pre-cutoff and post-cutoff drives; the WRITE BUFFER offset (`0x00AAAA` or `0xA5AAAA`) is auto-detected from the INQUIRY date.
+These commands use the same `0xB0` enable sequence as `hwdump` to read firmware directly from the running drive — no firmware file required. All work on pre-cutoff and post-cutoff drives; the WRITE BUFFER offset (`0x00AAAA` or `0xA5AAAA`) is auto-detected from the INQUIRY date.
 
-### Confirmed 0xB0 firmware layout (tested pre-cutoff and post-cutoff BDR-XD07U SAT 8D31/ID05)
+### Confirmed 0xB0 firmware layout (tested pre-cutoff BDR-XD06U SAT 8B30/ID69, pre-cutoff and post-cutoff BDR-XD07U SAT 8D31/ID05)
 
 | Region | Dump file offset | Live B0 address | Size |
 |--------|-----------------|-----------------|------|
@@ -630,6 +643,45 @@ Quick check: enables 0xB0 and reads the first chunk to confirm access.
 ```
 drivekit b0probe E
 ```
+
+### `b0key`
+
+Opens the `0xB0` window and scans the key-handler region of Normal firmware in real time — no firmware file required. Auto-detects pre/post-cutoff via INQUIRY date and uses the correct WRITE BUFFER offset (`0x00AAAA` or `0xA5AAAA`). After streaming, scans Normal for the H8S/2600 keyed-handler pattern and cross-checks the extracted key against the internal key table.
+
+```
+drivekit b0key E
+```
+
+The command sequence:
+1. INQUIRY — reads firmware date at byte `0x25` to detect pre/post-cutoff; primes the drive
+2. READ BUFFER `0xF1` — reads platform ID and kernel ID if not already cached
+3. GET EVENT STATUS ×4
+4. WRITE BUFFER `0x41` at the detected offset — enables `0xB0`
+5. READ BUFFER `0xF4` — trigger read (`0xA4` bytes at `0x8394B4`)
+6. Stream `0xB0` from live address `0x100000` through raw dump offset `0x3B0000` (~3 MB) using 32 KiB chunks
+7. Scan Normal body (raw dump offset `0x310000`) for keyed-handler pattern
+8. Cross-check against `pioneer_key()` table
+
+Output example (pre-cutoff BDR-XD06U, SAT 8B30/ID69, FW 1.11):
+```
+Generation: PRE-CUTOFF (offset 0x00AAAA, 0xB0 from 0x100000)
+Platform: SAT 8B30  Kernel: ID69  FW: 1.11
+WRITE BUFFER 0x41 offset=0x00AAAA: GOOD
+READ BUFFER 0xF4 trigger: GOOD
+Streaming 0xB0 to b0key_dump.bin...
+[========================================] 0x3B0000 bytes
+
+Normal[0..15]: 50 49 4F 4E 45 45 52 20 42 44 52 2D 42 44 53 37  (PIONEER OK)
+
+Keyed handler matches        : 1
+Key bytes offset in Normal   : 0x3BCE6
+Reject branch variant        : 10-byte
+Unlock key (wire order)      : F2 8A A9 08
+Unlock key (LE DWORD)        : 0x08A98AF2
+Cross-check: matches key-table entry for SAT 8B30 / ID69  ✓ MATCH
+```
+
+The cross-check uses `pioneer_key(driveID, 0)` — the platform-ID switch table — not `pioneer_key_lookup()`. A MATCH means the extracted value agrees with the compiled-in key; a mismatch is flagged with both values so you can decide which to trust. `b0key` does not write any firmware; it is a read-only diagnostic.
 
 ### `b0scankey`
 
@@ -676,6 +728,40 @@ pioneer_BDR-XD07U_ID05_8D31_1.06_info.txt              (sidecar: model, kernel I
 ```
 
 The `_normal.bin` output can be fed directly to `scankey` without first running `decodenormal`.
+
+---
+
+## H8S/2600 Disassembler and ASM Editor
+
+DriveKit includes a built-in **H8S/2600 disassembler** and an interactive **ASM text editor** for working with Pioneer drive firmware directly in the terminal — no external tools needed.
+
+### `disasm`
+
+Disassembles H8S/2600 machine code from a binary file. The input can be raw kernel output from `decryptkernel`, a region carved from a `b0dumpfw` dump, or any other H8S/2600 binary blob.
+
+```
+drivekit disasm --file pioneer_XD06U_ID69_8B30_1.11_kernel.bin
+drivekit disasm --file pioneer_XD07U_ID05_8D31_1.06_normal.bin
+```
+
+Output is H8S/2600 assembly with addresses, hex bytes, and mnemonics. Useful for:
+- Locating version-check logic in kernel or Normal firmware
+- Tracing unlock-key comparison handlers (the same code `scankey`/`b0key` pattern-match against)
+- Understanding pre/post-cutoff protection differences
+
+### `asmedit`
+
+Interactive text-mode assembly viewer and editor. Navigate disassembly listings with keyboard controls, search for bytes or instruction patterns, and make targeted byte edits without leaving the terminal.
+
+```
+drivekit asmedit --file pioneer_XD07U_ID05_8D31_1.06_kernel.bin
+```
+
+Controls: arrow keys to scroll, `/` to search, `e` to edit a byte at the cursor, `q` to quit and optionally save. The editor operates on the binary in memory; changes are written back only on explicit save.
+
+Both commands were added in November 2026 (commit 1561315) alongside analysis pass infrastructure for automated structure detection and cross-reference in Pioneer H8S/2600 firmware.
+
+---
 
 **Important — research images, not flash packages:** `b0dumpfw` extracts **decrypted, in-memory Kernel and Normal bodies**, not the encrypted KernelFront/Normal update envelopes expected by the flashing protocol. Despite the `.bin` extension, these outputs must **not** be passed directly to `flash`/`crossflash` as firmware packages. Flashable files require the appropriate envelope, encryption, integrity fields, and drive-specific protocol.
 

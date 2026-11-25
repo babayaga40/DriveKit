@@ -3255,23 +3255,24 @@ static int libredrive_activate(void) {
         0x10,       /* PF=1 (page format), SP=0 */
         0x00,       /* reserved */
         0x00,       /* reserved */
-        0x10,       /* parameter list length = 16 */
+        0x14,       /* parameter list length = 20 (4 header + 2 page hdr + 14 page data) */
         0x00        /* control */
     };
-    UCHAR ms_data[16] = {
+    /* 4-byte header + page 0x05 (2-byte hdr + 14 bytes data) = 20 bytes total */
+    UCHAR ms_data[20] = {
         /* 4-byte mode parameter header */
-        0x0E,       /* mode data length (remaining bytes) */
+        0x12,       /* mode data length = 18 (total - 2) */
         0x00,       /* medium type */
         0x00,       /* device-specific parameter */
-        0x00,       /* block descriptor length = 0 (no block descriptors) */
-        /* Mode page 0x05 (Write Parameters), length 0x0E, 14 bytes data = all zeros */
+        0x00,       /* block descriptor length = 0 */
+        /* Mode page 0x05 (Write Parameters), length 0x0E = 14 bytes follow */
         0x05, 0x0E,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
     UCHAR ms_sense[SENSE_SIZE] = {0};
 
-    if (send_scsi(g_hDrive, ms_cdb, 6, ms_data, 16,
+    if (send_scsi(g_hDrive, ms_cdb, 6, ms_data, 20,
                   SCSI_IOCTL_DATA_OUT, ms_sense, &st) == 0 && st == 0) {
         /* Verify */
         memset(buf77, 0, 4);

@@ -2801,37 +2801,62 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
         }
         if (tid == 6) {
             /* Logical Volume Descriptor (ECMA-167 §10.6)
-               Bytes 84..99: Logical Volume Contents Use (long_ad)
-                 [84..87]  extent_length  (4 bytes LE)
-                 [88..91]  extent_location.lb_num  (4 bytes LE) ← FSD LBA relative to partition
-                 [92..93]  extent_location.part_ref (2 bytes LE)
-               This points directly to the File Set Descriptor. */
-            uint32_t lvcu_len = le32(vd + 84);
-            uint32_t lvcu_lb  = le32(vd + 88);
-            uint16_t lvcu_pr  = (uint16_t)(vd[92] | (vd[93]<<8));
-            printf("    [UDF]   LVD: FSD long_ad len=%u lb=%u part_ref=%u\n",
-                   lvcu_len, lvcu_lb, lvcu_pr); fflush(stdout);
-            /* Store for FSD lookup; will be resolved against part_start after PD */
-            root_icb_lba = lvcu_lb; /* temporarily store relative LBA */
+               Layout:
+                 0-15:   Descriptor Tag
+                 16-19:  VDS Sequence Number
+                 20-23:  Interchange Level
+                 24-27:  Maximum Interchange Level
+                 28-31:  Character Set List
+                 32-35:  Maximum Character Set List
+                 36-167: Logical Volume Identifier (CS0 charspec at 36-51, name at 52-167 = 128 bytes)
+                 168-179: Descriptor Character Set (12 bytes)
+                 180-191: Explanatory Character Set (12 bytes)
+                 192-199: Logical Volume Contents Use — long_ad (8 bytes):
+                   [192..195] extent_length
+                   [196..199] extent_location.lb_num  ← FSD LBA relative to partition
+                   [200..201] extent_location.part_ref
+                 202-205: Map Table Length
+                 206-209: Number of Partition Maps
+               Wait — charspec is 64 bytes not 12. Recalculate:
+                 36-99:  Descriptor Character Set (64 bytes)
+                100-163: Explanatory Character Set (64 bytes)
+                164-171: Logical Volume Contents Use (long_ad, 8 bytes):
+                   [164..167] extent_length
+                   [168..171] extent_location.lb_num
+                   [172..173] extent_location.part_ref
+                174-177: Map Table Length
+                178-181: Number of Partition Maps
+               Actually ECMA-167 Table 5 (charspec) = 64 bytes each.
+               LV Identifier = regid (32 bytes) + LVI string (128 bytes) = starts at byte 84
+               ... Let's just dump the bytes at several candidate offsets. */
+            printf("    [UDF]   LVD raw @ offsets 84,164,228,432:\n"); fflush(stdout);
+            int off;
+            for (off = 0; off <= 440; off += 4) {
+                if (le32(vd + off) != 0 || le32(vd+off+4) != 0)
+                    printf("    [UDF]     [%3d] %02X %02X %02X %02X  %02X %02X %02X %02X\n",
+                        off,
+                        vd[off],vd[off+1],vd[off+2],vd[off+3],
+                        vd[off+4],vd[off+5],vd[off+6],vd[off+7]); fflush(stdout);
+            }
+            /* Dump sector in hex to find FSD pointer — skip for now, use partition scan */
+            root_icb_lba = 0; /* will use fallback scan */
         }
     }
     printf("    [UDF] part_start = %u, FSD rel LBA = %u\n", part_start, root_icb_lba); fflush(stdout);
 
     /* Resolve FSD absolute LBA using the LVD long_ad + partition start */
     uint32_t fsd_abs_lba = 0;
-    if (root_icb_lba != 0) {
-        fsd_abs_lba = part_start + root_icb_lba;
-        printf("    [UDF] FSD absolute LBA = %u (from LVD)\n", fsd_abs_lba); fflush(stdout);
-    } else {
-        /* Fallback: scan from partition start */
-        printf("    [UDF] LVD gave no FSD location, scanning from part_start...\n"); fflush(stdout);
-        for (i = 0; i < 32; i++) {
+    /* Always scan for FSD — we need the LVD dump to find the right offset */
+    {
+        /* Scan first 128 sectors of partition for tag 256 (FSD) */
+        printf("    [UDF] Scanning partition for FSD (tag 256)...\n"); fflush(stdout);
+        for (i = 0; i < 128; i++) {
             uint8_t fsd[2048];
-            if (read10(part_start + i, 1, fsd, NULL)) { printf("    [UDF]   FSD scan[%d]: read failed\n", i); fflush(stdout); break; }
+            if (read10(part_start + i, 1, fsd, NULL)) { printf("    [UDF]   scan[%d]: read failed\n", i); fflush(stdout); break; }
             uint16_t ftag = le16(fsd);
-            printf("    [UDF]   FSD scan[%d] @ LBA %u: tag=%u\n", i, part_start+i, ftag); fflush(stdout);
+            if (ftag != 0)
+                printf("    [UDF]   scan[%d] @ LBA %u: tag=%u\n", i, part_start+i, ftag); fflush(stdout);
             if (ftag == 256) { fsd_abs_lba = part_start + i; break; }
-            if (ftag == 8 || ftag == 9) break;
         }
     }
     root_icb_lba = 0; /* reset — will set from FSD below */

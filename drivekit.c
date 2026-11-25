@@ -3371,177 +3371,249 @@ static void aacs_decrypt_sector(uint8_t *s0, uint8_t *s1, uint8_t *s2, const uin
 }
 
 /* =========================================================
-   LIBREDRIVE_ACTIVATE
-   Applies the Pioneer LibreDrive volatile RAM patch via
-   WRITE BUFFER, enabling raw UHD sector reads.
+   LIBREDRIVE_ACTIVATE (Renesas/Pioneer — freemkv SET sequence)
+   =========================================================
+   For Pioneer/Renesas drives (BDR-XD06U fw 1.11, kernel ID69):
+   activation is NOT a WRITE BUFFER key payload. Instead it
+   uses the freemkv SET command protocol:
 
-   Pioneer LibreDrive uses the same WRITE BUFFER unlock
-   mechanism as the crossflash: 32-byte payload with model
-   string (bytes 0-15) and unlock key (bytes 16-19).
-   The drive firmware, upon seeing its own model+key via
-   WRITE BUFFER mode 0x04/buf 0xFF, sets an internal flag
-   that allows raw sector reads and returns AA 0B E0 FF to
-   READ BUFFER 0x77 (the LibreDrive handshake).
+     SET(Region,       REGION_FREE)   — optional
+     SET(Speed,        SPEED_MAX)     — optional
+     SET(Unrestricted, STATE_ON)      — optional
+     SET(Encryption,   STATE_OFF)     — required: de-busses drive
 
-   The key is drive-model specific. We read READ BUFFER 0xF1
-   to identify the drive platform and look up the key in the
-   same table used by cmd_unlock().
+   Each SET is a 12-byte vendor CDB (opcode 0xF1) sending 64
+   zero bytes; reply must be 64 zero bytes (validate_set_reply).
+   On success the drive bypasses AACS bus encryption and
+   READ BUFFER 0x77 returns AA 0B E0 FF.
+
+   freemkv SET CDB format (12 bytes):
+     [0]  = 0xF1   (vendor opcode)
+     [1]  = 0x01   (SET command sub-code)
+     [2]  = param  (what to SET: 0x01=Region, 0x02=Speed,
+                                 0x03=Unrestricted, 0x04=Encryption)
+     [3]  = value  (0x00=off/free/max, 0x01=on)
+     [4..9] = 0x00
+     [10] = 0x40   (transfer length high: 64 bytes)
+     [11] = 0x00
+
+   This is derived from libfreemkv/freemkv-unlock source
+   (confirmed: validate_set_reply expects 64 zero bytes,
+    capabilities = PIONEER_RUNTIME).
 
    Returns 0 if already active or successfully activated,
    1 if activation failed.
    ========================================================= */
+
+/* Send one freemkv SET command. Returns 0 on success.
+   The freemkv protocol sends the SET as a bidirectional command:
+   64 bytes out (zero payload), and the drive returns 64 bytes
+   (validate_set_reply: all zero = success).
+   Since Windows SPTI doesn't support true bidirectional, we do
+   it as DATA_IN (the drive sends us 64 bytes; our zero payload
+   is implicit, as the SET parameters are in the CDB itself). */
+static int fmkv_set(UCHAR param, UCHAR value, const char *name) {
+    UCHAR cdb[12] = {
+        0xF1,  /* vendor opcode */
+        0x01,  /* SET sub-code */
+        param, /* what: 0x01=Region, 0x02=Speed, 0x03=Unrestricted, 0x04=Encryption */
+        value, /* value: 0x00=off/free/max, 0x01=on */
+        0, 0, 0, 0, 0, 0,
+        0x40,  /* transfer length = 64 bytes */
+        0x00
+    };
+    UCHAR reply[64] = {0};
+    UCHAR sense[SENSE_SIZE] = {0};
+    int st = 0;
+
+    /* DATA_IN: drive returns 64-byte status block; validate_set_reply = all zero */
+    send_scsi(g_hDrive, cdb, 12, reply, 64, SCSI_IOCTL_DATA_IN, sense, &st);
+    if (st != 0) {
+        printf("[LD]   SET(%s=%02X): FAIL (SK=%02X ASC=%02X ASCQ=%02X)\n",
+               name, value, sense[2]&0x0F, sense[12], sense[13]);
+        return 1;
+    }
+
+    int valid = 1;
+    int k;
+    for (k = 0; k < 64; k++) if (reply[k]) { valid = 0; break; }
+    printf("[LD]   SET(%s=%02X): %s\n", name, value,
+           valid ? "OK (64 zero reply)" : "WARN (non-zero reply)");
+    return 0;
+}
+
 static int libredrive_activate(void) {
     UCHAR buf77[4] = {0};
     UCHAR s77[SENSE_SIZE] = {0};
-    int st = 0;
-    int i;
 
-    /* Check if already active */
+    /* ---- Check if already active ---- */
     if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
-        buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
+        buf77[0]==0xAA && buf77[1]==0x0B &&
+        buf77[2]==0xE0 && buf77[3]==0xFF) {
         printf("[LD] LibreDrive already active (AA 0B E0 FF)\n\n");
         return 0;
     }
 
-    printf("[LD] Activating LibreDrive (WRITE BUFFER unlock)...\n");
-
-    /* Step 0: Open AACS authentication session (REPORT KEY class=0 → get AGID).
-       Pioneer drives require an active AACS session before they will accept
-       WRITE BUFFER mode=0x04 (returns SK=02 ASC=04 ASCQ=03 without it).
-       We start the session but do not need to complete the full handshake —
-       just having an open AGID is enough to put the drive in the right state. */
-    UCHAR agid = 0;
+    /* ---- Probe: is this a Renesas/Pioneer drive? ----
+       READ BUFFER mode=0x02 buffer_id=0xF1 → bytes[16..18] == "SAT"
+       CDB: [0x3c, 0x02, 0xF1, 0,0,0, 0,0, 0x30, 0] */
+    printf("[LD] Probing drive (Renesas identity check)...\n");
     {
-        /* REPORT KEY class=0: get AGID for AACS authentication */
-        UCHAR rk_buf[8] = {0};
-        UCHAR rk_sense[SENSE_SIZE] = {0}; int rk_st = 0;
-        UCHAR rk_cdb[12] = {0xA4, 0, 0,0,0,0, 0, 0x00, 0x08, 0x02/*class=AACS*/, 0, 0};
-        /* class=0x02 = AACS, key format=0x00 = AGID request */
-        /* Actually REPORT KEY for AACS uses key class=0x02, key format=0x00 */
-        /* CDB[10] = (agid<<6)|key_format; for AGID request: agid=0,format=0 → 0x00 */
-        send_scsi(g_hDrive, rk_cdb, 12, rk_buf, 8, SCSI_IOCTL_DATA_IN, rk_sense, &rk_st);
-        if (rk_st == 0) {
-            agid = (rk_buf[7] >> 6) & 0x03;
-            printf("[LD]   AACS AGID obtained: %u\n", agid);
-        } else {
-            printf("[LD]   AACS AGID request: FAIL (SK=%02X ASC=%02X) — trying without\n",
-                   rk_sense[2]&0x0F, rk_sense[12]);
-        }
+        UCHAR probe_cdb[10] = {0x3C, 0x02, 0xF1, 0,0,0, 0,0, 0x30, 0};
+        UCHAR probe_buf[0x30] = {0};
+        UCHAR probe_sense[SENSE_SIZE] = {0};
+        int pst = 0;
+        send_scsi(g_hDrive, probe_cdb, 10, probe_buf, 0x30,
+                  SCSI_IOCTL_DATA_IN, probe_sense, &pst);
+
+        int is_renesas = (pst == 0 &&
+                          probe_buf[16]=='S' &&
+                          probe_buf[17]=='A' &&
+                          probe_buf[18]=='T');
+        printf("[LD]   Renesas probe: %s (bytes[16..18]=%c%c%c)\n",
+               is_renesas ? "YES" : "NO",
+               probe_buf[16]?probe_buf[16]:'.', probe_buf[17]?probe_buf[17]:'.', probe_buf[18]?probe_buf[18]:'.');
         fflush(stdout);
-    }
 
-    /* Read 0xF1 to identify drive platform/kernel */
-    UCHAR rb[0x30] = {0};
-    UCHAR rbs[SENSE_SIZE] = {0};
-    rb_data(0xF1, 0, rb, 0x30, rbs);
-
-    char platform[12] = {0};
-    char kernelID[5]  = {0};
-    int j;
-    for (j=0; j<8  && rb[16+j]>=0x20&&rb[16+j]<0x7F; j++) platform[j] = rb[16+j];
-    for (j=0; j<4  && rb[24+j]>=0x20&&rb[24+j]<0x7F; j++) kernelID[j] = rb[24+j];
-
-    char *pp = platform;
-    while (*pp && (*pp < '0' || *pp > '9')) pp++;
-    WORD driveID = *pp ? (WORD)strtol(pp, NULL, 16) : 0;
-
-    DWORD unlockKey = pioneer_key_lookup(driveID, kernelID);
-    if (!unlockKey) unlockKey = 0x6123789A; /* universal fallback */
-
-    printf("[LD]   Platform: %s  Kernel: %s  DriveID: 0x%04X  Key: 0x%08lX\n",
-           platform[0] ? platform : "?",
-           kernelID[0] ? kernelID : "?",
-           driveID, unlockKey);
-
-    /* Build 256-byte payload: model string (0-15) + key (16-19) + zeros
-       MrPenguin: CDB must be >= 19 bytes; payload must be 0x100 bytes
-       (same size as firmware unlock — drive ignores bytes beyond 0x14) */
-    UCHAR payload[0x100] = {0};
-    /* Find model string from g_mdl_map */
-    for (i = 0; g_mdl_map[i].did; i++) {
-        if (g_mdl_map[i].did == driveID) {
-            memcpy(payload, g_mdl_map[i].str, 16);
-            break;
+        if (!is_renesas) {
+            /* Not a Renesas drive — fall back to WRITE BUFFER key method */
+            printf("[LD] Not a Renesas drive. Falling back to WRITE BUFFER key...\n");
+            goto try_write_buffer;
         }
     }
-    if (!payload[0]) {
-        /* Fallback model string */
-        memcpy(payload, "PIONEER         ", 16);
+
+    /* ---- freemkv Renesas SET sequence ----
+       Sends the four freemkv SET commands that constitute BypassUhd/OemUhd:
+         SET(Region,       0x00)  — REGION_FREE
+         SET(Speed,        0x00)  — SPEED_MAX
+         SET(Unrestricted, 0x01)  — STATE_ON
+         SET(Encryption,   0x00)  — STATE_OFF  ← the actual unlock
+       Each is a 12-byte vendor CDB (opcode 0xF1) with 64-byte payload.
+       On success the drive suppresses AACS bus encryption. */
+    printf("[LD] Sending freemkv SET sequence (Renesas/Pioneer BypassUhd)...\n");
+    fflush(stdout);
+
+    /* Optional sets — ignore failures */
+    fmkv_set(0x01, 0x00, "Region=FREE");
+    Sleep(100);
+    fmkv_set(0x02, 0x00, "Speed=MAX");
+    Sleep(100);
+    fmkv_set(0x03, 0x01, "Unrestricted=ON");
+    Sleep(100);
+
+    /* Required: Encryption=OFF */
+    if (fmkv_set(0x04, 0x00, "Encryption=OFF") != 0) {
+        printf("[LD] SET(Encryption=OFF) failed — drive may need firmware support.\n");
+        /* Don't give up yet; check RB 0x77 anyway */
     }
-    payload[0x10] = (UCHAR)(unlockKey >>  0);
-    payload[0x11] = (UCHAR)(unlockKey >>  8);
-    payload[0x12] = (UCHAR)(unlockKey >> 16);
-    payload[0x13] = (UCHAR)(unlockKey >> 24);
+    Sleep(300);
 
-    printf("[LD]   Payload: %.16s + %02X%02X%02X%02X\n",
-           (char*)payload,
-           payload[0x10], payload[0x11], payload[0x12], payload[0x13]);
+    /* ---- Verify activation ---- */
+    memset(buf77, 0, 4);
+    if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
+        buf77[0]==0xAA && buf77[1]==0x0B &&
+        buf77[2]==0xE0 && buf77[3]==0xFF) {
+        printf("[LD] LibreDrive activated! (freemkv SET, AA 0B E0 FF)\n\n");
+        return 0;
+    }
 
-    /* Wait for drive to become ready (spin-up).
-       Mode 0x04 fails with SK=02 ASC=04 ASCQ=03 (Not Ready - manual intervention)
-       if sent before the disc is fully spun up. Poll TEST UNIT READY. */
+    printf("[LD] freemkv SET sent. RB 0x77 = %02X %02X %02X %02X\n",
+           buf77[0], buf77[1], buf77[2], buf77[3]);
+
+    /* ---- Secondary verify: Renesas RAM state ----
+       After activation: loaded==0, checked==1, result==0 at 0xffff_ed3c.
+       Status CDB: [0x3c,2,0x92,0,0x0d,0x3c,0,0,1,0] → byte[0] bit1 set */
     {
-        int tur_ok = 0, tloop;
-        for (tloop = 0; tloop < 20 && !tur_ok; tloop++) {
-            UCHAR tur_cdb[6] = {0,0,0,0,0,0};
-            UCHAR tur_sense[SENSE_SIZE] = {0}; int tur_st = 0;
-            send_scsi(g_hDrive, tur_cdb, 6, NULL, 0, SCSI_IOCTL_DATA_IN, tur_sense, &tur_st);
-            if (tur_st == 0) { tur_ok = 1; break; }
+        UCHAR sv_cdb[10] = {0x3C, 0x02, 0x92, 0x00, 0x0D, 0x3C, 0, 0, 0x01, 0};
+        UCHAR sv_buf[1]  = {0};
+        UCHAR sv_sense[SENSE_SIZE] = {0};
+        int svst = 0;
+        send_scsi(g_hDrive, sv_cdb, 10, sv_buf, 1,
+                  SCSI_IOCTL_DATA_IN, sv_sense, &svst);
+        printf("[LD]   Renesas state byte: 0x%02X (bit1=checked, 0x02=active)\n",
+               sv_buf[0]);
+        if (svst == 0 && (sv_buf[0] & 0x02)) {
+            printf("[LD] Renesas confirms active (checked bit set).\n\n");
+            return 0;
+        }
+    }
+
+    printf("[LD] LibreDrive not confirmed active after SET sequence.\n");
+    printf("[LD] The SET sub-command encoding may differ from expected.\n");
+    printf("[LD] Try: install freemkv, run once to unlock, then retry.\n\n");
+    return 1;
+
+try_write_buffer:;
+    /* ---- Legacy WRITE BUFFER key path (pre-cutoff / MediaTek drives) ----
+       Reads platform/kernel from READ BUFFER 0xF1, looks up unlock key,
+       sends 32-byte payload via WRITE BUFFER mode=0x04 buf=0xFF. */
+    printf("[LD] Activating LibreDrive (WRITE BUFFER unlock, legacy path)...\n");
+    {
+        UCHAR rb[0x30] = {0};
+        UCHAR rbs[SENSE_SIZE] = {0};
+        rb_data(0xF1, 0, rb, 0x30, rbs);
+
+        char platform[12] = {0};
+        char kernelID[5]  = {0};
+        int j;
+        for (j=0; j<8 && rb[16+j]>=0x20&&rb[16+j]<0x7F; j++) platform[j] = rb[16+j];
+        for (j=0; j<4 && rb[24+j]>=0x20&&rb[24+j]<0x7F; j++) kernelID[j] = rb[24+j];
+
+        char *pp = platform;
+        while (*pp && (*pp < '0' || *pp > '9')) pp++;
+        WORD driveID = *pp ? (WORD)strtol(pp, NULL, 16) : 0;
+
+        DWORD unlockKey = pioneer_key_lookup(driveID, kernelID);
+        if (!unlockKey) unlockKey = 0x6123789A;
+
+        printf("[LD]   Platform: %s  Kernel: %s  DriveID: 0x%04X  Key: 0x%08lX\n",
+               platform[0] ? platform : "?",
+               kernelID[0] ? kernelID : "?",
+               driveID, unlockKey);
+
+        UCHAR payload[0x100] = {0};
+        int i;
+        for (i = 0; g_mdl_map[i].did; i++) {
+            if (g_mdl_map[i].did == driveID) {
+                memcpy(payload, g_mdl_map[i].str, 16);
+                break;
+            }
+        }
+        if (!payload[0]) memcpy(payload, "PIONEER         ", 16);
+        payload[0x10] = (UCHAR)(unlockKey >>  0);
+        payload[0x11] = (UCHAR)(unlockKey >>  8);
+        payload[0x12] = (UCHAR)(unlockKey >> 16);
+        payload[0x13] = (UCHAR)(unlockKey >> 24);
+
+        /* Poll TUR before sending */
+        for (i = 0; i < 20; i++) {
+            UCHAR tc[6]={0}; UCHAR ts[SENSE_SIZE]={0}; int ti=0;
+            send_scsi(g_hDrive, tc, 6, NULL, 0, SCSI_IOCTL_DATA_IN, ts, &ti);
+            if (!ti) break;
             Sleep(500);
         }
-        printf("[LD]   Drive ready: %s\n", tur_ok ? "YES" : "NO (may fail)");
-        fflush(stdout);
-    }
 
-    /* Try WRITE BUFFER modes — 12-byte CDB, 0x100 byte payload.
-       mode=0x04 bufid=0xFF: standard LibreDrive unlock (MakeMKV method)
-       mode=0x01 bufid=0x00: returned GOOD on BDR-XD06U — try multiple times
-       Others: rejected with SK=05 ASC=24 (invalid CDB field) */
-    UCHAR modes[]  = {0x04, 0x04, 0x04, 0x01, 0x01, 0x01};
-    UCHAR bufids[] = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00};
-    int activated = 0;
-    for (i = 0; i < 6; i++) {
-        /* 12-byte CDB: opcode=0x3B, mode, bufid, 0,0,0,0, len(3 bytes), 0,0
-           Note: some Pioneer firmware variants use bufid=agid for mode=0x04 */
-        UCHAR bufid_try = (i < 3 && agid > 0) ? agid : bufids[i];
-        UCHAR ucdb[12] = {0x3B, modes[i], bufid_try, 0,0,0, 0, 0x01, 0x00, 0, 0, 0};
-        UCHAR usense[SENSE_SIZE] = {0};
-        int ust = 0;
+        UCHAR ucdb[12] = {0x3B, 0x04, 0xFF, 0,0,0, 0, 0x01, 0x00, 0, 0, 0};
+        UCHAR usense[SENSE_SIZE] = {0}; int ust = 0;
         send_scsi(g_hDrive, ucdb, 12, payload, 0x100,
                   SCSI_IOCTL_DATA_OUT, usense, &ust);
-        printf("[LD]   WB mode=0x%02X bufid=0x%02X: %s",
-               modes[i], bufid_try, ust==0 ? "GOOD" : "FAIL");
-        if (ust != 0)
-            printf(" (SK=%02X ASC=%02X ASCQ=%02X)", usense[2]&0x0F, usense[12], usense[13]);
-        /* Verify after each attempt */
+        printf("[LD]   WB mode=0x04 buf=0xFF: %s", ust==0 ? "GOOD" : "FAIL");
+        if (ust) printf(" (SK=%02X ASC=%02X)", usense[2]&0x0F, usense[12]);
+
         memset(buf77, 0, 4);
         rb_data(0x77, 0, buf77, 4, s77);
         printf("  RB77=%02X%02X%02X%02X\n", buf77[0],buf77[1],buf77[2],buf77[3]);
-        if (buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
-            printf("[LD] LibreDrive activated! mode=0x%02X buf=0x%02X (AA 0B E0 FF)\n\n",
-                   modes[i], bufids[i]);
-            activated = 1;
-            break;
-        }
-        /* Brief pause between retries */
-        if (i < 5) Sleep(200);
-    }
 
-    if (!activated) {
-        /* Final check — drive may have activated on a previous command */
-        memset(buf77, 0, 4);
-        if (rb_data(0x77, 0, buf77, 4, s77) == 0 &&
-            buf77[0]==0xAA && buf77[1]==0x0B && buf77[2]==0xE0 && buf77[3]==0xFF) {
-            printf("[LD] LibreDrive activated (AA 0B E0 FF)\n\n");
-            activated = 1;
-        } else {
-            printf("[LD] WRITE BUFFER sweep complete, RB 0x77 = %02X %02X %02X %02X\n",
-                   buf77[0], buf77[1], buf77[2], buf77[3]);
-            printf("[LD] LibreDrive not active. Drive may need firmware support.\n");
-            printf("[LD] Try running MakeMKV once to activate, then retry.\n\n");
+        if (buf77[0]==0xAA && buf77[1]==0x0B &&
+            buf77[2]==0xE0 && buf77[3]==0xFF) {
+            printf("[LD] LibreDrive activated! (WRITE BUFFER, AA 0B E0 FF)\n\n");
+            return 0;
         }
+
+        printf("[LD] LibreDrive not active. Drive may need firmware support.\n");
+        printf("[LD] Try running MakeMKV once to activate, then retry.\n\n");
+        return 1;
     }
-    return activated ? 0 : 1;
 }
 
 /* =========================================================

@@ -3405,6 +3405,31 @@ static int libredrive_activate(void) {
 
     printf("[LD] Activating LibreDrive (WRITE BUFFER unlock)...\n");
 
+    /* Step 0: Open AACS authentication session (REPORT KEY class=0 → get AGID).
+       Pioneer drives require an active AACS session before they will accept
+       WRITE BUFFER mode=0x04 (returns SK=02 ASC=04 ASCQ=03 without it).
+       We start the session but do not need to complete the full handshake —
+       just having an open AGID is enough to put the drive in the right state. */
+    UCHAR agid = 0;
+    {
+        /* REPORT KEY class=0: get AGID for AACS authentication */
+        UCHAR rk_buf[8] = {0};
+        UCHAR rk_sense[SENSE_SIZE] = {0}; int rk_st = 0;
+        UCHAR rk_cdb[12] = {0xA4, 0, 0,0,0,0, 0, 0x00, 0x08, 0x02/*class=AACS*/, 0, 0};
+        /* class=0x02 = AACS, key format=0x00 = AGID request */
+        /* Actually REPORT KEY for AACS uses key class=0x02, key format=0x00 */
+        /* CDB[10] = (agid<<6)|key_format; for AGID request: agid=0,format=0 → 0x00 */
+        send_scsi(g_hDrive, rk_cdb, 12, rk_buf, 8, SCSI_IOCTL_DATA_IN, rk_sense, &rk_st);
+        if (rk_st == 0) {
+            agid = (rk_buf[7] >> 6) & 0x03;
+            printf("[LD]   AACS AGID obtained: %u\n", agid);
+        } else {
+            printf("[LD]   AACS AGID request: FAIL (SK=%02X ASC=%02X) — trying without\n",
+                   rk_sense[2]&0x0F, rk_sense[12]);
+        }
+        fflush(stdout);
+    }
+
     /* Read 0xF1 to identify drive platform/kernel */
     UCHAR rb[0x30] = {0};
     UCHAR rbs[SENSE_SIZE] = {0};
@@ -3476,14 +3501,16 @@ static int libredrive_activate(void) {
     UCHAR bufids[] = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00};
     int activated = 0;
     for (i = 0; i < 6; i++) {
-        /* 12-byte CDB: opcode=0x3B, mode, bufid, 0,0,0,0, len(3 bytes), 0,0 */
-        UCHAR ucdb[12] = {0x3B, modes[i], bufids[i], 0,0,0, 0, 0x01, 0x00, 0, 0, 0};
+        /* 12-byte CDB: opcode=0x3B, mode, bufid, 0,0,0,0, len(3 bytes), 0,0
+           Note: some Pioneer firmware variants use bufid=agid for mode=0x04 */
+        UCHAR bufid_try = (i < 3 && agid > 0) ? agid : bufids[i];
+        UCHAR ucdb[12] = {0x3B, modes[i], bufid_try, 0,0,0, 0, 0x01, 0x00, 0, 0, 0};
         UCHAR usense[SENSE_SIZE] = {0};
         int ust = 0;
         send_scsi(g_hDrive, ucdb, 12, payload, 0x100,
                   SCSI_IOCTL_DATA_OUT, usense, &ust);
         printf("[LD]   WB mode=0x%02X bufid=0x%02X: %s",
-               modes[i], bufids[i], ust==0 ? "GOOD" : "FAIL");
+               modes[i], bufid_try, ust==0 ? "GOOD" : "FAIL");
         if (ust != 0)
             printf(" (SK=%02X ASC=%02X ASCQ=%02X)", usense[2]&0x0F, usense[12], usense[13]);
         /* Verify after each attempt */

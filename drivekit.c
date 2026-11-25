@@ -3452,12 +3452,30 @@ static int libredrive_activate(void) {
            (char*)payload,
            payload[0x10], payload[0x11], payload[0x12], payload[0x13]);
 
-    /* Try WRITE BUFFER modes — 12-byte CDB, 0x100 byte payload
-       MrPenguin confirmed: CDB >= 19 bytes required for LibreDrive activation */
-    UCHAR modes[]  = {0x04, 0x01, 0x00, 0x0A, 0x0B, 0x0C, 0x0D};
-    UCHAR bufids[] = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    /* Wait for drive to become ready (spin-up).
+       Mode 0x04 fails with SK=02 ASC=04 ASCQ=03 (Not Ready - manual intervention)
+       if sent before the disc is fully spun up. Poll TEST UNIT READY. */
+    {
+        int tur_ok = 0, tloop;
+        for (tloop = 0; tloop < 20 && !tur_ok; tloop++) {
+            UCHAR tur_cdb[6] = {0,0,0,0,0,0};
+            UCHAR tur_sense[SENSE_SIZE] = {0}; int tur_st = 0;
+            send_scsi(g_hDrive, tur_cdb, 6, NULL, 0, SCSI_IOCTL_DATA_IN, tur_sense, &tur_st);
+            if (tur_st == 0) { tur_ok = 1; break; }
+            Sleep(500);
+        }
+        printf("[LD]   Drive ready: %s\n", tur_ok ? "YES" : "NO (may fail)");
+        fflush(stdout);
+    }
+
+    /* Try WRITE BUFFER modes — 12-byte CDB, 0x100 byte payload.
+       mode=0x04 bufid=0xFF: standard LibreDrive unlock (MakeMKV method)
+       mode=0x01 bufid=0x00: returned GOOD on BDR-XD06U — try multiple times
+       Others: rejected with SK=05 ASC=24 (invalid CDB field) */
+    UCHAR modes[]  = {0x04, 0x04, 0x04, 0x01, 0x01, 0x01};
+    UCHAR bufids[] = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00};
     int activated = 0;
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 6; i++) {
         /* 12-byte CDB: opcode=0x3B, mode, bufid, 0,0,0,0, len(3 bytes), 0,0 */
         UCHAR ucdb[12] = {0x3B, modes[i], bufids[i], 0,0,0, 0, 0x01, 0x00, 0, 0, 0};
         UCHAR usense[SENSE_SIZE] = {0};
@@ -3478,6 +3496,8 @@ static int libredrive_activate(void) {
             activated = 1;
             break;
         }
+        /* Brief pause between retries */
+        if (i < 5) Sleep(200);
     }
 
     if (!activated) {

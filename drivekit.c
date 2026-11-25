@@ -2759,54 +2759,74 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
     int i;
 
     /* UDF anchor at sector 256 (ECMA-167 §8.4.2) */
-    if (read10(256, 1, sec, NULL)) {
-        /* Try sector 512 as fallback */
-        if (read10(512, 1, sec, NULL)) return 1;
+    printf("    [UDF] Reading sector 256 (AVDP)...\n"); fflush(stdout);
+    int r256 = read10(256, 1, sec, NULL);
+    if (r256) {
+        printf("    [UDF] Sector 256 failed (err=%d), trying sector 512...\n", r256); fflush(stdout);
+        int r512 = read10(512, 1, sec, NULL);
+        if (r512) { printf("    [UDF] Sector 512 also failed (err=%d). No anchor.\n", r512); fflush(stdout); return 1; }
     }
-    if (le16(sec) != 2) return 1; /* not an AVDP */
+    uint16_t anchor_tag = le16(sec);
+    printf("    [UDF] Sector 256 tag ID = %u (want 2 for AVDP)\n", anchor_tag); fflush(stdout);
+    printf("    [UDF]   Raw bytes[0..7]: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
+        sec[0],sec[1],sec[2],sec[3],sec[4],sec[5],sec[6],sec[7]); fflush(stdout);
+    if (anchor_tag != 2) return 1; /* not an AVDP */
 
     /* Main VDS location: bytes 16-23 (extent length + location) */
     uint32_t main_vds_len = le32(sec + 16);
     uint32_t main_vds_loc = le32(sec + 20);
     (void)main_vds_len;
     vds_lba = main_vds_loc;
+    printf("    [UDF] Main VDS: loc=%u len=%u\n", main_vds_loc, main_vds_len); fflush(stdout);
 
     /* Walk VDS descriptors to find PD (tag 5) and LVD (tag 6) */
     for (i = 0; i < 32; i++) {
         uint8_t vd[2048];
-        if (read10(vds_lba + i, 1, vd, NULL)) break;
+        if (read10(vds_lba + i, 1, vd, NULL)) { printf("    [UDF]   VDS[%d]: read failed\n", i); fflush(stdout); break; }
         uint16_t tid = le16(vd);
+        printf("    [UDF]   VDS[%d] @ LBA %u: tag=%u\n", i, vds_lba+i, tid); fflush(stdout);
         if (tid == 8) break; /* Terminating Descriptor */
         if (tid == 5) {
             /* Partition Descriptor: partition starting location at byte 188 */
             uint32_t acc_type = le32(vd + 184);
+            uint32_t ps = le32(vd + 188);
+            printf("    [UDF]   PD: acc_type=%u part_start=%u\n", acc_type, ps); fflush(stdout);
             if (acc_type == 1 || acc_type == 3) { /* writable or rewritable */
-                part_start = le32(vd + 188);
+                part_start = ps;
+            } else {
+                /* Take it regardless - BD-ROM uses acc_type=4 (read-only) */
+                part_start = ps;
+                printf("    [UDF]   PD: acc_type not 1/3, taking part_start anyway\n"); fflush(stdout);
             }
         }
         if (tid == 6) {
-            /* Logical Volume Descriptor: LVD contents use at bytes 84+.
-               Root ICB is in the FSD referenced by the LV integrity sequence.
-               Simpler: scan for the FSD (tag 8=unused, 256=FSD) below. */
+            /* Logical Volume Descriptor */
+            printf("    [UDF]   LVD found\n"); fflush(stdout);
         }
     }
+    printf("    [UDF] part_start = %u\n", part_start); fflush(stdout);
 
     /* Find FSD (File Set Descriptor, tag 256) by scanning from partition start */
-    for (i = 0; i < 8; i++) {
+    for (i = 0; i < 32; i++) {
         uint8_t fsd[2048];
-        if (read10(part_start + i, 1, fsd, NULL)) break;
-        if (le16(fsd) == 256) {
-            /* Root Directory ICB at bytes 400–415: lb_num at +400, part_ref at +404 */
-            root_icb_lba = part_start + le32(fsd + 400);
+        if (read10(part_start + i, 1, fsd, NULL)) { printf("    [UDF]   FSD scan[%d]: read failed\n", i); fflush(stdout); break; }
+        uint16_t ftag = le16(fsd);
+        printf("    [UDF]   FSD scan[%d] @ LBA %u: tag=%u\n", i, part_start+i, ftag); fflush(stdout);
+        if (ftag == 256) {
+            uint32_t icb_lb = le32(fsd + 400);
+            root_icb_lba = part_start + icb_lb;
+            printf("    [UDF]   FSD found! root_icb rel=%u abs=%u\n", icb_lb, root_icb_lba); fflush(stdout);
             break;
         }
+        if (ftag == 8 || ftag == 9) break; /* terminating/unused */
     }
-    if (!root_icb_lba) return 1;
+    if (!root_icb_lba) { printf("    [UDF] No FSD found, root_icb_lba=0\n"); fflush(stdout); return 1; }
 
     /* Read root directory FE and scan for "AACS" */
     uint8_t rfe[2048];
-    if (read10(root_icb_lba, 1, rfe, NULL)) return 1;
+    if (read10(root_icb_lba, 1, rfe, NULL)) { printf("    [UDF] Root FE read failed @ LBA %u\n", root_icb_lba); fflush(stdout); return 1; }
     uint16_t rfe_tag = le16(rfe);
+    printf("    [UDF] Root FE tag=%u (want 260=FE or 261=EFE)\n", rfe_tag); fflush(stdout);
     if (rfe_tag != 260 && rfe_tag != 261) return 1;
 
     uint32_t rfe_ext_attr_len, rfe_ext_data_len, rfe_ad_off;
@@ -2818,7 +2838,12 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
         rfe_ad_off = 184 + rfe_ext_attr_len;
     }
     uint8_t rfe_ad_type = (rfe[18] >> 3) & 0x07;
-    if (rfe_ad_type != 1) return 1;
+    printf("    [UDF] Root FE: ext_attr_len=%u ext_data_len=%u ad_off=%u ad_type=%u\n",
+        rfe_ext_attr_len, rfe_ext_data_len, rfe_ad_off, rfe_ad_type); fflush(stdout);
+    if (rfe_ad_type != 1) {
+        printf("    [UDF] AD type %u != 1 (Short AD), cannot walk directory\n", rfe_ad_type); fflush(stdout);
+        return 1;
+    }
 
     /* Scan root directory Short ADs for a folder named "AACS" */
     uint32_t ad_i;
@@ -2827,10 +2852,11 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
         uint32_t e_loc = le32(rfe + ad_i + 4);
         uint32_t e_abs = part_start + e_loc;
         uint32_t e_secs = (e_len + 2047) / 2048;
+        printf("    [UDF]   Root AD: len=%u loc=%u abs=%u secs=%u\n", e_len, e_loc, e_abs, e_secs); fflush(stdout);
         uint32_t si;
         for (si = 0; si < e_secs; si++) {
             uint8_t dsec[2048];
-            if (read10(e_abs + si, 1, dsec, NULL)) continue;
+            if (read10(e_abs + si, 1, dsec, NULL)) { printf("    [UDF]     Dir sector read failed\n"); fflush(stdout); continue; }
             uint32_t pos = 0;
             while (pos + 38 <= 2048) {
                 if (le16(dsec + pos) != 257) { pos++; continue; }
@@ -2838,27 +2864,40 @@ static int udf_find_aacs_dir(uint32_t *part_start_out, uint32_t *aacs_lba_out) {
                 uint8_t  l_fi = dsec[pos + 19];
                 uint16_t l_iu = le16(dsec + pos + 36);
                 uint32_t icb_loc = le32(dsec + pos + 20);
-                if ((fc & 0x02) == 0 && (fc & 0x04) && l_fi > 0) {
-                    /* directory bit set */
-                    const uint8_t *fn = dsec + pos + 38 + l_iu;
-                    char fn_buf[64] = {0};
-                    if (fn[0] == 8 && l_fi <= 32) {
+                /* Print every FID we find */
+                char fn_buf[64] = {0};
+                const uint8_t *fn = dsec + pos + 38 + l_iu;
+                if (l_fi > 0 && l_fi <= 32 && pos + 38 + l_iu + l_fi <= 2048) {
+                    if (fn[0] == 8) {
                         uint32_t ci;
                         for (ci = 0; ci < (uint32_t)(l_fi-1) && ci < 62; ci++)
                             fn_buf[ci] = (char)fn[ci+1];
+                    } else if (fn[0] == 16) {
+                        /* UTF-16BE */
+                        uint32_t ci;
+                        for (ci = 0; ci < (uint32_t)((l_fi-1)/2) && ci < 62; ci++)
+                            fn_buf[ci] = (char)fn[1+ci*2+1];
                     }
+                }
+                printf("    [UDF]     FID @ pos=%u fc=0x%02X l_fi=%u icb=%u name='%s'\n",
+                    pos, fc, l_fi, icb_loc, fn_buf); fflush(stdout);
+                if ((fc & 0x02) == 0 && (fc & 0x04) && l_fi > 0) {
+                    /* directory bit set */
                     if (strcmp(fn_buf, "AACS") == 0) {
                         *part_start_out = part_start;
                         *aacs_lba_out   = part_start + icb_loc;
+                        printf("    [UDF] Found AACS dir! aacs_lba=%u\n", *aacs_lba_out); fflush(stdout);
                         return 0;
                     }
                 }
                 uint32_t fid_len = 38 + l_iu + l_fi;
                 fid_len = (fid_len + 3) & ~3u;
+                if (fid_len == 0) break;
                 pos += fid_len;
             }
         }
     }
+    printf("    [UDF] AACS dir not found in root directory listing\n"); fflush(stdout);
     return 1;
 }
 

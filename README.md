@@ -738,13 +738,47 @@ drivekit b0dumpfw E
 
 Output files (example — BDR-XD07U SAT 8D31/ID05, FW 1.06):
 ```
-pioneer_BDR-XD07U_ID05_8D31_1.06_kernel.bin   64 KiB   (live B0 0x400000)
-pioneer_BDR-XD07U_ID05_8D31_1.06_normal.bin   ~1.8 MB  (live B0 0x410000)
-pioneer_BDR-XD07U_ID05_8D31_1.06_raw.bin      ~5 MB    (full sequential dump)
-pioneer_BDR-XD07U_ID05_8D31_1.06_info.txt              (sidecar: model, kernel ID, platform, FW rev, file sizes)
+pioneer_BDR-XD07U_ID05_8D31_1.06_kernel.bin              64 KiB   (live B0 0x400000)
+pioneer_BDR-XD07U_ID05_8D31_1.06_normal.bin              ~1.8 MB  (live B0 0x410000)
+pioneer_BDR-XD07U_ID05_8D31_1.06_raw.bin                 ~5 MB    (full sequential dump)
+pioneer_BDR-XD07U_ID05_8D31_1.06_info.txt                         (sidecar: model, kernel ID, platform, FW rev, file sizes)
+pioneer_BDR-XD07U_ID05_8D31_1.06_comp_<offset>.bin       varies   (decompressed COMP streams, one file per stream)
 ```
 
 The `_normal.bin` output can be fed directly to `scankey` without first running `decodenormal`.
+
+#### COMP stream extraction
+
+After saving the Normal image, `b0dumpfw` automatically scans it for compressed sub-images using the **COMP directory** embedded in the Normal firmware at offset `0x1000`.
+
+**Directory layout (offsets within the Normal image):**
+
+| Offset | Content |
+|--------|---------|
+| `0x1000` | 4-byte magic: ASCII `COMP` |
+| `0x1004` | Array of `(start_addr, end_addr)` pairs, each 8 bytes, big-endian u32 × 2 |
+| `0x1100` | End of directory (or earlier if `0xFFFFFFFF` terminator is hit) |
+
+Up to 16 streams are supported. Addresses are **absolute in the drive's H8S/2600 address space**. Normal firmware is mapped at base `0x00410000`, so an address of e.g. `0x0041A004` maps to Normal image offset `0xA004`.
+
+**Each stream's layout in the Normal image (at image offset `start_addr − 0x00410000`):**
+
+```
+[0..3]  expanded length  — big-endian u32 (decompressed size in bytes)
+[4..]   zlib stream      — compressed data, length = end_addr − start_addr bytes
+```
+
+The zlib stream is validated by checking that its first byte is `0x78` (zlib CMF byte). `b0dumpfw` decompresses each valid stream with zlib `uncompress2()` and writes the result to a file named `<prefix>_comp_<hex_zlib_offset>.bin`, where the hex offset is the absolute position of the zlib data within the Normal image.
+
+**Example output with two COMP streams:**
+```
+  Reading COMP directory at Normal+0x1000...
+    COMP[0]  0x0041A004-0x0041C800  10244 -> 65536 bytes  -> pioneer_..._comp_00009008.bin
+    COMP[1]  0x0041C800-0x0041F200   9216 -> 32768 bytes  -> pioneer_..._comp_0000BC04.bin
+    2 COMP stream(s) extracted.
+```
+
+The decompressed outputs are raw H8S/2600 code or data blobs. Pass them to `disasm` for analysis — they often contain additional firmware modules (audio DSP, servo control, loader stubs) that are compressed in the Normal image to save flash space.
 
 ---
 
